@@ -50,24 +50,19 @@ There is a **Back up** button in the app that exports everything as JSON, and a
 **Restore** button that reads it back. Use them; `localStorage` is per-browser
 and per-device.
 
-## Two things carried over from the app's original runtime
+## Carried over from the app's original runtime
 
 `src/PersonalCRM.jsx` was written against a host runtime that provided some
-things a plain browser does not. It is checked in unmodified, so two seams show:
+things a plain browser does not, so one seam remains:
 
-1. **Storage copy.** The footer reads "Saved to your Claude account rather than
-   this device, so it follows you between sessions." Running here, it is saved
-   to *this browser on this device* and does not follow you anywhere. The data
-   is real and persists across reloads — only the sentence is stale.
+**Place search on the Map tab.** Geocoding calls `api.anthropic.com` directly
+with no API key, which worked because the original host injected credentials.
+Here the request fails and the app falls back to its `offline` state: place
+search reports it cannot reach the service, and the rest of the Map tab keeps
+working. Wiring this up means routing the call through a small backend that
+holds a key, or swapping in a geocoding service.
 
-2. **Place search on the Map tab.** Geocoding calls `api.anthropic.com` directly
-   with no API key, which worked because the original host injected
-   credentials. Here the request fails and the app falls back to its `offline`
-   state: place search reports it cannot reach the service, and the rest of the
-   Map tab keeps working. Wiring this up means routing the call through a small
-   backend that holds a key, or swapping in a geocoding service.
-
-Neither breaks anything else in the app.
+Nothing else in the app is affected.
 
 ## Known lint warnings
 

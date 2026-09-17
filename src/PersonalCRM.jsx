@@ -3158,8 +3158,8 @@ export default function PersonalCRM() {
         {!loading && people.length > 0 && (
           <div style={{ marginTop: 18, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
             <p style={{ fontSize: 12, color: C.faint, margin: '0 0 10px', lineHeight: 1.5 }}>
-              Saved to your Claude account rather than this device, so it follows you between
-              sessions. Only you can see it.
+              Saved locally, in this browser on this device. Only you can see it. It will not
+              follow you to another browser or computer — back up before you switch.
             </p>
 
             <p style={{ fontSize: 12, color: C.faint, margin: '0 0 7px' }}>Theme</p>
