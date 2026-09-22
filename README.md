@@ -118,8 +118,8 @@ lengths.
 People, events, reminders, lists, the chosen theme, and your name live under
 six keys (`crm-people-v1`, `crm-events-v1`, `crm-reminders-v1`,
 `crm-collections-v1`, `crm-theme-v1`, `crm-owner-v1`). Lists are called
-collections in the code, because "list" already means the people list there. The app reads and writes them through an async
-`window.storage` object.
+collections in the code, because "list" already means the people list there.
+The app reads and writes them through an async `window.storage` object.
 
 `src/storage.js` provides that object, backed by `localStorage` and namespaced
 under an `orbit:` prefix. Writes are allowed to fail loudly — the app already
@@ -137,12 +137,22 @@ the People tab and appear once anything at all is saved.
 Import and export cover reminders and lists too. A reminder CSV is recognised
 by its `Next due` column, which is what tells it apart from an events sheet. A
 lists CSV has one row per entry and is recognised by having both a `Title` and
-a `List` column. Importing it adds entries to a list of the same name if you
-already have one, and stages are read back from their words (*Reading*,
-*Finished*, *yes*). A sheet with no `List kind` column gets its kind from the
-list's name, so a list called *Books* reads *Reading* as a stage. Custom stage
-words do not survive a CSV round trip, only the kind's. The JSON backup keeps
-everything.
+a `List` column but no `Name` column. The `Name` rule means a people sheet with
+a job-title column is still read as people. Importing it adds entries to a list
+of the same name if you already have one, reading their stages in that list's
+own words. Otherwise stages are read from the usual words (*Reading*,
+*Finished*, *yes*, *Not started*). A sheet with no `List kind` column gets its
+kind from the list's name, so a list called *Books* reads *Reading* as a stage.
+A plain list comes back plain. A new list made from a sheet has its kind's
+stage words, not any custom ones, so the JSON backup is the lossless copy. A
+list holds at most 2,000 entries, and the import screen says how many would not
+fit before anything is saved.
+
+Every CSV export guards against formula injection. A cell starting `=`, `+`,
+`-` or `@` would run as a formula in Excel or Sheets, and list titles can come
+from anyone who shares a list. Such cells get a leading `'`, and import takes it
+off again. Plain signed numbers are left alone, so a longitude of `-94.58`
+stays a number.
 
 ## Carried over from the app's original runtime
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, memo } from 'react';
 import Papa from 'papaparse';
 
 /* ---------- palette ---------- */
@@ -399,6 +399,40 @@ function Group({ label, children }) {
     </div>
   );
 }
+
+// Shared looks. Functions rather than objects: C changes with the theme, and
+// an object built once at load would keep whichever theme came first.
+
+// A chip in a row of filters or choices.
+const filterChip = (on) => ({
+  font: 'inherit', fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.01em',
+  padding: '6px 12px', borderRadius: 20, cursor: 'pointer',
+  background: on ? C.accent : 'transparent',
+  border: `1px solid ${on ? C.accent : C.line}`,
+  color: on ? C.onAccent : C.muted,
+});
+
+// One half of a two-way choice that fills the row: "Just once / Again and again".
+const segment = (on) => ({
+  flex: 1, font: 'inherit', fontSize: 13, fontWeight: 600, padding: '8px 0',
+  borderRadius: 7, cursor: 'pointer',
+  background: on ? C.accent : 'transparent',
+  border: `1px solid ${on ? C.accent : C.line}`,
+  color: on ? C.onAccent : C.muted,
+});
+
+// A small label naming what kind of thing something is.
+const kindChip = () => ({
+  fontSize: 11, fontWeight: 600, color: C.muted, flexShrink: 0,
+  border: `1px solid ${C.line}`, borderRadius: 20, padding: '2px 8px',
+});
+
+// Enter submits, unless it is the Enter that confirms a word being composed
+// in an input method (Japanese, Chinese, Korean), which only finishes the word.
+const isEnter = (e) => e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229;
+
+const hintStyle = () => ({ display: 'block', fontSize: 12, color: C.faint, marginTop: 6, lineHeight: 1.5 });
+const small = { fontSize: 12.5, padding: '6px 11px' };
 
 let inputStyle = {
   width: '100%',
@@ -1547,7 +1581,13 @@ const COLLECTION_SORTS = [
 // The stages a list actually uses, in order. A list can leave out the middle
 // one (a film is rarely half-watched), and one that does not track progress
 // has none at all.
-const stagesOf = (c) => (!c.track ? [] : STAGES.filter((s) => s !== 'doing' || (c.labels?.doing || '').trim()));
+//
+// There are only three possible answers, so they are shared rather than
+// rebuilt: this runs for every entry on every render and inside sorts.
+const ALL_STAGES = Object.freeze([...STAGES]);
+const NO_MIDDLE = Object.freeze(['want', 'done']);
+const NO_STAGES = Object.freeze([]);
+const stagesOf = (c) => (!c.track ? NO_STAGES : (c.labels?.doing || '').trim() ? ALL_STAGES : NO_MIDDLE);
 
 const stageLabel = (c, s) => (c.labels?.[s] || '').trim() || kindOf(c.kind).labels[s] || s;
 
@@ -1566,13 +1606,20 @@ const nextStage = (c, it) => {
 
 // Only http and https links are ever kept. Links arrive from shared lists and
 // imported sheets as well as the form, and a javascript: URL in an href would
-// run in this page the moment it was clicked.
+// run in this page the moment it was clicked. Whatever the input, the
+// protocol check on the parsed result is the gate.
+//
+// A word then a colon is a scheme ("mailto:", "javascript:") unless a port
+// follows it, so "localhost:3000" and "example.com:8080/x" get https added.
+// A link too long to keep is refused, not cut into one that goes nowhere.
+const LINK_CAP = 2048;
 const safeLink = (v) => {
   const s = typeof v === 'string' ? v.trim() : '';
   if (!s) return '';
   try {
-    const u = new URL(/^[a-z][a-z0-9+.-]*:/i.test(s) ? s : `https://${s}`);
-    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href.slice(0, 2000) : '';
+    const u = new URL(/^[a-z][a-z0-9+.-]*:(?!\d)/i.test(s) ? s : `https://${s}`);
+    const web = u.protocol === 'http:' || u.protocol === 'https:';
+    return web && u.href.length <= LINK_CAP ? u.href : '';
   } catch {
     return '';
   }
@@ -1583,6 +1630,14 @@ const linkHost = (href) => {
 };
 
 const clip = (v, n) => (typeof v === 'string' || typeof v === 'number' ? String(v).trim().slice(0, n) : '');
+
+// One set of limits, used by the loader and by every box that writes these
+// fields, so nothing the forms accept is cut short the next time it loads.
+const TITLE_CAP = 300;
+const NOTE_CAP = 5000;
+const LIST_NAME_CAP = 120;
+const LIST_NOTE_CAP = 2000;
+const LABEL_CAP = 40;
 const isDay = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
 // Everything that comes in from outside, a backup, a sheet or a list someone
@@ -1590,7 +1645,7 @@ const isDay = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
 // produce a well-formed list.
 const cleanItem = (raw, seen) => {
   if (!raw || typeof raw !== 'object') return null;
-  const title = clip(raw.title, 300);
+  const title = clip(raw.title, TITLE_CAP);
   if (!title) return null;
   let id = clip(raw.id, 40);
   if (!id || seen.has(id)) id = uid();
@@ -1599,12 +1654,12 @@ const cleanItem = (raw, seen) => {
   return {
     id,
     title,
-    detail: clip(raw.detail, 300),
+    detail: clip(raw.detail, TITLE_CAP),
     status,
     rating: Math.min(5, Math.max(0, Math.round(Number(raw.rating) || 0))),
     link: safeLink(raw.link),
-    note: clip(raw.note, 5000),
-    from: typeof raw.from === 'string' && raw.from ? raw.from : null,
+    note: clip(raw.note, NOTE_CAP),
+    from: clip(raw.from, 40) || null,
     addedOn: isDay(raw.addedOn) ? raw.addedOn : todayStr(),
     doneOn: status === 'done' && isDay(raw.doneOn) ? raw.doneOn : null,
   };
@@ -1614,7 +1669,7 @@ const ITEM_CAP = 2000;
 
 const cleanCollection = (raw, seen = new Set()) => {
   if (!raw || typeof raw !== 'object') return null;
-  const name = clip(raw.name, 120);
+  const name = clip(raw.name, LIST_NAME_CAP);
   if (!name) return null;
   let id = clip(raw.id, 40);
   if (!id || seen.has(id)) id = uid();
@@ -1630,10 +1685,10 @@ const cleanCollection = (raw, seen = new Set()) => {
       ? raw.updatedAt : new Date().toISOString(),
     name,
     kind,
-    note: clip(raw.note, 2000),
+    note: clip(raw.note, LIST_NOTE_CAP),
     track: raw.track !== false,
-    labels: Object.fromEntries(STAGES.map((s) => [s, clip(raw.labels?.[s], 40)])),
-    detail: clip(raw.detail, 40),
+    labels: Object.fromEntries(STAGES.map((s) => [s, clip(raw.labels?.[s], LABEL_CAP)])),
+    detail: clip(raw.detail, LABEL_CAP),
     sort: COLLECTION_SORTS.some(([v]) => v === raw.sort) ? raw.sort : 'manual',
     items: (Array.isArray(raw.items) ? raw.items : [])
       .slice(0, ITEM_CAP)
@@ -1647,23 +1702,42 @@ const cleanCollections = (raw) => {
   return (Array.isArray(raw) ? raw : []).map((c) => cleanCollection(c, seen)).filter(Boolean);
 };
 
-// Library order: "The Overstory" files under O, the way a shelf would.
+// Library order: "The Overstory" files under O, the way a shelf would. One
+// collator for everything: localeCompare with options builds a fresh one on
+// every comparison, which is most of the cost of sorting a long list.
+const SHELF = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
 const shelfKey = (t) => (t || '').replace(/^(the|a|an)\s+/i, '');
-const byShelf = (a, b) =>
-  shelfKey(a.title).localeCompare(shelfKey(b.title), undefined, { sensitivity: 'base', numeric: true });
+const PROGRESS_ORDER = { doing: 0, want: 1, done: 2 };
 
 // Every order but "My order" is a view: the stored sequence is never
-// rewritten, and ties keep the order you gave them.
+// rewritten, and ties keep the order you gave them. Each entry's sort key is
+// worked out once, not once per comparison. Callers only read the result, so
+// "My order" hands back the stored array as it is.
 const sortItems = (c, items) => {
-  const list = [...items];
-  if (c.sort === 'title') return list.sort(byShelf);
-  if (c.sort === 'added') return list.sort((a, b) => (b.addedOn || '').localeCompare(a.addedOn || ''));
-  if (c.sort === 'rating') return list.sort((a, b) => (b.rating || 0) - (a.rating || 0));
-  if (c.sort === 'status' && c.track) {
-    const order = { doing: 0, want: 1, done: 2 };
-    return list.sort((a, b) => order[stageOf(c, a)] - order[stageOf(c, b)]);
-  }
-  return list;
+  const keyOf = {
+    title: (it) => shelfKey(it.title),
+    added: (it) => it.addedOn || '',
+    rating: (it) => it.rating || 0,
+    status: c.track ? (it) => PROGRESS_ORDER[stageOf(c, it)] : null,
+  }[c.sort];
+  if (!keyOf) return items;
+  const cmp = {
+    title: (a, b) => SHELF.compare(a, b),
+    added: (a, b) => (a < b ? 1 : a > b ? -1 : 0),
+    rating: (a, b) => b - a,
+    status: (a, b) => a - b,
+  }[c.sort];
+  return items
+    .map((it, i) => ({ it, i, k: keyOf(it) }))
+    .sort((a, b) => cmp(a.k, b.k) || a.i - b.i)
+    .map((x) => x.it);
+};
+
+// Every stage counted in one pass, for the bar, the chips and the cards.
+const tally = (c) => {
+  const n = { want: 0, doing: 0, done: 0 };
+  c.items.forEach((it) => { n[stageOf(c, it)] += 1; });
+  return n;
 };
 
 const withStatus = (it, status) => ({
@@ -1678,9 +1752,12 @@ const stars = (n) => '★'.repeat(n) + '☆'.repeat(5 - n);
 // stage when progress is included, because "Watched ★★★★★" is the part a
 // friend actually wants; numbered in your order when it is not.
 const collectionText = (c, { progress, notes }) => {
+  // Numbered whenever the text is not grouped, which includes a plain list
+  // shared with progress on: its order is the whole point of it.
+  const stages = progress ? stagesOf(c) : NO_STAGES;
   const line = (it, i) => {
     const bits = [
-      progress ? '-' : `${i + 1}.`,
+      stages.length ? '-' : `${i + 1}.`,
       it.title,
       it.detail ? `(${it.detail})` : '',
       progress && it.rating ? stars(it.rating) : '',
@@ -1691,7 +1768,6 @@ const collectionText = (c, { progress, notes }) => {
   const head = [c.name, notes && c.note ? c.note : ''].filter(Boolean).join('\n');
   const items = sortItems(c, c.items);
   if (items.length === 0) return `${head}\n\nNothing on it yet.`;
-  const stages = progress ? stagesOf(c) : [];
   if (stages.length === 0) return `${head}\n\n${items.map(line).join('\n')}`;
   const groups = stages
     .map((s) => [s, items.filter((it) => stageOf(c, it) === s)])
@@ -1709,11 +1785,15 @@ const collectionText = (c, { progress, notes }) => {
 // and is never included, and notes only go when you say so.
 const SHARE_PREFIX = 'share=';
 
+// btoa wants one character per byte. Built in chunks rather than a byte at a
+// time; each chunk stays well under the engine's limit on call arguments.
 const toCode = (obj) => {
   const bytes = new TextEncoder().encode(JSON.stringify(obj));
-  let bin = '';
-  bytes.forEach((b) => { bin += String.fromCharCode(b); });
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const parts = [];
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+  }
+  return btoa(parts.join('')).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 };
 
 const fromCode = (code) => {
@@ -1884,15 +1964,24 @@ const flattenCollections = (cs) => cs.flatMap((c) => c.items.map((it) => ({
   doneOn: it.doneOn,
 })));
 
-// Reads a stage back from whatever a sheet calls it: the list's own words
-// first, then the usual ones, so "Read", "Finished" and "yes" all count as done.
+// Every kind's own words for its stages, so "In the collection" or "Want to
+// watch" reads right whichever list a row lands in.
+const STAGE_WORDS = new Map(COLLECTION_KINDS.flatMap((k) =>
+  STAGES.filter((s) => k.labels[s]).map((s) => [k.labels[s].toLowerCase(), s])));
+
+// Reads a stage back from whatever a sheet calls it: the list's own words,
+// then any kind's, then the usual ones. Negatives are tested before anything
+// else, because "Not started" and "Have not watched" contain the very words
+// that would otherwise mark them started or watched.
 const stageFrom = (v, labels) => {
   const s = (v || '').trim().toLowerCase();
   if (!s) return 'want';
-  const hit = STAGES.find((k) => (labels[k] || '').toLowerCase() === s);
-  if (hit) return hit;
-  if (/^(done|finished|complete|completed|watched|read|seen|heard|played|beaten|have|owned|got|been|yes)\b/.test(s)) return 'done';
-  if (/ing\b|progress|on the way|ordered|started/.test(s)) return 'doing';
+  const own = STAGES.find((k) => (labels[k] || '').trim().toLowerCase() === s);
+  if (own) return own;
+  if (STAGE_WORDS.has(s)) return STAGE_WORDS.get(s);
+  if (/\b(not|no|never|nothing|none|haven'?t|hasn'?t|yet to|to do|todo|want(ed)?|wish ?list|planned|pending|upcoming|queued?|backlog|meaning to|someday)\b/.test(s)) return 'want';
+  if (/\b(in progress|under ?way|started|ongoing|current(ly)?|reading|watching|playing|listening|on the way|ordered|doing|part(ly|ially)?)\b/.test(s)) return 'doing';
+  if (/\b(done|finished|complete(d)?|watched|read|seen|heard|played|beaten|have|owned|got|been|visited|yes|y|true|x)\b/.test(s)) return 'done';
   return 'want';
 };
 
@@ -1915,42 +2004,70 @@ const guessKind = (kind, name) => {
   return kindOf((KIND_HINTS.find(([, re]) => re.test(name || '')) || ['Other'])[0]);
 };
 
+const sameName = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase();
+
 // Rows are grouped into lists by name. A sheet with no list names at all
 // becomes one list, named after the file it came from.
-const gatherCollections = (rows, fallback) => {
+//
+// have: lists the rows may join. A row for one of those is read in that
+// list's own stage words, which a sheet it exported will be written in.
+//
+// statusColumn: whether the sheet had a Status column at all. With one, a
+// list is staged only if some row says where it stands, which is what brings
+// a plain list back as a plain list; without one, it takes its kind's usual.
+const gatherCollections = (rows, { fallback, have = [], statusColumn = true }) => {
   const groups = new Map();
   rows.forEach((r) => {
     const name = (r.list || '').trim() || fallback;
     const key = name.toLowerCase();
     if (!groups.has(key)) {
-      const k = guessKind(r.kind, name);
-      groups.set(key, { name, kind: k.kind, track: true, labels: { ...k.labels }, detail: k.detail, items: [] });
+      const mine = have.find((x) => sameName(x.name, name));
+      const k = mine ? kindOf(mine.kind) : guessKind(r.kind, name);
+      groups.set(key, {
+        name, kind: k.kind, track: !statusColumn,
+        labels: mine ? { ...mine.labels } : { ...k.labels }, detail: mine ? mine.detail : k.detail, items: [],
+      });
     }
     const g = groups.get(key);
+    if ((r.status || '').trim()) g.track = true;
     g.items.push({ ...r, status: stageFrom(r.status, g.labels) });
   });
   return cleanCollections([...groups.values()]);
 };
 
 // Adding a sheet to lists you already keep: entries for a list with the same
-// name join it rather than starting a second list beside it.
+// name join it rather than starting a second list beside it. The list keeps
+// its own settings; only its entries grow.
 const mergeCollections = (have, incoming) => {
   const out = [...have];
   incoming.forEach((c) => {
-    const i = out.findIndex((x) => x.name.toLowerCase() === c.name.toLowerCase());
+    const i = out.findIndex((x) => sameName(x.name, c.name));
     if (i === -1) out.push(c);
     else out[i] = { ...out[i], updatedAt: new Date().toISOString(), items: [...out[i].items, ...c.items].slice(0, ITEM_CAP) };
   });
   return out;
 };
 
+// How many entries an import would leave out for want of room, so the screen
+// can say so before anything is saved rather than dropping them quietly.
+const importOverflow = (have, incoming, mode) => incoming.reduce((n, c) => {
+  const mine = mode === 'add' ? have.find((x) => sameName(x.name, c.name)) : null;
+  return n + Math.max(0, (mine ? mine.items.length : 0) + c.items.length - ITEM_CAP);
+}, 0);
+
 const norm = (h) => (h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+// A cell starting = + - or @ runs as a formula when the file is opened in a
+// spreadsheet, and list titles can come from anyone who shares a list. Such
+// cells get a leading ' (the usual defence), except a plain signed number, so
+// a longitude of -94.58 stays a number. fromCsv takes the ' back off.
+const FORMULA_START = /^(?![+-][0-9]+(\.[0-9]+)?$)[=+\-@\t\r]/;
 
 const toCsv = (cols, rows, extra) =>
   Papa.unparse({
     fields: cols.map((c) => c.h).concat(extra ? extra.fields : []),
     data: rows.map((r) => cols.map((c) => c.get(r)).concat(extra ? extra.row(r) : [])),
-  });
+  }, { escapeFormulae: FORMULA_START });
 
 // Matches headers loosely, so a hand-made sheet still lands in the right fields.
 const fromCsv = (cols, rows, make) => {
@@ -1962,8 +2079,9 @@ const fromCsv = (cols, rows, make) => {
     let touched = false;
     Object.entries(row).forEach(([header, value]) => {
       const col = lookup.get(norm(header));
-      if (!col || value == null || String(value).trim() === '') return;
-      col.set(obj, String(value).trim());
+      const v = value == null ? '' : String(value).replace(/^'(?=[=+\-@\t\r])/, '').trim();
+      if (!col || v === '') return;
+      col.set(obj, v);
       touched = true;
     });
     if (touched) out.push(obj); else skipped += 1;
@@ -2511,18 +2629,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
       <Group label="When">
         <div style={{ display: 'flex', gap: 8, marginBottom: 9 }}>
           {[[false, 'One day'], [true, 'Over several days']].map(([v, l]) => (
-            <button
-              key={l}
-              className="crm-btn"
-              onClick={() => setSpans(v)}
-              style={{
-                flex: 1, font: 'inherit', fontSize: 13, fontWeight: 600, padding: '8px 0',
-                borderRadius: 7, cursor: 'pointer',
-                background: spans === v ? C.accent : 'transparent',
-                border: `1px solid ${spans === v ? C.accent : C.line}`,
-                color: spans === v ? C.onAccent : C.muted,
-              }}
-            >{l}</button>
+            <button key={l} className="crm-btn" onClick={() => setSpans(v)} style={segment(spans === v)}>{l}</button>
           ))}
         </div>
 
@@ -2557,7 +2664,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
             style={{ ...inputStyle, width: 'auto', flex: 1 }}
             value={place}
             onChange={(e) => { setPlace(e.target.value); setCoords(null); setLooking(''); setHits([]); }}
-            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); findPlace(); } }}
+            onKeyDown={(e) => { if (isEnter(e)) { e.preventDefault(); findPlace(); } }}
             placeholder="Cincinnati, Ohio"
           />
           <Button onClick={findPlace}>Find</Button>
@@ -2789,14 +2896,6 @@ function EventsView({ events, people, onAdd, onEdit, onRemove }) {
   const narrowed = Boolean(query) || kind !== 'All';
   const years = byAdded ? [] : [...new Set(sorted.map(eventYear))];
 
-  const chipStyle = (on) => ({
-    font: 'inherit', fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.01em',
-    padding: '6px 12px', borderRadius: 20, cursor: 'pointer',
-    background: on ? C.accent : 'transparent',
-    border: `1px solid ${on ? C.accent : C.line}`,
-    color: on ? C.onAccent : C.muted,
-  });
-
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap', marginBottom: 6 }}>
@@ -2837,11 +2936,11 @@ function EventsView({ events, people, onAdd, onEdit, onRemove }) {
           <div style={{
             display: 'flex', gap: 7, flexWrap: 'wrap', alignItems: 'center', marginBottom: 22,
           }}>
-            <button className="crm-btn" onClick={() => setKind('All')} style={chipStyle(kind === 'All')}>
+            <button className="crm-btn" onClick={() => setKind('All')} style={filterChip(kind === 'All')}>
               All
             </button>
             {kindsPresent.map((k) => (
-              <button key={k} className="crm-btn" onClick={() => setKind(k)} style={chipStyle(kind === k)}>
+              <button key={k} className="crm-btn" onClick={() => setKind(k)} style={filterChip(kind === k)}>
                 {k}
               </button>
             ))}
@@ -2948,14 +3047,6 @@ function ReminderForm({ initial, fresh, people, onSave, onCancel }) {
     ? LEADS
     : [...LEADS, [lead, `${lead} day${lead === 1 ? '' : 's'}`]].sort((a, b) => a[0] - b[0]);
 
-  const pick = (on) => ({
-    flex: 1, font: 'inherit', fontSize: 13, fontWeight: 600, padding: '8px 0',
-    borderRadius: 7, cursor: 'pointer',
-    background: on ? C.accent : 'transparent',
-    border: `1px solid ${on ? C.accent : C.line}`,
-    color: on ? C.onAccent : C.muted,
-  });
-
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
       <Field label="What to remember">
@@ -2972,7 +3063,7 @@ function ReminderForm({ initial, fresh, people, onSave, onCancel }) {
       <Group label="How often">
         <div style={{ display: 'flex', gap: 8, marginBottom: repeats ? 9 : 0 }}>
           {[[false, 'Just once'], [true, 'Again and again']].map(([v, l]) => (
-            <button key={l} className="crm-btn" onClick={() => setRepeats(v)} style={pick(repeats === v)}>
+            <button key={l} className="crm-btn" onClick={() => setRepeats(v)} style={segment(repeats === v)}>
               {l}
             </button>
           ))}
@@ -3008,7 +3099,7 @@ function ReminderForm({ initial, fresh, people, onSave, onCancel }) {
         <Group label="Count the gap from">
           <div style={{ display: 'flex', gap: 8 }}>
             {[['date', 'The calendar'], ['done', 'The day I do it']].map(([v, l]) => (
-              <button key={v} className="crm-btn" onClick={() => setAnchor(v)} style={pick(anchor === v)}>
+              <button key={v} className="crm-btn" onClick={() => setAnchor(v)} style={segment(anchor === v)}>
                 {l}
               </button>
             ))}
@@ -3289,14 +3380,6 @@ function RemindersView({ reminders, people, onAdd, onEdit, onSave, onRemove, onS
   const narrowed = Boolean(query) || kind !== 'All';
   const have = new Set(reminders.map((r) => (r.title || '').toLowerCase()));
 
-  const chipStyle = (on) => ({
-    font: 'inherit', fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.01em',
-    padding: '6px 12px', borderRadius: 20, cursor: 'pointer',
-    background: on ? C.accent : 'transparent',
-    border: `1px solid ${on ? C.accent : C.line}`,
-    color: on ? C.onAccent : C.muted,
-  });
-
   let head = 'Nothing to remember yet';
   let sub = 'The things that come round again: the filter, the bill, the talks posted every autumn.';
   if (reminders.length > 0) {
@@ -3340,11 +3423,11 @@ function RemindersView({ reminders, people, onAdd, onEdit, onSave, onRemove, onS
           </div>
 
           <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginBottom: 20 }}>
-            <button className="crm-btn" onClick={() => setKind('All')} style={chipStyle(kind === 'All')}>
+            <button className="crm-btn" onClick={() => setKind('All')} style={filterChip(kind === 'All')}>
               All
             </button>
             {kindsPresent.map((k) => (
-              <button key={k} className="crm-btn" onClick={() => setKind(k)} style={chipStyle(kind === k)}>
+              <button key={k} className="crm-btn" onClick={() => setKind(k)} style={filterChip(kind === k)}>
                 {k}
               </button>
             ))}
@@ -3451,46 +3534,26 @@ function StarPicker({ value, onChange }) {
 
 // How far through a list you are, as a bar and in words. The words are what
 // a screen reader gets; the bar is there to be taken in at a glance.
-function Progress({ c, thin }) {
+function Progress({ c, n, thin }) {
   const total = c.items.length;
-  const done = c.items.filter((it) => stageOf(c, it) === 'done').length;
-  const doing = c.items.filter((it) => stageOf(c, it) === 'doing').length;
-  const pct = (n) => `${total ? (n / total) * 100 : 0}%`;
+  const pct = (x) => `${total ? (x / total) * 100 : 0}%`;
   return (
     <span style={{ display: 'block', marginTop: thin ? 10 : 14 }}>
       <span aria-hidden="true" style={{
         display: 'flex', height: thin ? 4 : 6, borderRadius: 6, background: C.line, overflow: 'hidden',
       }}>
-        <span style={{ width: pct(done), background: C.accent }} />
-        <span style={{ width: pct(doing), background: C.soonBar }} />
+        <span style={{ width: pct(n.done), background: C.accent }} />
+        <span style={{ width: pct(n.doing), background: C.soonBar }} />
       </span>
       {!thin && (
         <span style={{ display: 'block', fontSize: 12.5, color: C.faint, marginTop: 6 }}>
-          {done} of {total} {stageLabel(c, 'done').toLowerCase()}
-          {doing > 0 ? ` · ${doing} ${stageLabel(c, 'doing').toLowerCase()}` : ''}
+          {n.done} of {total} {stageLabel(c, 'done').toLowerCase()}
+          {n.doing > 0 ? ` · ${n.doing} ${stageLabel(c, 'doing').toLowerCase()}` : ''}
         </span>
       )}
     </span>
   );
 }
-
-// Functions rather than objects: C changes with the theme, and an object
-// built once at load would keep the colours of whichever theme came first.
-const kindChip = () => ({
-  fontSize: 11, fontWeight: 600, color: C.muted, flexShrink: 0,
-  border: `1px solid ${C.line}`, borderRadius: 20, padding: '2px 8px',
-});
-
-const filterChip = (on) => ({
-  font: 'inherit', fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.01em',
-  padding: '6px 12px', borderRadius: 20, cursor: 'pointer',
-  background: on ? C.accent : 'transparent',
-  border: `1px solid ${on ? C.accent : C.line}`,
-  color: on ? C.onAccent : C.muted,
-});
-
-const hintStyle = () => ({ display: 'block', fontSize: 12, color: C.faint, marginTop: 6, lineHeight: 1.5 });
-const small = { fontSize: 12.5, padding: '6px 11px' };
 
 /* ---------- lists: a new list, or changing one ---------- */
 function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
@@ -3517,14 +3580,15 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
     if (!detail.trim() || detail === was.detail) setDetail(now.detail);
   };
 
+  const k = kindOf(kind);
+
   const save = () => {
     const n = name.trim();
     if (!n) { setMissing(true); return; }
-    const k = kindOf(kind);
     onSave({
       id: initial?.id || uid(),
       addedOn: initial?.addedOn || todayStr(),
-      name: n.slice(0, 120),
+      name: n,
       kind,
       note: note.trim(),
       track,
@@ -3538,15 +3602,6 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
       items: initial?.items || [],
     });
   };
-
-  const k = kindOf(kind);
-  const pick = (on) => ({
-    flex: 1, font: 'inherit', fontSize: 13, fontWeight: 600, padding: '8px 0',
-    borderRadius: 7, cursor: 'pointer',
-    background: on ? C.accent : 'transparent',
-    border: `1px solid ${on ? C.accent : C.line}`,
-    color: on ? C.onAccent : C.muted,
-  });
 
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
@@ -3563,7 +3618,7 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
       </Group>
 
       <Field label="Name">
-        <input style={inputStyle} value={name} maxLength={120}
+        <input style={inputStyle} value={name} maxLength={LIST_NAME_CAP}
           aria-invalid={missing || undefined}
           aria-describedby={missing ? 'crm-list-name-missing' : undefined}
           onChange={(e) => { setName(e.target.value); setMissing(false); }}
@@ -3581,6 +3636,7 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
           className="crm-serif"
           style={{ ...inputStyle, minHeight: 64, resize: 'vertical', lineHeight: 1.55 }}
           value={note}
+          maxLength={LIST_NOTE_CAP}
           onChange={(e) => setNote(e.target.value)}
           placeholder="Everything people keep telling me to watch."
         />
@@ -3590,7 +3646,7 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
         <div style={{ display: 'flex', gap: 8, marginBottom: track ? 10 : 0 }}>
           {[[true, 'Yes, in stages'], [false, 'No, just a list']].map(([v, l]) => (
             <button key={l} className="crm-btn" onClick={() => setTrack(v)}
-              aria-pressed={track === v} style={pick(track === v)}>
+              aria-pressed={track === v} style={segment(track === v)}>
               {l}
             </button>
           ))}
@@ -3604,7 +3660,7 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
                   <input
                     style={{ ...inputStyle, minHeight: 38, fontSize: 14 }}
                     value={labels[s]}
-                    maxLength={40}
+                    maxLength={LABEL_CAP}
                     aria-label={`Name for the ${cap.toLowerCase()} stage`}
                     placeholder={s === 'doing' ? 'Empty skips it' : k.labels[s]}
                     onChange={(e) => setLabels({ ...labels, [s]: e.target.value })}
@@ -3625,7 +3681,7 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
       </Group>
 
       <Field label="The line under each title">
-        <input style={inputStyle} value={detail} maxLength={40}
+        <input style={inputStyle} value={detail} maxLength={LABEL_CAP}
           onChange={(e) => setDetail(e.target.value)} placeholder={k.detail} />
         <span style={hintStyle()}>
           What each entry notes besides its name: the author, where to watch it, the set it
@@ -3655,7 +3711,7 @@ function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
   const [problem, setProblem] = useState('');
   const [confirm, setConfirm] = useState(false);
   const used = stagesOf(c);
-  const byName = [...people].sort((a, b) => a.name.localeCompare(b.name));
+  const byName = useMemo(() => [...people].sort((a, b) => SHELF.compare(a.name, b.name)), [people]);
 
   const save = () => {
     const t = title.trim();
@@ -3668,15 +3724,7 @@ function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
     // Left alone, the stage and its finish date stay exactly as stored, so
     // tidying a title never stamps a finish date on something imported.
     const base = status !== stageOf(c, it) ? withStatus(it, status) : it;
-    onSave({
-      ...base,
-      title: t.slice(0, 300),
-      detail: detail.trim().slice(0, 300),
-      rating,
-      from: from || null,
-      link: href,
-      note: note.trim(),
-    });
+    onSave({ ...base, title: t, detail: detail.trim(), rating, from: from || null, link: href, note: note.trim() });
   };
 
   return (
@@ -3684,13 +3732,15 @@ function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
       padding: '15px 15px 12px', background: C.paper, borderBottom: `1px solid ${C.line}`,
     }}>
       <Field label="Title">
-        <input autoFocus style={inputStyle} value={title} maxLength={300}
+        <input autoFocus style={inputStyle} value={title} maxLength={TITLE_CAP}
           onChange={(e) => { setTitle(e.target.value); setProblem(''); }} placeholder={kindOf(c.kind).ph} />
       </Field>
 
-      {(c.detail || detail) && (
+      {/* Decided by what is stored, not what is typed, so clearing the box
+          does not make it vanish from under the cursor. */}
+      {(c.detail || it.detail) && (
         <Field label={c.detail || 'Detail'}>
-          <input style={inputStyle} value={detail} maxLength={300} onChange={(e) => setDetail(e.target.value)} />
+          <input style={inputStyle} value={detail} maxLength={TITLE_CAP} onChange={(e) => setDetail(e.target.value)} />
         </Field>
       )}
 
@@ -3724,7 +3774,7 @@ function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
 
       <Field label="Link">
         <input type="url" inputMode="url" style={inputStyle} value={link} placeholder="https://"
-          onChange={(e) => { setLink(e.target.value); setProblem(''); }} />
+          maxLength={LINK_CAP} onChange={(e) => { setLink(e.target.value); setProblem(''); }} />
       </Field>
 
       <Field label="Notes">
@@ -3732,6 +3782,7 @@ function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
           className="crm-serif"
           style={{ ...inputStyle, minHeight: 64, resize: 'vertical', lineHeight: 1.55 }}
           value={note}
+          maxLength={NOTE_CAP}
           onChange={(e) => setNote(e.target.value)}
           placeholder="Why it is on here, who to watch it with, what it cost."
         />
@@ -3756,15 +3807,22 @@ function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
   );
 }
 
-function ItemRow({ c, it, people, index, total, reordering, onStep, onEdit, onMove }) {
-  const used = stagesOf(c);
-  const st = stageOf(c, it);
-  const from = it.from ? people.find((p) => p.id === it.from) : null;
-  const meta = [it.detail, from && `from ${from.name}`].filter(Boolean).join(' · ');
-  const side = {
-    width: 46, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
-    background: 'transparent', border: 'none', cursor: 'pointer', font: 'inherit',
-  };
+const rowSide = {
+  width: 46, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+  background: 'transparent', border: 'none', cursor: 'pointer', font: 'inherit',
+};
+
+// Memoised, and every prop is either the entry itself or something that
+// holds still while other entries change: the list's shape (kind, stages,
+// words) rather than the whole list, the recommender's name rather than
+// everyone, a number only when numbers show, and one action function that
+// never changes. Ticking one entry off then redraws that one row, not all
+// of them.
+const ItemRow = memo(function ItemRow({ shape, it, from, n, first, last, reordering, act }) {
+  const used = stagesOf(shape);
+  const st = stageOf(shape, it);
+  const meta = [it.detail, from && `from ${from}`].filter(Boolean).join(' · ');
+  const host = it.link ? linkHost(it.link) : '';
 
   const body = (
     <>
@@ -3797,36 +3855,36 @@ function ItemRow({ c, it, people, index, total, reordering, onStep, onEdit, onMo
     <div className="crm-entry" style={{
       display: 'flex', alignItems: 'stretch', background: C.surface, borderBottom: `1px solid ${C.line}`,
     }}>
-      {used.length > 0 && !reordering ? (
+      {n == null ? (
         <button
           className="crm-btn"
-          onClick={onStep}
-          title={`${stageLabel(c, st)}. Tap for ${stageLabel(c, nextStage(c, it))}.`}
-          aria-label={`${it.title}: ${stageLabel(c, st)}. Mark as ${stageLabel(c, nextStage(c, it))}`}
-          style={{ ...side, borderRight: `1px solid ${C.line}` }}
+          onClick={() => act('step', it.id)}
+          title={`${stageLabel(shape, st)}. Tap for ${stageLabel(shape, nextStage(shape, it))}.`}
+          aria-label={`${it.title}: ${stageLabel(shape, st)}. Mark as ${stageLabel(shape, nextStage(shape, it))}`}
+          style={{ ...rowSide, borderRight: `1px solid ${C.line}` }}
         >
           <StageMark stage={st} />
         </button>
       ) : (
         <span aria-hidden="true" style={{
-          ...side, cursor: 'default', fontSize: 12.5, fontWeight: 600, color: C.faint,
+          ...rowSide, cursor: 'default', fontSize: 12.5, fontWeight: 600, color: C.faint,
           fontVariantNumeric: 'tabular-nums',
-        }}>{index + 1}</span>
+        }}>{n}</span>
       )}
 
       {reordering ? (
         <div style={{ flex: 1, minWidth: 0, padding: '12px 14px' }}>{body}</div>
       ) : (
-        <button className="crm-btn crm-row" onClick={onEdit} style={{
+        <button className="crm-btn crm-row" onClick={() => act('edit', it.id)} style={{
           flex: 1, minWidth: 0, display: 'block', textAlign: 'left', font: 'inherit', color: C.ink,
           background: 'transparent', border: 'none', padding: '12px 14px', cursor: 'pointer',
         }}>{body}</button>
       )}
 
-      {it.link && !reordering && (
-        <a href={it.link} target="_blank" rel="noreferrer" title={linkHost(it.link)}
-          aria-label={`Open ${it.title} on ${linkHost(it.link)}`}
-          style={{ ...side, width: 42, color: C.muted, borderLeft: `1px solid ${C.line}` }}>
+      {host && !reordering && (
+        <a href={it.link} target="_blank" rel="noreferrer" title={host}
+          aria-label={`Open ${it.title} on ${host}`}
+          style={{ ...rowSide, width: 42, color: C.muted, borderLeft: `1px solid ${C.line}` }}>
           <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
             <path d="M5.5 2.5 H11.5 V8.5 M11.5 2.5 L3 11" fill="none" stroke="currentColor"
               strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
@@ -3834,48 +3892,85 @@ function ItemRow({ c, it, people, index, total, reordering, onStep, onEdit, onMo
         </a>
       )}
 
-      {reordering && [[-1, 'up'], [1, 'down']].map(([d, word]) => {
-        const off = (d < 0 && index === 0) || (d > 0 && index === total - 1);
-        return (
-          <button
-            key={word}
-            className="crm-btn"
-            data-move={`${it.id}:${d}`}
-            disabled={off}
-            onClick={() => onMove(it.id, d)}
-            aria-label={`Move ${it.title} ${word}`}
-            style={{
-              ...side, width: 44, color: C.muted, borderLeft: `1px solid ${C.line}`,
-              cursor: off ? 'default' : 'pointer', opacity: off ? 0.3 : 1,
-            }}
-          >
-            <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
-              <path d={d < 0 ? 'M3 9 L7 5 L11 9' : 'M3 5 L7 9 L11 5'} fill="none" stroke="currentColor"
-                strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </button>
-        );
-      })}
+      {reordering && [[-1, 'up', first], [1, 'down', last]].map(([d, word, off]) => (
+        <button
+          key={word}
+          className="crm-btn"
+          data-move={`${it.id}:${d}`}
+          disabled={off}
+          onClick={() => act('move', it.id, d)}
+          aria-label={`Move ${it.title} ${word}`}
+          style={{
+            ...rowSide, width: 44, color: C.muted, borderLeft: `1px solid ${C.line}`,
+            cursor: off ? 'default' : 'pointer', opacity: off ? 0.3 : 1,
+          }}
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+            <path d={d < 0 ? 'M3 9 L7 5 L11 9' : 'M3 5 L7 9 L11 5'} fill="none" stroke="currentColor"
+              strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+      ))}
     </div>
+  );
+});
+
+// Its own component so that typing redraws this box and nothing else. When
+// it lived in the list, every keystroke redrew every row under it.
+function QuickAdd({ label, placeholder, onAdd }) {
+  const [draft, setDraft] = useState('');
+  const [said, setSaid] = useState('');
+  const box = useRef(null);
+
+  const add = () => {
+    const t = draft.trim();
+    if (!t) return;
+    const [ok, message] = onAdd(t);
+    if (ok) setDraft('');
+    setSaid(message);
+    box.current?.focus();
+  };
+
+  return (
+    <>
+      <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
+        <input
+          ref={box}
+          style={inputStyle}
+          value={draft}
+          maxLength={TITLE_CAP}
+          aria-label={label}
+          placeholder={placeholder}
+          onChange={(e) => { setDraft(e.target.value); setSaid(''); }}
+          onKeyDown={(e) => { if (isEnter(e)) { e.preventDefault(); add(); } }}
+        />
+        <Button kind="solid" onClick={add}>Add</Button>
+      </div>
+      <p aria-live="polite" style={{ margin: '6px 0 0', minHeight: 17, fontSize: 12.5, color: C.faint }}>{said}</p>
+    </>
   );
 }
 
 /* ---------- lists: sharing ---------- */
-function SharePanel({ c, people, owner }) {
+// Memoised as a whole, and each output only rebuilt when what it depends on
+// changes: encoding a long list is the most expensive thing on this screen.
+const SharePanel = memo(function SharePanel({ c, people, owner }) {
   const [progress, setProgress] = useState(true);
   const [notes, setNotes] = useState(false);
   const [to, setTo] = useState('');
   const [said, setSaid] = useState('');
   const [fallback, setFallback] = useState('');
 
-  const text = collectionText(c, { progress, notes });
-  const link = `${window.location.origin}${window.location.pathname}#${SHARE_PREFIX}${shareCode(c, { notes, by: owner })}`;
-  const mailable = people.filter((p) => (p.email || '').includes('@'))
-    .sort((a, b) => a.name.localeCompare(b.name));
+  const text = useMemo(() => collectionText(c, { progress, notes }), [c, progress, notes]);
+  const link = useMemo(
+    () => `${window.location.origin}${window.location.pathname}#${SHARE_PREFIX}${shareCode(c, { notes, by: owner })}`,
+    [c, notes, owner]);
+  const mailable = useMemo(() => people.filter((p) => (p.email || '').includes('@'))
+    .sort((a, b) => SHELF.compare(a.name, b.name)), [people]);
   const who = mailable.find((p) => p.id === to) || mailable[0] || null;
-  const mail = who
+  const mail = useMemo(() => (who
     ? `mailto:${who.email}?subject=${encodeURIComponent(c.name)}&body=${encodeURIComponent(text)}`
-    : '';
+    : ''), [who, c.name, text]);
   const canShare = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
 
   // The clipboard is refused outright on plain http and in some embeds, so
@@ -3940,6 +4035,7 @@ function SharePanel({ c, people, owner }) {
         <p style={{ margin: '0 0 9px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
           Sending it to someone else who uses Orbit? A link gives them their own copy to work
           through. They open it, or paste it under Add a shared list.
+          {owner ? ` It tells them it is from ${owner}.` : ''}
         </p>
         <Button onClick={() => copy(link, 'The link')} style={small}>Copy Orbit link</Button>
         {link.length > 4000 && (
@@ -3964,12 +4060,10 @@ function SharePanel({ c, people, owner }) {
       )}
     </div>
   );
-}
+});
 
 /* ---------- lists: one list, opened ---------- */
 function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }) {
-  const [draft, setDraft] = useState('');
-  const [added, setAdded] = useState('');
   const [stage, setStage] = useState('all');
   const [q, setQ] = useState('');
   const [editing, setEditing] = useState(null);
@@ -3977,7 +4071,6 @@ function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }
   const [sharing, setSharing] = useState(false);
   const [confirm, setConfirm] = useState(false);
   const [moved, setMoved] = useState(null);
-  const addBox = useRef(null);
 
   const k = kindOf(c.kind);
   const used = stagesOf(c);
@@ -3986,13 +4079,42 @@ function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }
   // would otherwise hide everything with no chip on screen to undo it.
   const on = used.includes(stage) ? stage : 'all';
   const query = q.trim().toLowerCase();
-  const count = (s) => items.filter((it) => stageOf(c, it) === s).length;
+  const counts = useMemo(() => tally(c), [c]);
 
-  // Reordering works on the whole list in your order, whatever the view was,
-  // so "up" always means up in the order that is actually kept.
-  const shown = reordering ? items : sortItems(c, items)
+  // Only the parts of the list a row draws from. Saving an entry keeps these
+  // same objects, so rows can tell nothing about them changed.
+  const shape = useMemo(() => ({ kind: c.kind, track: c.track, labels: c.labels }), [c.kind, c.track, c.labels]);
+  const names = useMemo(() => new Map(people.map((p) => [p.id, p.name])), [people]);
+
+  // Sorted once per change to the list; filtering on top is all a keystroke
+  // in the search box costs. Reordering works on the whole list in your
+  // order, whatever the view was, so "up" means up in the order that is kept.
+  const sorted = useMemo(() => sortItems(c, items), [c, items]);
+  const shown = useMemo(() => (reordering ? items : sorted
     .filter((it) => on === 'all' || stageOf(c, it) === on)
-    .filter((it) => !query || `${it.title} ${it.detail} ${it.note}`.toLowerCase().includes(query));
+    .filter((it) => !query || `${it.title} ${it.detail} ${it.note}`.toLowerCase().includes(query))),
+  [reordering, items, sorted, c, on, query]);
+
+  // Rows get one action function that never changes, reading the list as it
+  // is at the moment of the tap. The layout effect keeps it current before
+  // the browser can deliver another tap.
+  const latest = useRef({ c, onSave });
+  useLayoutEffect(() => { latest.current = { c, onSave }; });
+  const act = useCallback((type, id, d) => {
+    if (type === 'edit') { setEditing(id); return; }
+    const { c: now, onSave: save } = latest.current;
+    if (type === 'step') {
+      save({ ...now, items: now.items.map((x) => (x.id === id ? withStatus(x, nextStage(now, x)) : x)) });
+      return;
+    }
+    const i = now.items.findIndex((x) => x.id === id);
+    const j = i + d;
+    if (i < 0 || j < 0 || j >= now.items.length) return;
+    const next = [...now.items];
+    [next[i], next[j]] = [next[j], next[i]];
+    save({ ...now, items: next });
+    setMoved({ id, d });
+  }, []);
 
   // Swapping two rows can pull the focused arrow out of the page and put it
   // back, which drops keyboard focus. Hand it back so the next press works.
@@ -4007,34 +4129,23 @@ function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }
 
   // New entries land in whatever stage you are looking at, so adding to the
   // "Watched" view does not make the new entry vanish from it.
-  const add = () => {
-    const t = draft.trim();
-    if (!t) return;
-    if (items.length >= ITEM_CAP) { setAdded(`This list is full at ${ITEM_CAP}. Start another one.`); return; }
-    const fresh = withStatus({
-      id: uid(), title: t.slice(0, 300), detail: '', status: 'want', rating: 0, link: '', note: '',
+  const add = (t) => {
+    if (items.length >= ITEM_CAP) return [false, `This list is full at ${ITEM_CAP}. Start another one.`];
+    put([withStatus({
+      id: uid(), title: t, detail: '', status: 'want', rating: 0, link: '', note: '',
       from: null, addedOn: todayStr(), doneOn: null,
-    }, on === 'all' ? 'want' : on);
-    put([fresh, ...items]);
-    setDraft('');
+    }, on === 'all' ? 'want' : on), ...items]);
     setQ('');
-    setAdded(`Added ${t}${on === 'all' ? '' : ` as ${stageLabel(c, on).toLowerCase()}`}.`);
-    addBox.current?.focus();
+    return [true, `Added ${t}${on === 'all' ? '' : ` as ${stageLabel(c, on).toLowerCase()}`}.`];
   };
 
-  const step = (it) => put(items.map((x) => (x.id === it.id ? withStatus(x, nextStage(c, x)) : x)));
   const saveItem = (it) => { put(items.map((x) => (x.id === it.id ? it : x))); setEditing(null); };
   const removeItem = (id) => { put(items.filter((x) => x.id !== id)); setEditing(null); };
 
-  const move = (id, d) => {
-    const i = items.findIndex((x) => x.id === id);
-    const j = i + d;
-    if (i < 0 || j < 0 || j >= items.length) return;
-    const next = [...items];
-    [next[i], next[j]] = [next[j], next[i]];
-    put(next);
-    setMoved({ id, d });
-  };
+  // Numbers only where they mean something: a plain list's ranking, or while
+  // reordering. Anywhere else a number would change on every row each time
+  // one entry was added above them.
+  const numbered = used.length === 0 || reordering;
 
   return (
     <div>
@@ -4065,24 +4176,15 @@ function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }
         <p className="crm-serif" style={{ margin: '10px 0 0', fontSize: 15, lineHeight: 1.6, color: C.ink }}>{c.note}</p>
       )}
 
-      {used.length > 0 && items.length > 0 && <Progress c={c} />}
+      {used.length > 0 && items.length > 0 && <Progress c={c} n={counts} />}
 
       {sharing && <SharePanel c={c} people={people} owner={owner} />}
 
-      <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
-        <input
-          ref={addBox}
-          style={inputStyle}
-          value={draft}
-          maxLength={300}
-          aria-label={k.add}
-          placeholder={on === 'all' ? k.add : `${k.add} as ${stageLabel(c, on).toLowerCase()}`}
-          onChange={(e) => { setDraft(e.target.value); setAdded(''); }}
-          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } }}
-        />
-        <Button kind="solid" onClick={add}>Add</Button>
-      </div>
-      <p aria-live="polite" style={{ margin: '6px 0 0', minHeight: 17, fontSize: 12.5, color: C.faint }}>{added}</p>
+      <QuickAdd
+        label={k.add}
+        placeholder={on === 'all' ? k.add : `${k.add} as ${stageLabel(c, on).toLowerCase()}`}
+        onAdd={add}
+      />
 
       {items.length > 0 && (
         <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', alignItems: 'center', margin: '8px 0 12px' }}>
@@ -4095,7 +4197,7 @@ function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }
               {used.map((s) => (
                 <button key={s} className="crm-btn" onClick={() => setStage(s)} aria-pressed={on === s}
                   style={filterChip(on === s)}>
-                  {stageLabel(c, s)} <span style={{ opacity: 0.7 }}>{count(s)}</span>
+                  {stageLabel(c, s)} <span style={{ opacity: 0.7 }}>{counts[s]}</span>
                 </button>
               ))}
             </>
@@ -4157,8 +4259,9 @@ function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }
             <ItemEditor key={it.id} c={c} it={it} people={people}
               onSave={saveItem} onRemove={removeItem} onCancel={() => setEditing(null)} />
           ) : (
-            <ItemRow key={it.id} c={c} it={it} people={people} index={i} total={shown.length}
-              reordering={reordering} onStep={() => step(it)} onEdit={() => setEditing(it.id)} onMove={move} />
+            <ItemRow key={it.id} shape={shape} it={it} from={names.get(it.from) || ''}
+              n={numbered ? i + 1 : null} first={reordering && i === 0} last={reordering && i === shown.length - 1}
+              reordering={reordering} act={act} />
           )))}
         </div>
       )}
@@ -4180,19 +4283,22 @@ function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }
 /* ---------- lists: the tab ---------- */
 const LIST_ORDERS = [['recent', 'Recently changed'], ['name', 'A to Z'], ['size', 'Biggest first']];
 
-function CollectionCard({ c, found, onOpen }) {
+// One shared empty array, so a card that matched nothing keeps the same prop
+// from one keystroke to the next and can skip redrawing.
+const NO_MATCHES = Object.freeze([]);
+
+const CollectionCard = memo(function CollectionCard({ c, found, onOpen }) {
   const k = kindOf(c.kind);
   const used = stagesOf(c);
   const n = c.items.length;
-  const done = c.items.filter((it) => stageOf(c, it) === 'done').length;
-  const doing = used.includes('doing') ? c.items.filter((it) => stageOf(c, it) === 'doing').length : 0;
+  const counts = tally(c);
   const peek = (found.length ? found : sortItems(c, c.items)).slice(0, 4).map((it) => it.title);
   const more = (found.length || n) - peek.length;
 
   // A flex column, because a button centres what is inside it, and cards in
   // a row share the tallest one's height: shorter ones would sit lower down.
   return (
-    <button className="crm-btn" onClick={onOpen} style={{
+    <button className="crm-btn" onClick={() => onOpen(c.id)} style={{
       display: 'flex', flexDirection: 'column', justifyContent: 'flex-start',
       width: '100%', textAlign: 'left', font: 'inherit', color: C.ink,
       background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12,
@@ -4207,10 +4313,10 @@ function CollectionCard({ c, found, onOpen }) {
       </span>
       <span style={{ display: 'block', fontSize: 12.5, color: C.muted, marginTop: 3 }}>
         {n === 0 ? 'Nothing on it yet' : `${n} ${n === 1 ? k.one : k.many}`}
-        {used.length > 0 && n > 0 ? ` · ${done} ${stageLabel(c, 'done').toLowerCase()}` : ''}
-        {doing > 0 ? ` · ${doing} ${stageLabel(c, 'doing').toLowerCase()}` : ''}
+        {used.length > 0 && n > 0 ? ` · ${counts.done} ${stageLabel(c, 'done').toLowerCase()}` : ''}
+        {counts.doing > 0 ? ` · ${counts.doing} ${stageLabel(c, 'doing').toLowerCase()}` : ''}
       </span>
-      {used.length > 0 && n > 0 && <Progress c={c} thin />}
+      {used.length > 0 && n > 0 && <Progress c={c} n={counts} thin />}
       {peek.length > 0 && (
         <span style={{
           display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
@@ -4222,15 +4328,19 @@ function CollectionCard({ c, found, onOpen }) {
       )}
     </button>
   );
-}
+});
 
-function CollectionsView({ collections, incoming, onOpen, onNew, onTakeShared, onDropShared }) {
-  const [q, setQ] = useState('');
-  const [kind, setKind] = useState('All');
-  const [order, setOrder] = useState('recent');
+// look: where the search, kind and order are kept while a list is open, so
+// coming back from one returns to the view you left rather than a fresh one.
+function CollectionsView({ collections, look, incoming, onOpen, onNew, onTakeShared, onDropShared }) {
+  const [q, setQ] = useState(look.current.q);
+  const [kind, setKind] = useState(look.current.kind);
+  const [order, setOrder] = useState(look.current.order);
   const [pasting, setPasting] = useState(false);
   const [paste, setPaste] = useState('');
   const [problem, setProblem] = useState('');
+
+  useEffect(() => { look.current = { q, kind, order }; }, [look, q, kind, order]);
 
   const query = q.trim().toLowerCase();
   const kindsPresent = COLLECTION_KINDS.map((x) => x.kind).filter((x) => collections.some((c) => c.kind === x));
@@ -4239,19 +4349,20 @@ function CollectionsView({ collections, incoming, onOpen, onNew, onTakeShared, o
 
   // A search looks inside lists as well as at their names, and a list found
   // by what is on it shows those entries instead of its first few.
-  const shown = collections
+  const shown = useMemo(() => collections
     .filter((c) => onKind === 'All' || c.kind === onKind)
-    .map((c) => ({
-      c,
-      found: query ? c.items.filter((it) => `${it.title} ${it.detail} ${it.note}`.toLowerCase().includes(query)) : [],
-      named: !query || `${c.name} ${c.note}`.toLowerCase().includes(query),
-    }))
+    .map((c) => {
+      const found = query
+        ? c.items.filter((it) => `${it.title} ${it.detail} ${it.note}`.toLowerCase().includes(query))
+        : NO_MATCHES;
+      return { c, found: found.length ? found : NO_MATCHES, named: !query || `${c.name} ${c.note}`.toLowerCase().includes(query) };
+    })
     .filter((x) => x.named || x.found.length > 0)
     .sort((a, b) => {
-      if (order === 'name') return a.c.name.localeCompare(b.c.name, undefined, { sensitivity: 'base', numeric: true });
+      if (order === 'name') return SHELF.compare(a.c.name, b.c.name);
       if (order === 'size') return b.c.items.length - a.c.items.length;
       return (b.c.updatedAt || '').localeCompare(a.c.updatedAt || '');
-    });
+    }), [collections, onKind, query, order]);
 
   const takePaste = () => {
     const got = readShared(paste);
@@ -4276,6 +4387,8 @@ function CollectionsView({ collections, incoming, onOpen, onNew, onTakeShared, o
       sub = order === 'name' ? 'A to Z.' : order === 'size' ? 'Biggest first.' : 'Most recently changed first.';
     }
   }
+
+  const inKind = incoming?.c ? kindOf(incoming.c.kind) : null;
 
   return (
     <div>
@@ -4306,7 +4419,7 @@ function CollectionsView({ collections, incoming, onOpen, onNew, onTakeShared, o
               <p style={{ margin: '0 0 12px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
                 {incoming.c.items.length === 0
                   ? 'Nothing on it yet.'
-                  : `${incoming.c.items.length} ${incoming.c.items.length === 1 ? kindOf(incoming.c.kind).one : kindOf(incoming.c.kind).many}: ${incoming.c.items.slice(0, 4).map((it) => it.title).join(', ')}${incoming.c.items.length > 4 ? ', and more' : ''}.`}
+                  : `${incoming.c.items.length} ${incoming.c.items.length === 1 ? inKind.one : inKind.many}: ${incoming.c.items.slice(0, 4).map((it) => it.title).join(', ')}${incoming.c.items.length > 4 ? ', and more' : ''}.`}
               </p>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <Button kind="solid" onClick={() => onTakeShared(incoming)} style={small}>Add to my lists</Button>
@@ -4348,6 +4461,7 @@ function CollectionsView({ collections, incoming, onOpen, onNew, onTakeShared, o
             <input
               style={inputStyle}
               value={q}
+              aria-label="Search lists"
               onChange={(e) => setQ(e.target.value)}
               placeholder="Search lists and everything on them"
             />
@@ -4389,9 +4503,7 @@ function CollectionsView({ collections, incoming, onOpen, onNew, onTakeShared, o
 
       {shown.length > 0 && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(250px, 1fr))', gap: 10 }}>
-          {shown.map(({ c, found }) => (
-            <CollectionCard key={c.id} c={c} found={found} onOpen={() => onOpen(c.id)} />
-          ))}
+          {shown.map(({ c, found }) => <CollectionCard key={c.id} c={c} found={found} onOpen={onOpen} />)}
         </div>
       )}
 
@@ -4404,12 +4516,16 @@ function CollectionsView({ collections, incoming, onOpen, onNew, onTakeShared, o
               <textarea
                 autoFocus
                 value={paste}
+                aria-invalid={Boolean(problem) || undefined}
+                aria-describedby={problem ? 'crm-paste-problem' : undefined}
                 onChange={(e) => { setPaste(e.target.value); setProblem(''); }}
                 placeholder="The Orbit link someone sent you, or the code at the end of it"
                 style={{ ...inputStyle, minHeight: 72, fontSize: 13, lineHeight: 1.45, resize: 'vertical' }}
               />
             </Field>
-            {problem && <p style={{ margin: '-4px 0 10px', fontSize: 13, color: C.overdue }}>{problem}</p>}
+            {problem && (
+              <p id="crm-paste-problem" style={{ margin: '-4px 0 10px', fontSize: 13, color: C.overdue }}>{problem}</p>
+            )}
             <div style={{ display: 'flex', gap: 8 }}>
               <Button kind="solid" onClick={takePaste} style={small}>Add it</Button>
               <Button onClick={() => { setPasting(false); setPaste(''); setProblem(''); }} style={small}>Cancel</Button>
@@ -4687,8 +4803,9 @@ function ImportView({ people, events, reminders, collections, onPeople, onEvents
       const looksLikeReminders = headers.includes('nextdue')
         || headers.includes('repeatevery') || headers.includes('noticedays');
       const looksLikeEvents = headers.includes('title') && (headers.includes('start') || headers.includes('date'));
-      // People sheets have a List column too, but never a Title.
-      const looksLikeLists = headers.includes('title') && headers.includes('list');
+      // People sheets have a List column too, and a hand-edited one may add a
+      // Title (a job title), but a lists sheet never has a Name.
+      const looksLikeLists = headers.includes('title') && headers.includes('list') && !headers.includes('name');
 
       if (looksLikeReminders) {
         const { out, skipped } = fromCsv(REMINDER_COLS, rows, () => ({
@@ -4709,8 +4826,18 @@ function ImportView({ people, events, reminders, collections, onPeople, onEvents
           link: '', note: '', addedOn: '', doneOn: '',
         }));
         const good = out.filter((r) => r.title);
-        const lists = gatherCollections(good, file.name.replace(/\.csv$/i, '').trim() || 'Imported list');
-        setFound({ kind: 'lists', rows: lists, skipped: skipped + (out.length - good.length), file: file.name });
+        const opts = {
+          fallback: file.name.replace(/\.csv$/i, '').trim() || 'Imported list',
+          statusColumn: headers.includes('status'),
+        };
+        // Kept as rows too: adding to lists you already keep reads stages in
+        // those lists' own words, which is only known once Add is chosen.
+        const lists = gatherCollections(good, opts);
+        const kept = lists.reduce((n, c) => n + c.items.length, 0);
+        setFound({
+          kind: 'lists', rows: lists, raw: good, opts, lost: good.length - kept,
+          skipped: skipped + (out.length - good.length), file: file.name,
+        });
       } else if (looksLikeEvents) {
         const { out, skipped } = fromCsv(EVENT_COLS, rows, () => ({
           id: uid(), addedOn: todayStr(), kind: 'Other', people: [],
@@ -4738,7 +4865,8 @@ function ImportView({ people, events, reminders, collections, onPeople, onEvents
     } else if (found.kind === 'reminders') {
       onReminders(mode === 'replace' ? found.rows : [...reminders, ...found.rows]);
     } else if (found.kind === 'lists') {
-      onCollections(mode === 'replace' ? found.rows : mergeCollections(collections, found.rows));
+      onCollections(mode === 'replace' ? found.rows
+        : mergeCollections(collections, gatherCollections(found.raw, { ...found.opts, have: collections })));
     } else {
       onEvents(mode === 'replace' ? found.rows : [...events, ...found.rows]);
     }
@@ -4810,6 +4938,11 @@ function ImportView({ people, events, reminders, collections, onPeople, onEvents
               <Check on={mode === 'replace'} onChange={() => setMode('replace')}
                 label="Replace everything"
                 hint={`Removes your current ${found.kind}`} />
+              {found.kind === 'lists' && found.lost + importOverflow(collections, found.rows, mode) > 0 && (
+                <p style={{ margin: '0 0 12px', fontSize: 13, color: C.overdue, lineHeight: 1.5 }}>
+                  {`${countThings(found.lost + importOverflow(collections, found.rows, mode), 'entry', 'entries')} will not fit. A list holds at most ${ITEM_CAP.toLocaleString()}.`}
+                </p>
+              )}
               <Button kind="solid" onClick={commit} style={{ width: '100%', marginBottom: 10 }}>
                 {mode === 'replace' ? 'Replace' : 'Add'} {found.rows.length} {found.kind}
               </Button>
@@ -4845,6 +4978,7 @@ export default function PersonalCRM() {
   const [collectionOpen, setCollectionOpen] = useState(null);
   const [collectionDraft, setCollectionDraft] = useState(null);
   const [incoming, setIncoming] = useState(null);
+  const listsLook = useRef({ q: '', kind: 'All', order: 'recent' });
   const [menuOpen, setMenuOpen] = useState(false);
   const [year, setYear] = useState(new Date().getFullYear());
   const [backup, setBackup] = useState('');
@@ -4909,19 +5043,22 @@ export default function PersonalCRM() {
   // Someone opened a shared list's link. Nothing is added until they say so,
   // and the link is taken out of the address bar straight away, so a reload
   // or a bookmark does not offer the same list again.
+  //
+  // Arriving with a link goes straight to the offer, since nothing can be
+  // open yet. A link pasted into the address bar later only raises a notice
+  // (see sharedWaiting), so a half-filled form is never thrown away for it.
   useEffect(() => {
-    const look = () => {
+    const look = (arriving) => {
       if (!window.location.hash.startsWith(`#${SHARE_PREFIX}`)) return;
       const got = readShared(window.location.hash);
       window.history.replaceState(null, '', window.location.pathname + window.location.search);
       setIncoming(got || { broken: true });
-      setView('collections');
-      setCollectionOpen(null);
-      setCollectionDraft(null);
+      if (arriving) setView('collections');
     };
-    look();
-    window.addEventListener('hashchange', look);
-    return () => window.removeEventListener('hashchange', look);
+    look(true);
+    const later = () => look(false);
+    window.addEventListener('hashchange', later);
+    return () => window.removeEventListener('hashchange', later);
   }, []);
 
   const persist = async (next) => {
@@ -5035,11 +5172,13 @@ export default function PersonalCRM() {
     persistCollections(exists ? collections.map((x) => (x.id === c.id ? next : x)) : [...collections, next]);
   };
 
-  const openCollectionById = (id) => {
+  // Stable, so list cards (memoised) are not redrawn just because this
+  // component was.
+  const openCollectionById = useCallback((id) => {
     setCollectionOpen(id);
     setCollectionDraft(null);
     window.scrollTo(0, 0);
-  };
+  }, []);
 
   const saveCollection = (c) => {
     putCollection(c);
@@ -5079,7 +5218,7 @@ export default function PersonalCRM() {
       // only a bad backup when there is nothing else in it either.
       if (Object.values(parts).every((x) => x.length === 0)) throw new Error('nothing in it');
     } catch {
-      setError("That backup could not be read. Paste the whole thing, starting with [ and ending with ].");
+      setError('That backup could not be read. Paste the whole thing, exactly as it was copied.');
       return;
     }
     // Writing is kept out of the block above so a storage failure is never
@@ -5170,7 +5309,7 @@ export default function PersonalCRM() {
     reminders.forEach((r) => (r.history || []).forEach((h) =>
       h?.date && found.add(Number(h.date.slice(0, 4)))));
     collections.forEach((c) => c.items.forEach((it) =>
-      it.doneOn && found.add(Number(it.doneOn.slice(0, 4)))));
+      it.doneOn && stageOf(c, it) === 'done' && found.add(Number(it.doneOn.slice(0, 4)))));
     return [...found].sort((a, b) => b - a);
   }, [people, reminders, collections]);
 
@@ -5186,6 +5325,17 @@ export default function PersonalCRM() {
 
   const selectedPerson = people.find((x) => x.id === (editing || openId)) || null;
   const panelOpen = Boolean(adding || editing || openId);
+
+  const openCollection = collections.find((x) => x.id === collectionOpen) || null;
+  const selectedId = selectedPerson?.id;
+  const myRecs = useMemo(() => (selectedId
+    ? collections.flatMap((c) => c.items.filter((it) => it.from === selectedId).map((it) => ({ c, it })))
+    : []), [collections, selectedId]);
+
+  // A link that arrived while something else was on screen waits here until
+  // asked for, rather than pulling the page out from under an open form.
+  const sharedWaiting = Boolean(incoming)
+    && !(view === 'collections' && !collectionDraft && !openCollection);
 
   const list = filtering
     ? everyone.filter((p) =>
@@ -5269,6 +5419,13 @@ export default function PersonalCRM() {
           .crm-idle { display: block; }
         }
         .crm-person:last-child, .crm-entry:last-child { border-bottom: none !important; }
+        /* A list can hold thousands of entries. Rows off screen are skipped
+           until scrolled to, which is most of what a keystroke costs on a long
+           list. Still found by find-in-page and screen readers. */
+        .crm-entry { content-visibility: auto; contain-intrinsic-size: auto 62px; }
+        /* That also clips painting to each row, which would cut off a focus
+           ring drawn outside a button that fills the row, so rings go inside. */
+        .crm-entry .crm-btn:focus-visible, .crm-entry a:focus-visible { outline-offset: -3px; }
         .crm-select {
           appearance: none; -webkit-appearance: none;
           background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.5 4.5 L6 8 L9.5 4.5' fill='none' stroke='${encodeURIComponent(C.muted)}' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
@@ -5296,7 +5453,7 @@ export default function PersonalCRM() {
               defaultValue={owner}
               placeholder="Your name"
               onBlur={(e) => saveOwner(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') saveOwner(e.target.value); }}
+              onKeyDown={(e) => { if (isEnter(e)) saveOwner(e.target.value); }}
               style={{ ...inputStyle, width: 170, minHeight: 32, padding: '5px 9px', fontSize: 14 }}
             />
           ) : (
@@ -5422,6 +5579,17 @@ export default function PersonalCRM() {
         {error && (
           <p style={{ margin: '12px 0 0', fontSize: 13, color: C.overdue }}>{error}</p>
         )}
+        {sharedWaiting && (
+          <p role="status" style={{ margin: '12px 0 0', fontSize: 13, color: C.ink, display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
+            {incoming.broken
+              ? 'A shared list arrived but could not be read.'
+              : `${incoming.by || 'Someone'} shared a list with you: ${incoming.c.name}.`}
+            <button className="crm-btn" onClick={() => { setView('collections'); setCollectionOpen(null); setCollectionDraft(null); }}
+              style={{ font: 'inherit', fontSize: 13, fontWeight: 600, color: C.ink, background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textDecoration: 'underline' }}>
+              See it
+            </button>
+          </p>
+        )}
         </div>
 
         {view === 'events' && (
@@ -5474,7 +5642,10 @@ export default function PersonalCRM() {
         )}
 
         {view === 'collections' && (
-          <div className="crm-full">
+          // Keyed on the theme: rows and cards here are memoised, and the
+          // theme lives in C rather than in their props, so a theme change
+          // must start them afresh or they would keep the old colours.
+          <div className="crm-full" key={theme}>
             {loading ? (
               <p style={{ fontSize: 14, color: C.muted }}>One moment.</p>
             ) : collectionDraft ? (
@@ -5484,16 +5655,16 @@ export default function PersonalCRM() {
                 onSave={saveCollection}
                 onCancel={() => setCollectionDraft(null)}
               />
-            ) : collections.some((x) => x.id === collectionOpen) ? (
+            ) : openCollection ? (
               <CollectionDetail
-                key={collectionOpen}
-                c={collections.find((x) => x.id === collectionOpen)}
+                key={openCollection.id}
+                c={openCollection}
                 people={people}
                 owner={owner}
                 onSave={putCollection}
-                onEdit={() => setCollectionDraft({ c: collections.find((x) => x.id === collectionOpen) })}
+                onEdit={() => setCollectionDraft({ c: openCollection })}
                 onRemove={() => {
-                  persistCollections(collections.filter((x) => x.id !== collectionOpen));
+                  persistCollections(collections.filter((x) => x.id !== openCollection.id));
                   setCollectionOpen(null);
                 }}
                 onBack={() => setCollectionOpen(null)}
@@ -5501,6 +5672,7 @@ export default function PersonalCRM() {
             ) : (
               <CollectionsView
                 collections={collections}
+                look={listsLook}
                 incoming={incoming}
                 onOpen={openCollectionById}
                 onNew={(kind) => setCollectionDraft({ c: null, kind })}
@@ -5547,7 +5719,8 @@ export default function PersonalCRM() {
               reminderCount={reminders.reduce((n, r) => n + (r.history || [])
                 .filter((h) => h?.date && Number(h.date.slice(0, 4)) === year).length, 0)}
               listCount={collections.reduce((n, c) => n + c.items
-                .filter((it) => it.doneOn && Number(it.doneOn.slice(0, 4)) === year).length, 0)} />
+                .filter((it) => it.doneOn && stageOf(c, it) === 'done' && Number(it.doneOn.slice(0, 4)) === year)
+                .length, 0)} />
           </div>
         )}
 
@@ -5735,9 +5908,7 @@ export default function PersonalCRM() {
               myReminders={reminders
                 .filter((r) => (r.people || []).includes(selectedPerson.id))
                 .sort(byDue)}
-              myRecs={collections.flatMap((c) => c.items
-                .filter((it) => it.from === selectedPerson.id)
-                .map((it) => ({ c, it })))}
+              myRecs={myRecs}
               onList={(id) => { setView('collections'); openCollectionById(id); }}
               onLog={logTouch}
               onEditLog={editLog}
