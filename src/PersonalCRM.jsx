@@ -1405,7 +1405,14 @@ const completeReminder = (r, on) => {
   return { ...r, history, lastDone: on, done: false, next: nextAfter(r, on) };
 };
 
-const snoozeReminder = (r, days) => ({ ...r, next: addUnits(todayStr(), 'day', days) });
+// Pushed back from wherever it already sits, not from today: nudging a
+// reminder that is months out should move it further out, never drag it
+// forward to next week. Something already late restarts from today.
+const snoozeReminder = (r, days) => {
+  const today = todayStr();
+  const base = r.next && r.next > today ? r.next : today;
+  return { ...r, next: addUnits(base, 'day', days) };
+};
 
 // Starter reminders, with the intervals each job is usually given: filters
 // every three months, dryer vents and gutters twice a year, estimated taxes
@@ -1555,6 +1562,10 @@ const REMINDER_COLS = [
     set: (r, v) => { r.every = { unit: 'month', ...(r.every || {}), n: Number(v) }; } },
   { h: 'Repeat unit', get: (r) => (repeatOf(r) ? repeatOf(r).unit : ''),
     set: (r, v) => { r.every = { n: 1, ...(r.every || {}), unit: v.toLowerCase().replace(/s$/, '') }; } },
+  // Exported so a monthly reminder pinned to the 31st comes back pinned to the
+  // 31st, rather than to whichever day a short month had clamped it to.
+  { h: 'Repeat day of month', get: (r) => (repeatOf(r) ? String(repeatOf(r).dom) : ''),
+    set: (r, v) => { r.every = { unit: 'month', n: 1, ...(r.every || {}), dom: Number(v) }; } },
   { h: 'Counts from', get: (r) => (r.anchor === 'done' ? 'the day it is done' : 'the calendar'),
     set: (r, v) => { r.anchor = /done|last/i.test(v) ? 'done' : 'date'; } },
   { h: 'Notice days', get: (r) => String(leadOf(r)), set: (r, v) => { r.lead = Number(v); } },
@@ -1658,7 +1669,10 @@ const buildUpcoming = (people, events, reminders) => {
   (reminders || []).forEach((r) => {
     if (r.paused || r.done) return;
     const st = reminderState(r);
-    if (st.d === null || st.d > HORIZON) return;
+    // Only once it is inside the notice period asked for. "Tell me a week
+    // ahead" means this list stays quiet until that week, however far off the
+    // date is; anything already late is always worth showing.
+    if (st.d === null || st.d > Math.min(leadOf(r), HORIZON)) return;
     out.push({
       key: `r-${r.id}`, d: st.d, reminder: r, what: r.title,
       tone: st.key === 'over' ? 'over' : st.key === 'later' ? 'calm' : 'soon',
@@ -2525,6 +2539,15 @@ function ReminderForm({ initial, fresh, people, onSave, onCancel }) {
 
   const n = Math.min(99, Math.max(1, Math.round(Number(count) || 1)));
 
+  // Only a date the user actually moved re-pins the day of the month. Opening
+  // a reminder pinned to the 31st while it sits on a clamped Feb 28 and
+  // pressing Save would otherwise walk the whole series back to the 28th.
+  const schedule = () => {
+    const fresh = everyFrom(next, unit, n);
+    const kept = initial && initial.next === next ? repeatOf(initial) : null;
+    return kept ? { ...fresh, dom: kept.dom } : fresh;
+  };
+
   const save = () => {
     const t = title.trim();
     if (!t || !next) return;
@@ -2533,7 +2556,7 @@ function ReminderForm({ initial, fresh, people, onSave, onCancel }) {
       addedOn: initial?.addedOn || todayStr(),
       title: t,
       kind,
-      every: repeats ? everyFrom(next, unit, n) : null,
+      every: repeats ? schedule() : null,
       anchor: repeats ? anchor : 'date',
       next,
       lead,
@@ -2545,6 +2568,13 @@ function ReminderForm({ initial, fresh, people, onSave, onCancel }) {
       done: repeats ? false : Boolean(initial?.done),
     });
   };
+
+  // Starters and imported sheets carry intervals the preset row does not
+  // list. Show the real one rather than leaving nothing selected, where any
+  // corrective tap would quietly change it.
+  const leadChoices = LEADS.some(([v]) => v === lead)
+    ? LEADS
+    : [...LEADS, [lead, `${lead} day${lead === 1 ? '' : 's'}`]].sort((a, b) => a[0] - b[0]);
 
   const pick = (on) => ({
     flex: 1, font: 'inherit', fontSize: 13, fontWeight: 600, padding: '8px 0',
@@ -2621,7 +2651,7 @@ function ReminderForm({ initial, fresh, people, onSave, onCancel }) {
 
       <Group label="Tell me ahead of time">
         <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
-          {LEADS.map(([v, l]) => (
+          {leadChoices.map(([v, l]) => (
             <button
               key={v}
               className="crm-btn"
@@ -3240,10 +3270,12 @@ function ImportView({ people, events, reminders, onPeople, onEvents, onReminders
           title: '', next: '', every: null, lead: 7, note: '', people: [],
           history: [], lastDone: null, paused: false, done: false,
         }));
-        // A row that named an interval but no day to pin it to gets one from
-        // the date it is due, so month-end repeats behave from the first tick.
+        // A sheet that named an interval but no day to pin it to gets one from
+        // the date it is due. A sheet that did name one keeps it.
         const good = out.filter((r) => r.title && /^\d{4}-\d{2}-\d{2}$/.test(r.next))
-          .map((r) => (r.every ? { ...r, every: { ...r.every, dom: everyFrom(r.next).dom } } : r));
+          .map((r) => (r.every && !r.every.dom
+            ? { ...r, every: { ...r.every, dom: everyFrom(r.next).dom } }
+            : r));
         setFound({ kind: 'reminders', rows: good, skipped: skipped + (out.length - good.length), file: file.name });
       } else if (looksLikeEvents) {
         const { out, skipped } = fromCsv(EVENT_COLS, rows, () => ({
