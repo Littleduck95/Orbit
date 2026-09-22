@@ -112,10 +112,10 @@ const SOCIALS = [
 ];
 
 /* ---------- date helpers ---------- */
-const todayStr = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-};
+const fmtDate = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+const todayStr = () => fmtDate(new Date());
 
 const parseDate = (s) => {
   const [y, m, d] = s.split('-').map(Number);
@@ -199,6 +199,15 @@ const daysToBirthday = (s) => {
 };
 
 const countdown = (d) => (d === 0 ? 'today' : d === 1 ? 'tomorrow' : `in ${elapsed(d)}`);
+
+// Signed, unlike daysToBirthday: a date that has gone by comes back negative
+// rather than rolling forward to next year's occurrence.
+const daysUntil = (s) => {
+  if (!s) return null;
+  const now = new Date();
+  now.setHours(12, 0, 0, 0);
+  return Math.round((parseDate(s) - now) / 86400000);
+};
 
 const status = (p) => {
   const d = daysSince(p.lastContact);
@@ -374,6 +383,20 @@ function Field({ label, children }) {
       <span style={{ display: 'block', fontSize: 13, color: C.muted, marginBottom: 5, fontWeight: 500 }}>{label}</span>
       {children}
     </label>
+  );
+}
+
+// Same thing to look at, but not a <label>. A label with no "for" attaches
+// itself to the first labelable thing inside it, and a <button> counts: wrap a
+// row of choices in Field and the heading becomes the first button's name, so
+// it reads as "How often Just once" and clicking the heading presses it.
+// Anything holding buttons rather than a single input belongs in here.
+function Group({ label, children }) {
+  return (
+    <div style={{ display: 'block', marginBottom: 14 }}>
+      <span style={{ display: 'block', fontSize: 13, color: C.muted, marginBottom: 5, fontWeight: 500 }}>{label}</span>
+      {children}
+    </div>
   );
 }
 
@@ -925,7 +948,7 @@ function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle }) {
   );
 }
 
-function PersonDetail({ p, myEvents, onLog, onEditLog, onRemoveLog, onEdit, onRemove, onTag, onClose }) {
+function PersonDetail({ p, myEvents, myReminders, onLog, onEditLog, onRemoveLog, onEdit, onRemove, onTag, onClose }) {
   const [logging, setLogging] = useState(false);
   const [logDate, setLogDate] = useState(todayStr());
   const [logText, setLogText] = useState('');
@@ -1124,6 +1147,23 @@ function PersonDetail({ p, myEvents, onLog, onEditLog, onRemoveLog, onEdit, onRe
             </div>
           )}
 
+          {(myReminders || []).length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <p style={{ margin: '0 0 6px', fontSize: 12.5, color: C.faint }}>Coming round again</p>
+              {myReminders.map((r) => {
+                const st = reminderState(r);
+                return (
+                  <p key={r.id} style={{ margin: '0 0 4px', fontSize: 13, color: C.ink, lineHeight: 1.45 }}>
+                    {r.title}
+                    <span style={{ color: st.key === 'over' ? C.overdue : C.faint }}>
+                      {` — ${st.key === 'paused' ? 'paused' : st.key === 'done' ? 'done' : dueText(st.d)}`}
+                    </span>
+                  </p>
+                );
+              })}
+            </div>
+          )}
+
           {p.note && (
             <p className="crm-serif" style={{ margin: '0 0 14px', fontSize: 15, lineHeight: 1.6, color: C.ink }}>
               {p.note}
@@ -1215,6 +1255,224 @@ function PersonDetail({ p, myEvents, onLog, onEditLog, onRemoveLog, onEdit, onRe
   );
 }
 
+/* ---------- reminders ---------- */
+// Events are what happened. Reminders are what comes round again: the filter
+// that needs changing, the card that needs paying, the talks that get posted
+// every September. Two things make this more than a list of dates.
+//
+// First, repeats are counted in calendar units, not days. "Monthly" on the
+// 15th stays on the 15th instead of drifting a day earlier every other month,
+// and a yearly reminder keeps its date through leap years.
+//
+// Second, a repeat is anchored one of two ways, because the two jobs behave
+// differently. A card bill is due on the 15th whether you paid early or a
+// week late, so it counts from the calendar. A furnace filter lasts three
+// months from the day you actually changed it, so it counts from completion.
+// Getting this wrong makes a reminder app quietly useless: fixed dates drift,
+// or maintenance intervals pile up while you are away.
+const REMINDERS_KEY = 'crm-reminders-v1';
+
+const REMINDER_KINDS = ['Home', 'Money', 'Health', 'Admin', 'Car', 'Pets', 'Watch', 'Other'];
+
+const REPEAT_UNITS = [
+  { unit: 'day', one: 'day', many: 'days' },
+  { unit: 'week', one: 'week', many: 'weeks' },
+  { unit: 'month', one: 'month', many: 'months' },
+  { unit: 'year', one: 'year', many: 'years' },
+];
+
+const daysInMonth = (y, m) => new Date(y, m + 1, 0).getDate();
+
+// Clamps rather than overflows: Jan 31 plus a month is the last day of
+// February, not the third of March, and Feb 29 plus a year is Feb 28.
+//
+// keepDay is what stops that clamp from being a one-way door. Advancing month
+// by month from the 31st would otherwise hit February, clamp to the 28th, and
+// carry the 28th forward for good — a card due on the 31st would quietly
+// become a card due on the 28th. Passing the day the series is really pinned
+// to lets every month go back to it.
+const addUnits = (s, unit, n, keepDay) => {
+  const d = parseDate(s);
+  if (unit === 'day') { d.setDate(d.getDate() + n); return fmtDate(d); }
+  if (unit === 'week') { d.setDate(d.getDate() + n * 7); return fmtDate(d); }
+  const months = unit === 'year' ? n * 12 : n;
+  const day = Math.min(31, Math.max(1, Math.round(Number(keepDay)) || d.getDate()));
+  d.setDate(1); // never overflow the month while the month is being changed
+  d.setMonth(d.getMonth() + months);
+  d.setDate(Math.min(day, daysInMonth(d.getFullYear(), d.getMonth())));
+  return fmtDate(d);
+};
+
+// The day of the month a repeat is pinned to, carried alongside the interval
+// so a short February cannot rewrite it. Every way of making a reminder goes
+// through here, so nothing is left without one.
+const everyFrom = (next, unit, n) => ({ unit, n, dom: Number((next || '').slice(8, 10)) || 1 });
+
+// Everything downstream reads the repeat through here, so a hand-edited CSV
+// carrying "every 0 fortnights" cannot stall the advance loop below.
+const repeatOf = (r) => {
+  if (!r?.every?.unit) return null;
+  const unit = REPEAT_UNITS.some((u) => u.unit === r.every.unit) ? r.every.unit : 'month';
+  const n = Math.min(99, Math.max(1, Math.round(Number(r.every.n) || 1)));
+  // Older entries, and hand-made CSVs, carry no pinned day: fall back to the
+  // day the next date already sits on.
+  const dom = Math.min(31, Math.max(1, Math.round(Number(r.every.dom)) || Number((r.next || '').slice(8, 10)) || 1));
+  return { unit, n, dom };
+};
+
+const repeatText = (r) => {
+  const rep = repeatOf(r);
+  if (!rep) return 'once';
+  const u = REPEAT_UNITS.find((x) => x.unit === rep.unit);
+  return rep.n === 1 ? `every ${u.one}` : `every ${rep.n} ${u.many}`;
+};
+
+// How much warning you get. Renewals are the reason this exists: a passport
+// or an open-enrollment window is no use to you on the morning it closes.
+const leadOf = (r) => Math.min(365, Math.max(0, Math.round(Number(r?.lead) || 0)));
+
+const REMINDER_ORDER = { over: 0, today: 1, soon: 2, later: 3, paused: 4, done: 5 };
+
+const reminderState = (r) => {
+  const d = daysUntil(r.next);
+  if (r.paused) return { key: 'paused', tone: C.muted, bar: C.line, d };
+  if (r.done) return { key: 'done', tone: C.muted, bar: C.line, d };
+  if (d === null) return { key: 'later', tone: C.muted, bar: C.line, d };
+  if (d < 0) return { key: 'over', tone: C.overdue, bar: C.overdueBar, d };
+  if (d === 0) return { key: 'today', tone: C.soonText, bar: C.soonBar, d };
+  if (d <= leadOf(r)) return { key: 'soon', tone: C.soonText, bar: C.soonBar, d };
+  return { key: 'later', tone: C.calmText, bar: C.calmBar, d };
+};
+
+const dueText = (d) => {
+  if (d === null) return 'no date set';
+  if (d === 0) return 'due today';
+  if (d === 1) return 'due tomorrow';
+  if (d === -1) return 'due yesterday';
+  if (d < 0) return `${elapsed(-d)} late`;
+  return `in ${elapsed(d)}`;
+};
+
+// Worst first, then soonest within each band. Paused and finished sink.
+const byDue = (a, b) => {
+  const sa = reminderState(a);
+  const sb = reminderState(b);
+  if (REMINDER_ORDER[sa.key] !== REMINDER_ORDER[sb.key]) {
+    return REMINDER_ORDER[sa.key] - REMINDER_ORDER[sb.key];
+  }
+  if (sa.d === null) return sb.d === null ? 0 : 1;
+  if (sb.d === null) return -1;
+  return sa.d - sb.d;
+};
+
+// Where a repeat lands after you tick it off. A calendar-anchored reminder
+// keeps its slot and skips over anything already missed, so catching up on
+// three late months does not leave you three months behind.
+const nextAfter = (r, on) => {
+  const rep = repeatOf(r);
+  if (!rep) return null;
+  // Counting from the day it was actually done: the interval simply restarts,
+  // so the day of the month is free to move with it.
+  if (r.anchor === 'done') return addUnits(on, rep.unit, rep.n);
+
+  const from = r.next || on;
+  let next = addUnits(from, rep.unit, rep.n, rep.dom);
+  if (rep.unit === 'day' || rep.unit === 'week') {
+    // Even intervals: work out the jump instead of stepping. A daily reminder
+    // left alone for years would otherwise need thousands of iterations.
+    const step = rep.unit === 'week' ? rep.n * 7 : rep.n;
+    const gap = Math.round((parseDate(on) - parseDate(from)) / 86400000);
+    if (gap >= 0) next = addUnits(from, 'day', step * (Math.floor(gap / step) + 1));
+  } else {
+    for (let i = 0; i < 1200 && next <= on; i += 1) next = addUnits(next, rep.unit, rep.n, rep.dom);
+  }
+  // Whatever happened above, never hand back a date that is already behind:
+  // a reminder ticked off should not come back still overdue.
+  return next > on ? next : addUnits(on, rep.unit, rep.n, rep.dom);
+};
+
+// History is capped: a daily reminder kept for years would otherwise grow
+// without limit inside a storage backend measured in megabytes.
+const HISTORY_CAP = 60;
+
+const completeReminder = (r, on) => {
+  const history = [{ date: on }, ...(r.history || [])]
+    .filter((h) => h && h.date)
+    .sort((a, b) => (a.date < b.date ? 1 : -1))
+    .slice(0, HISTORY_CAP);
+  const rep = repeatOf(r);
+  if (!rep) return { ...r, history, lastDone: on, done: true };
+  return { ...r, history, lastDone: on, done: false, next: nextAfter(r, on) };
+};
+
+const snoozeReminder = (r, days) => ({ ...r, next: addUnits(todayStr(), 'day', days) });
+
+// Starter reminders, with the intervals each job is usually given: filters
+// every three months, dryer vents and gutters twice a year, estimated taxes
+// with a fortnight of notice because no one sends you an invoice for them.
+const STARTERS = [
+  { title: 'Replace the HVAC filter', kind: 'Home', n: 3, unit: 'month', anchor: 'done', lead: 7,
+    note: 'Every three months for a standard filter. Monthly if you have pets or allergies.' },
+  { title: 'Clean out the dryer vent', kind: 'Home', n: 6, unit: 'month', anchor: 'done', lead: 7,
+    note: 'Lint in the duct is the single biggest cause of dryer fires.' },
+  { title: 'Clean the gutters', kind: 'Home', n: 6, unit: 'month', anchor: 'done', lead: 14,
+    note: 'Once after the leaves come down, once before the spring rain.' },
+  { title: 'Flush the water heater', kind: 'Home', n: 1, unit: 'year', anchor: 'done', lead: 14,
+    note: 'Clears the sediment that quietly eats efficiency and lifespan.' },
+  { title: 'Test the smoke and CO alarms', kind: 'Home', n: 6, unit: 'month', anchor: 'done', lead: 3 },
+  { title: 'Service the furnace and AC', kind: 'Home', n: 1, unit: 'year', anchor: 'done', lead: 21,
+    note: 'Book it before the first cold snap, when every other house is calling.' },
+  { title: 'Take the bins out', kind: 'Home', n: 1, unit: 'week', anchor: 'date', lead: 0 },
+
+  { title: 'Pay the credit card in full', kind: 'Money', n: 1, unit: 'month', anchor: 'date', lead: 3 },
+  { title: 'Pay the estimated taxes', kind: 'Money', n: 3, unit: 'month', anchor: 'date', lead: 14,
+    note: 'Mid-January, April, June and September. Nobody invoices you for these.' },
+  { title: 'Read through the subscriptions', kind: 'Money', n: 3, unit: 'month', anchor: 'done', lead: 3,
+    note: 'The ones you have forgotten about are the expensive ones.' },
+  { title: 'File the tax return', kind: 'Money', n: 1, unit: 'year', anchor: 'date', lead: 30 },
+  { title: 'Decide if the card annual fee still earns its keep', kind: 'Money', n: 1, unit: 'year', anchor: 'date', lead: 30 },
+
+  { title: 'Book the dental cleaning', kind: 'Health', n: 6, unit: 'month', anchor: 'done', lead: 14 },
+  { title: 'Book the annual physical', kind: 'Health', n: 1, unit: 'year', anchor: 'done', lead: 21 },
+  { title: 'Book an eye exam', kind: 'Health', n: 1, unit: 'year', anchor: 'done', lead: 21 },
+
+  { title: 'Open enrollment for health insurance', kind: 'Admin', n: 1, unit: 'year', anchor: 'date', lead: 14,
+    note: 'The window is short and it does not reopen because you missed it.' },
+  { title: 'Renew the vehicle registration', kind: 'Admin', n: 1, unit: 'year', anchor: 'date', lead: 30 },
+  { title: 'Check the passports are still in date', kind: 'Admin', n: 1, unit: 'year', anchor: 'date', lead: 30,
+    note: 'Renewals take months, and plenty of countries want six of them left on the clock.' },
+  { title: 'Shop the home and auto insurance rates', kind: 'Admin', n: 1, unit: 'year', anchor: 'done', lead: 14 },
+
+  { title: 'Change the oil', kind: 'Car', n: 6, unit: 'month', anchor: 'done', lead: 7 },
+  { title: 'Rotate the tires', kind: 'Car', n: 6, unit: 'month', anchor: 'done', lead: 7 },
+
+  { title: 'Take the pets for a checkup', kind: 'Pets', n: 1, unit: 'year', anchor: 'done', lead: 14 },
+  { title: 'Flea and heartworm dose', kind: 'Pets', n: 1, unit: 'month', anchor: 'date', lead: 1 },
+
+  { title: 'Catch up on the All-In Summit talks', kind: 'Watch', n: 1, unit: 'year', anchor: 'date', lead: 7,
+    note: 'The talks go up after the summit. No subscription to anything required.' },
+  { title: 'Rewatch the thing you say you will rewatch', kind: 'Watch', n: 1, unit: 'year', anchor: 'date', lead: 7 },
+];
+
+// A starter arrives already scheduled one interval out, so it can be saved
+// without filling anything in, and moved if that is not the right date.
+const fromStarter = (s) => ({
+  id: uid(),
+  addedOn: todayStr(),
+  title: s.title,
+  kind: s.kind,
+  every: everyFrom(addUnits(todayStr(), s.unit, s.n), s.unit, s.n),
+  anchor: s.anchor,
+  next: addUnits(todayStr(), s.unit, s.n),
+  lead: s.lead,
+  note: s.note || '',
+  people: [],
+  history: [],
+  lastDone: null,
+  paused: false,
+  done: false,
+});
+
 /* ---------- csv ---------- */
 // Arrays are joined with ";" so they survive a comma-delimited file.
 const joinList = (a) => (a || []).join('; ');
@@ -1288,6 +1546,24 @@ const EVENT_COLS = [
   { h: 'Details', get: (e) => e.note || '', set: (e, v) => { e.note = v; } },
 ];
 
+const REMINDER_COLS = [
+  { h: 'Title', get: (r) => r.title, set: (r, v) => { r.title = v; } },
+  { h: 'Category', get: (r) => r.kind || 'Other',
+    set: (r, v) => { r.kind = REMINDER_KINDS.find((k) => k.toLowerCase() === v.toLowerCase()) || 'Other'; } },
+  { h: 'Next due', get: (r) => r.next || '', set: (r, v) => { r.next = v; } },
+  { h: 'Repeat every', get: (r) => (repeatOf(r) ? String(repeatOf(r).n) : ''),
+    set: (r, v) => { r.every = { unit: 'month', ...(r.every || {}), n: Number(v) }; } },
+  { h: 'Repeat unit', get: (r) => (repeatOf(r) ? repeatOf(r).unit : ''),
+    set: (r, v) => { r.every = { n: 1, ...(r.every || {}), unit: v.toLowerCase().replace(/s$/, '') }; } },
+  { h: 'Counts from', get: (r) => (r.anchor === 'done' ? 'the day it is done' : 'the calendar'),
+    set: (r, v) => { r.anchor = /done|last/i.test(v) ? 'done' : 'date'; } },
+  { h: 'Notice days', get: (r) => String(leadOf(r)), set: (r, v) => { r.lead = Number(v); } },
+  { h: 'Last done', get: (r) => r.lastDone || '', set: (r, v) => { r.lastDone = v || null; } },
+  { h: 'Paused', get: (r) => yesNo(r.paused), set: (r, v) => { r.paused = isYes(v); } },
+  { h: 'Finished', get: (r) => yesNo(r.done), set: (r, v) => { r.done = isYes(v); } },
+  { h: 'Details', get: (r) => r.note || '', set: (r, v) => { r.note = v; } },
+];
+
 const norm = (h) => (h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
 const toCsv = (cols, rows, extra) =>
@@ -1336,7 +1612,7 @@ const downloadCsv = (name, text) => {
 const HORIZON = 45;
 
 // Everything time-sensitive across people and events, in one ordered list.
-const buildUpcoming = (people, events) => {
+const buildUpcoming = (people, events, reminders) => {
   const out = [];
 
   people.forEach((p) => {
@@ -1377,14 +1653,31 @@ const buildUpcoming = (people, events) => {
     }
   });
 
+  // Reminders are the one thing here that can already be late, so unlike a
+  // birthday they are allowed a negative d and sort above everything else.
+  (reminders || []).forEach((r) => {
+    if (r.paused || r.done) return;
+    const st = reminderState(r);
+    if (st.d === null || st.d > HORIZON) return;
+    out.push({
+      key: `r-${r.id}`, d: st.d, reminder: r, what: r.title,
+      tone: st.key === 'over' ? 'over' : st.key === 'later' ? 'calm' : 'soon',
+      detail: r.kind && r.kind !== 'Other' ? r.kind.toLowerCase() : '',
+      due: dueText(st.d),
+    });
+  });
+
   return out.sort((a, b) => a.d - b.d);
 };
 
-function Upcoming({ people, events, quiet, onShowQuiet, onPerson }) {
+function Upcoming({ people, events, reminders, quiet, onShowQuiet, onPerson, onReminder }) {
   const [open, setOpen] = useState(true);
-  const items = buildUpcoming(people, events);
+  const items = buildUpcoming(people, events, reminders);
   const total = items.length + (quiet > 0 ? 1 : 0);
   if (total === 0) return null;
+  // A late reminder counts as something wanting attention, same as a person
+  // who has gone quiet, so the badge does not read green while one sits red.
+  const pressing = quiet > 0 || items.some((it) => it.tone === 'over');
 
   return (
     <div style={{
@@ -1403,8 +1696,8 @@ function Upcoming({ people, events, quiet, onShowQuiet, onPerson }) {
         <span style={{ fontSize: 13, fontWeight: 600, color: C.ink, flex: 1 }}>Coming up</span>
         <span style={{
           fontSize: 11, fontWeight: 700, padding: '1px 7px', borderRadius: 20,
-          background: quiet > 0 ? C.overdue : C.accent,
-          color: quiet > 0 ? C.paper : C.onAccent,
+          background: pressing ? C.overdue : C.accent,
+          color: pressing ? C.paper : C.onAccent,
         }}>{total}</span>
         <span style={{ fontSize: 11, color: C.faint }}>{open ? 'Hide' : 'Show'}</span>
       </button>
@@ -1436,25 +1729,31 @@ function Upcoming({ people, events, quiet, onShowQuiet, onPerson }) {
             <button
               key={it.key}
               className="crm-btn"
-              onClick={() => it.person && onPerson(it.person.id)}
+              onClick={() => {
+                if (it.person) onPerson(it.person.id);
+                else if (it.reminder) onReminder();
+              }}
               style={{
                 display: 'flex', alignItems: 'baseline', gap: 9, width: '100%',
                 font: 'inherit', textAlign: 'left',
-                cursor: it.person ? 'pointer' : 'default',
+                cursor: it.person || it.reminder ? 'pointer' : 'default',
                 padding: '9px 0', background: 'transparent', border: 'none',
                 borderTop: `1px solid ${C.line}`,
               }}
             >
               <span style={{
                 width: 7, height: 7, borderRadius: 7, flexShrink: 0,
-                background: it.tone === 'soon' ? C.soonBar : C.accent,
+                background: it.tone === 'over' ? C.overdueBar : it.tone === 'soon' ? C.soonBar : C.accent,
               }} />
               <span style={{ flex: 1, minWidth: 0, fontSize: 13, color: C.ink }}>
                 {it.what}
                 {it.detail && <span style={{ color: C.faint }}>{`, ${it.detail}`}</span>}
               </span>
-              <span style={{ fontSize: 12, color: C.muted, flexShrink: 0, whiteSpace: 'nowrap' }}>
-                {countdown(it.d)}
+              <span style={{
+                fontSize: 12, flexShrink: 0, whiteSpace: 'nowrap',
+                color: it.tone === 'over' ? C.overdue : C.muted,
+              }}>
+                {it.due || countdown(it.d)}
               </span>
             </button>
           ))}
@@ -1566,7 +1865,7 @@ function Stat({ n, label, tone }) {
   );
 }
 
-function Recap({ people, year, years, onYear, eventCount }) {
+function Recap({ people, year, years, onYear, eventCount, reminderCount }) {
   const r = buildRecap(people, year);
   const maxMonth = Math.max(1, ...r.months);
 
@@ -1596,7 +1895,7 @@ function Recap({ people, year, years, onYear, eventCount }) {
         )}
       </div>
 
-      {r.total === 0 && r.added === 0 && !eventCount ? (
+      {r.total === 0 && r.added === 0 && !eventCount && !reminderCount ? (
         <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.6, margin: 0 }}>
           Nothing logged in {year} yet. Every catch-up you record builds this page, so it
           gets more interesting the longer you use it.
@@ -1608,6 +1907,7 @@ function Recap({ people, year, years, onYear, eventCount }) {
             <Stat n={r.added} label="people added" />
             <Stat n={r.activeMonths} label={`of 12 months with contact`} />
             <Stat n={eventCount} label="events recorded" />
+            {reminderCount > 0 && <Stat n={reminderCount} label="reminders kept" />}
           </div>
 
           {r.top.length > 0 && (
@@ -2203,6 +2503,481 @@ function EventsView({ events, people, onAdd, onEdit, onRemove }) {
   );
 }
 
+/* ---------- reminders: add / edit ---------- */
+const LEADS = [[0, 'On the day'], [3, '3 days'], [7, 'A week'], [14, '2 weeks'], [30, 'A month']];
+
+function ReminderForm({ initial, fresh, people, onSave, onCancel }) {
+  const [title, setTitle] = useState(initial?.title || '');
+  const [kind, setKind] = useState(initial?.kind || 'Home');
+  const [repeats, setRepeats] = useState(initial ? Boolean(repeatOf(initial)) : true);
+  const [unit, setUnit] = useState(repeatOf(initial)?.unit || 'month');
+  const [count, setCount] = useState(String(repeatOf(initial)?.n || 1));
+  const [anchor, setAnchor] = useState(initial?.anchor === 'done' ? 'done' : 'date');
+  const [next, setNext] = useState(initial?.next || addUnits(todayStr(), 'month', 1));
+  const [lead, setLead] = useState(initial ? leadOf(initial) : 7);
+  const [note, setNote] = useState(initial?.note || '');
+  const [who, setWho] = useState(initial?.people || []);
+  const [filter, setFilter] = useState('');
+
+  const toggle = (id) => setWho(who.includes(id) ? who.filter((x) => x !== id) : [...who, id]);
+  const shown = people.filter((x) =>
+    !filter.trim() || x.name.toLowerCase().includes(filter.trim().toLowerCase()));
+
+  const n = Math.min(99, Math.max(1, Math.round(Number(count) || 1)));
+
+  const save = () => {
+    const t = title.trim();
+    if (!t || !next) return;
+    onSave({
+      id: initial?.id || uid(),
+      addedOn: initial?.addedOn || todayStr(),
+      title: t,
+      kind,
+      every: repeats ? everyFrom(next, unit, n) : null,
+      anchor: repeats ? anchor : 'date',
+      next,
+      lead,
+      note: note.trim(),
+      people: who,
+      history: initial?.history || [],
+      lastDone: initial?.lastDone || null,
+      paused: Boolean(initial?.paused),
+      done: repeats ? false : Boolean(initial?.done),
+    });
+  };
+
+  const pick = (on) => ({
+    flex: 1, font: 'inherit', fontSize: 13, fontWeight: 600, padding: '8px 0',
+    borderRadius: 7, cursor: 'pointer',
+    background: on ? C.accent : 'transparent',
+    border: `1px solid ${on ? C.accent : C.line}`,
+    color: on ? C.onAccent : C.muted,
+  });
+
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
+      <Field label="What to remember">
+        <input style={inputStyle} value={title} onChange={(e) => setTitle(e.target.value)}
+          placeholder="Check the All-In Summit talks" />
+      </Field>
+
+      <Field label="Kind">
+        <select className="crm-select" style={inputStyle} value={kind} onChange={(e) => setKind(e.target.value)}>
+          {REMINDER_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
+        </select>
+      </Field>
+
+      <Group label="How often">
+        <div style={{ display: 'flex', gap: 8, marginBottom: repeats ? 9 : 0 }}>
+          {[[false, 'Just once'], [true, 'Again and again']].map(([v, l]) => (
+            <button key={l} className="crm-btn" onClick={() => setRepeats(v)} style={pick(repeats === v)}>
+              {l}
+            </button>
+          ))}
+        </div>
+
+        {repeats && (
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span style={{ fontSize: 13, color: C.muted }}>Every</span>
+            <input
+              type="number" min="1" max="99" value={count} aria-label="How many"
+              onChange={(e) => setCount(e.target.value)}
+              onBlur={() => setCount(String(n))}
+              style={{ ...inputStyle, width: 68, flex: '0 0 68px', minHeight: 38, fontSize: 14 }}
+            />
+            <select
+              className="crm-select" value={unit} aria-label="Unit"
+              onChange={(e) => setUnit(e.target.value)}
+              style={{ ...inputStyle, width: 'auto', flex: 1, minHeight: 38, fontSize: 14 }}
+            >
+              {REPEAT_UNITS.map((u) => (
+                <option key={u.unit} value={u.unit}>{n === 1 ? u.one : u.many}</option>
+              ))}
+            </select>
+          </div>
+        )}
+      </Group>
+
+      <Field label={repeats ? 'Next one due' : 'Due'}>
+        <input type="date" style={inputStyle} value={next} onChange={(e) => setNext(e.target.value)} />
+      </Field>
+
+      {repeats && (
+        <Group label="Count the gap from">
+          <div style={{ display: 'flex', gap: 8 }}>
+            {[['date', 'The calendar'], ['done', 'The day I do it']].map(([v, l]) => (
+              <button key={v} className="crm-btn" onClick={() => setAnchor(v)} style={pick(anchor === v)}>
+                {l}
+              </button>
+            ))}
+          </div>
+          <span style={{ display: 'block', fontSize: 12, color: C.faint, marginTop: 6, lineHeight: 1.5 }}>
+            {anchor === 'date'
+              ? 'Keeps its place on the calendar. A bill due on the 15th stays on the 15th whether you pay it early or late.'
+              : 'Restarts the clock when you tick it off. A filter lasts three months from the day you actually changed it.'}
+          </span>
+        </Group>
+      )}
+
+      <Group label="Tell me ahead of time">
+        <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+          {LEADS.map(([v, l]) => (
+            <button
+              key={v}
+              className="crm-btn"
+              onClick={() => setLead(v)}
+              style={{
+                font: 'inherit', fontSize: 12.5, fontWeight: 600, padding: '6px 12px',
+                borderRadius: 20, cursor: 'pointer',
+                background: lead === v ? C.accent : 'transparent',
+                border: `1px solid ${lead === v ? C.accent : C.line}`,
+                color: lead === v ? C.onAccent : C.muted,
+              }}
+            >{l}</button>
+          ))}
+        </div>
+        <span style={{ display: 'block', fontSize: 12, color: C.faint, marginTop: 6, lineHeight: 1.5 }}>
+          How long before it is due this starts nudging you. Renewals want the room.
+        </span>
+      </Group>
+
+      {people.length > 0 && (
+        <Group label="Anyone involved">
+          {people.length > 10 && (
+            <input style={{ ...inputStyle, marginBottom: 8, minHeight: 38, fontSize: 14 }}
+              value={filter} onChange={(e) => setFilter(e.target.value)}
+              aria-label="Filter names" placeholder="Filter names" />
+          )}
+          <div style={{
+            display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 150, overflowY: 'auto',
+            border: `1px solid ${C.line}`, borderRadius: 8, padding: 9,
+          }}>
+            {shown.map((x) => {
+              const on = who.includes(x.id);
+              return (
+                <button
+                  key={x.id}
+                  className="crm-btn"
+                  onClick={() => toggle(x.id)}
+                  style={{
+                    font: 'inherit', fontSize: 12.5, fontWeight: 600, padding: '5px 10px',
+                    borderRadius: 20, cursor: 'pointer',
+                    background: on ? C.accent : 'transparent',
+                    border: `1px solid ${on ? C.accent : C.line}`,
+                    color: on ? C.onAccent : C.muted,
+                  }}
+                >{x.name}</button>
+              );
+            })}
+          </div>
+        </Group>
+      )}
+
+      <Field label="Details">
+        <textarea
+          className="crm-serif"
+          style={{ ...inputStyle, minHeight: 84, resize: 'vertical', lineHeight: 1.6 }}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="Anything future you will want to know. The account number, the plumber's name, why this matters."
+        />
+      </Field>
+
+      <div style={{ display: 'flex', gap: 8 }}>
+        <Button kind="solid" onClick={save} style={{ flex: 1 }}>
+          {fresh ? 'Add this reminder' : 'Save changes'}
+        </Button>
+        <Button onClick={onCancel}>Cancel</Button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- reminders: one card ---------- */
+function ReminderCard({ r, people, onSave, onRemove, onEdit, onPerson }) {
+  const [confirm, setConfirm] = useState(false);
+  const [snoozing, setSnoozing] = useState(false);
+  const st = reminderState(r);
+  const involved = (r.people || []).map((id) => people.find((x) => x.id === id)).filter(Boolean);
+  const times = (r.history || []).length;
+  const act = { fontSize: 12.5, padding: '6px 11px' };
+
+  return (
+    <div style={{
+      background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12,
+      padding: '13px 14px', marginBottom: 10, opacity: st.key === 'paused' || st.key === 'done' ? 0.72 : 1,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 9 }}>
+        <span style={{ width: 8, height: 8, borderRadius: 8, background: st.bar, flexShrink: 0 }} />
+        <span style={{ flex: 1, minWidth: 0, fontSize: 16, fontWeight: 600, letterSpacing: '-0.02em', color: C.ink }}>
+          {r.title}
+        </span>
+        <span style={{ fontSize: 12.5, fontWeight: 600, color: st.tone, flexShrink: 0, whiteSpace: 'nowrap' }}>
+          {st.key === 'paused' ? 'Paused' : st.key === 'done' ? 'Done' : dueText(st.d)}
+        </span>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline', margin: '7px 0 0', paddingLeft: 17 }}>
+        <span style={{
+          fontSize: 11, fontWeight: 600, color: C.muted,
+          border: `1px solid ${C.line}`, borderRadius: 20, padding: '2px 8px',
+        }}>{r.kind || 'Other'}</span>
+        <span style={{ fontSize: 12.5, color: C.faint }}>
+          {repeatText(r)}
+          {repeatOf(r) && r.anchor === 'done' ? ', from when it was last done' : ''}
+        </span>
+        {r.next && st.key !== 'done' && (
+          <span style={{ fontSize: 12.5, color: C.faint }}>· {prettyDate(r.next)}</span>
+        )}
+      </div>
+
+      <div style={{ paddingLeft: 17 }}>
+        {r.note && (
+          <p className="crm-serif" style={{ margin: '8px 0 0', fontSize: 14.5, lineHeight: 1.6, color: C.ink }}>
+            {r.note}
+          </p>
+        )}
+
+        {involved.length > 0 && (
+          <p style={{ margin: '8px 0 0', fontSize: 12.5, color: C.muted }}>
+            <span style={{ color: C.faint }}>With </span>
+            {involved.map((x, i) => (
+              <span key={x.id}>
+                {i > 0 && ', '}
+                <button
+                  className="crm-btn"
+                  onClick={() => onPerson && onPerson(x.id)}
+                  style={{
+                    font: 'inherit', fontSize: 12.5, color: C.ink, background: 'transparent',
+                    border: 'none', padding: 0, cursor: 'pointer', textDecoration: 'underline',
+                    textDecorationColor: C.line,
+                  }}
+                >{x.name}</button>
+              </span>
+            ))}
+          </p>
+        )}
+
+        {r.lastDone && (
+          <p style={{ margin: '8px 0 0', fontSize: 12, color: C.faint }}>
+            Last done {prettyDate(r.lastDone)}
+            {times > 1 ? ` · ${times} times logged` : ''}
+          </p>
+        )}
+
+        <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginTop: 11 }}>
+          {st.key === 'done' ? (
+            <Button onClick={() => onSave({ ...r, done: false })} style={act}>Not done after all</Button>
+          ) : st.key === 'paused' ? (
+            <Button kind="solid" onClick={() => onSave({ ...r, paused: false })} style={act}>Resume</Button>
+          ) : (
+            <>
+              <Button kind="solid" onClick={() => onSave(completeReminder(r, todayStr()))} style={act}>
+                Did it today
+              </Button>
+              {snoozing ? (
+                [[1, 'A day'], [7, 'A week'], [30, 'A month']].map(([d, l]) => (
+                  <Button key={d} onClick={() => { onSave(snoozeReminder(r, d)); setSnoozing(false); }} style={act}>
+                    {l}
+                  </Button>
+                ))
+              ) : (
+                <Button onClick={() => setSnoozing(true)} style={act}>Push it back</Button>
+              )}
+              <Button onClick={() => onSave({ ...r, paused: true })} style={act}>Pause</Button>
+            </>
+          )}
+          <Button onClick={onEdit} style={act}>Edit</Button>
+          <Button kind="danger" onClick={() => (confirm ? onRemove(r.id) : setConfirm(true))}
+            style={{ fontSize: 12.5, padding: '6px 8px' }}>
+            {confirm ? 'Tap again to remove' : 'Remove'}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- reminders: the tab ---------- */
+const BANDS = [['over', 'Late'], ['today', 'Today'], ['soon', 'Coming up'],
+  ['later', 'Later'], ['paused', 'Paused'], ['done', 'Done']];
+
+function Starters({ have, onPick }) {
+  const [open, setOpen] = useState(false);
+  // Nothing you already keep, so the list shrinks as you use it.
+  const left = STARTERS.filter((s) => !have.has(s.title.toLowerCase()));
+  if (left.length === 0) return null;
+  const kinds = REMINDER_KINDS.filter((k) => left.some((s) => s.kind === k));
+
+  return (
+    <div style={{ border: `1px solid ${C.line}`, borderRadius: 12, marginTop: 18, overflow: 'hidden' }}>
+      <button
+        className="crm-btn"
+        onClick={() => setOpen(!open)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 9, width: '100%', font: 'inherit',
+          textAlign: 'left', cursor: 'pointer', padding: '12px 14px',
+          background: 'transparent', border: 'none',
+        }}
+      >
+        <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: C.ink }}>
+          Things worth remembering
+        </span>
+        <span style={{ fontSize: 11, color: C.faint }}>{open ? 'Hide' : `Show ${left.length}`}</span>
+      </button>
+
+      {open && (
+        <div style={{ padding: '0 14px 14px' }}>
+          <p style={{ margin: '0 0 12px', fontSize: 12.5, color: C.faint, lineHeight: 1.55 }}>
+            The usual intervals, already filled in. Tap one to look it over before it is added.
+          </p>
+          {kinds.map((k) => (
+            <div key={k} style={{ marginBottom: 12 }}>
+              <p style={{
+                margin: '0 0 7px', fontSize: 10.5, fontWeight: 600, letterSpacing: '0.05em',
+                textTransform: 'uppercase', color: C.faint,
+              }}>{k}</p>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {left.filter((s) => s.kind === k).map((s) => (
+                  <button
+                    key={s.title}
+                    className="crm-btn"
+                    onClick={() => onPick(s)}
+                    style={{
+                      font: 'inherit', fontSize: 12.5, fontWeight: 600, padding: '6px 11px',
+                      borderRadius: 20, cursor: 'pointer', textAlign: 'left',
+                      background: 'transparent', border: `1px solid ${C.line}`, color: C.ink,
+                    }}
+                  >
+                    {s.title}
+                    <span style={{ color: C.faint, fontWeight: 400 }}>
+                      {` · ${s.n === 1 ? REPEAT_UNITS.find((u) => u.unit === s.unit).one
+                        : `${s.n} ${REPEAT_UNITS.find((u) => u.unit === s.unit).many}`}`}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RemindersView({ reminders, people, onAdd, onEdit, onSave, onRemove, onStarter, onPerson }) {
+  const [q, setQ] = useState('');
+  const [kind, setKind] = useState('All');
+
+  const nameOf = (id) => people.find((x) => x.id === id)?.name || '';
+  const query = q.trim().toLowerCase();
+  const matches = (r) =>
+    `${r.title} ${r.note || ''} ${r.kind || ''} ${(r.people || []).map(nameOf).join(' ')}`
+      .toLowerCase().includes(query);
+
+  const kindsPresent = REMINDER_KINDS.filter((k) => reminders.some((r) => (r.kind || 'Other') === k));
+  const shown = reminders
+    .filter((r) => kind === 'All' || (r.kind || 'Other') === kind)
+    .filter((r) => !query || matches(r))
+    .sort(byDue);
+
+  const live = reminders.filter((r) => !r.paused && !r.done);
+  const needing = live.filter((r) => ['over', 'today', 'soon'].includes(reminderState(r).key));
+  const late = live.filter((r) => reminderState(r).key === 'over').length;
+  const narrowed = Boolean(query) || kind !== 'All';
+  const have = new Set(reminders.map((r) => (r.title || '').toLowerCase()));
+
+  const chipStyle = (on) => ({
+    font: 'inherit', fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.01em',
+    padding: '6px 12px', borderRadius: 20, cursor: 'pointer',
+    background: on ? C.accent : 'transparent',
+    border: `1px solid ${on ? C.accent : C.line}`,
+    color: on ? C.onAccent : C.muted,
+  });
+
+  let head = 'Nothing to remember yet';
+  let sub = 'The things that come round again: the filter, the bill, the talks posted every autumn.';
+  if (reminders.length > 0) {
+    if (narrowed) {
+      head = `${countThings(shown.length, 'reminder', 'reminders')} ${shown.length === 1 ? 'matches' : 'match'}`;
+      sub = 'Looking through everything you keep.';
+    } else if (needing.length === 0) {
+      head = 'Nothing due';
+      sub = live.length > 0
+        ? `${countThings(live.length, 'reminder is', 'reminders are')} waiting quietly.`
+        : 'Everything here is paused or finished.';
+    } else {
+      head = `${countThings(needing.length, 'thing needs', 'things need')} you`;
+      sub = late > 0
+        ? `${countThings(late, 'is', 'are')} already past due. Longest overdue first.`
+        : 'Nothing late yet. Soonest first.';
+    }
+  }
+
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap', marginBottom: 6 }}>
+        <h1 style={{ margin: 0, fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>{head}</h1>
+        <Button kind="solid" onClick={onAdd} style={{ marginLeft: 'auto' }}>Add a reminder</Button>
+      </div>
+
+      {reminders.length === 0 && <EmptySky />}
+
+      <p style={{ margin: '0 0 18px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>{sub}</p>
+
+      {reminders.length > 0 && (
+        <>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+            <input
+              style={inputStyle}
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Search reminders, details, people"
+            />
+            {query && <Button onClick={() => setQ('')}>Clear</Button>}
+          </div>
+
+          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginBottom: 20 }}>
+            <button className="crm-btn" onClick={() => setKind('All')} style={chipStyle(kind === 'All')}>
+              All
+            </button>
+            {kindsPresent.map((k) => (
+              <button key={k} className="crm-btn" onClick={() => setKind(k)} style={chipStyle(kind === k)}>
+                {k}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      {reminders.length > 0 && shown.length === 0 && (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.55, margin: 0 }}>
+          Nothing matches that. Try a looser search, or set the kind back to All.
+        </p>
+      )}
+
+      {BANDS.map(([key, label]) => {
+        const group = shown.filter((r) => reminderState(r).key === key);
+        if (group.length === 0) return null;
+        return (
+          <div key={key}>
+            <p style={{
+              margin: '0 0 10px', fontSize: 11, fontWeight: 600, letterSpacing: '0.06em',
+              textTransform: 'uppercase', color: key === 'over' ? C.overdue : C.faint,
+            }}>{label}</p>
+            {group.map((r) => (
+              <ReminderCard key={r.id} r={r} people={people} onSave={onSave}
+                onRemove={onRemove} onPerson={onPerson} onEdit={() => onEdit(r)} />
+            ))}
+          </div>
+        );
+      })}
+
+      <Starters have={have} onPick={onStarter} />
+    </div>
+  );
+}
+
 /* ---------- map ---------- */
 // No basemap here on purpose: tile servers are outside the sandbox allowlist,
 // so Leaflet would load and then render an empty grey square. The pins live
@@ -2313,8 +3088,8 @@ function Check({ on, onChange, label, hint }) {
   );
 }
 
-function ExportView({ people, events, onClose }) {
-  const [what, setWhat] = useState({ people: true, events: true, log: false });
+function ExportView({ people, events, reminders, onClose }) {
+  const [what, setWhat] = useState({ people: true, events: true, reminders: true, log: false });
   const [circle, setCircle] = useState('all');
   const [withPaused, setWithPaused] = useState(true);
   const [groups, setGroups] = useState(
@@ -2332,6 +3107,7 @@ function ExportView({ people, events, onClose }) {
     const parts = [];
     if (what.people) parts.push(['people', toCsv(cols, chosen)]);
     if (what.events) parts.push(['events', toCsv(EVENT_COLS, events)]);
+    if (what.reminders) parts.push(['reminders', toCsv(REMINDER_COLS, reminders)]);
     if (what.log) {
       const rows = [];
       chosen.forEach((p) => (p.log || []).forEach((e) => rows.push({ p, e })));
@@ -2374,6 +3150,8 @@ function ExportView({ people, events, onClose }) {
           label={`People (${chosen.length})`} />
         <Check on={what.events} onChange={(v) => setWhat({ ...what, events: v })}
           label={`Events (${events.length})`} />
+        <Check on={what.reminders} onChange={(v) => setWhat({ ...what, reminders: v })}
+          label={`Reminders (${reminders.length})`} />
         <Check on={what.log} onChange={(v) => setWhat({ ...what, log: v })}
           label="Catch-up log" hint="Every logged catch-up as its own row" />
       </div>
@@ -2425,7 +3203,7 @@ function ExportView({ people, events, onClose }) {
   );
 }
 
-function ImportView({ people, events, onPeople, onEvents, onClose }) {
+function ImportView({ people, events, reminders, onPeople, onEvents, onReminders, onClose }) {
   const [over, setOver] = useState(false);
   const [found, setFound] = useState(null);
   const [problem, setProblem] = useState('');
@@ -2450,9 +3228,24 @@ function ImportView({ people, events, onPeople, onEvents, onClose }) {
       if (rows.length === 0) { setProblem('No rows in that file.'); return; }
 
       const headers = Object.keys(rows[0] || {}).map(norm);
+      // Reminders and events both have a Title, so test for the column only
+      // reminders carry before falling through to the event shape.
+      const looksLikeReminders = headers.includes('nextdue')
+        || headers.includes('repeatevery') || headers.includes('noticedays');
       const looksLikeEvents = headers.includes('title') && (headers.includes('start') || headers.includes('date'));
 
-      if (looksLikeEvents) {
+      if (looksLikeReminders) {
+        const { out, skipped } = fromCsv(REMINDER_COLS, rows, () => ({
+          id: uid(), addedOn: todayStr(), kind: 'Other', anchor: 'date',
+          title: '', next: '', every: null, lead: 7, note: '', people: [],
+          history: [], lastDone: null, paused: false, done: false,
+        }));
+        // A row that named an interval but no day to pin it to gets one from
+        // the date it is due, so month-end repeats behave from the first tick.
+        const good = out.filter((r) => r.title && /^\d{4}-\d{2}-\d{2}$/.test(r.next))
+          .map((r) => (r.every ? { ...r, every: { ...r.every, dom: everyFrom(r.next).dom } } : r));
+        setFound({ kind: 'reminders', rows: good, skipped: skipped + (out.length - good.length), file: file.name });
+      } else if (looksLikeEvents) {
         const { out, skipped } = fromCsv(EVENT_COLS, rows, () => ({
           id: uid(), addedOn: todayStr(), kind: 'Other', people: [],
           title: '', date: '', endDate: null, note: '', place: '', lat: null, lon: null,
@@ -2476,6 +3269,8 @@ function ImportView({ people, events, onPeople, onEvents, onClose }) {
     if (!found) return;
     if (found.kind === 'people') {
       onPeople(mode === 'replace' ? found.rows : [...people, ...found.rows]);
+    } else if (found.kind === 'reminders') {
+      onReminders(mode === 'replace' ? found.rows : [...reminders, ...found.rows]);
     } else {
       onEvents(mode === 'replace' ? found.rows : [...events, ...found.rows]);
     }
@@ -2489,8 +3284,8 @@ function ImportView({ people, events, onPeople, onEvents, onClose }) {
         <Button onClick={onClose} style={{ marginLeft: 'auto' }}>Done</Button>
       </div>
       <p style={{ margin: '0 0 20px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
-        Drop in a CSV. People and events are detected automatically, and a plain sheet
-        of names and emails works fine.
+        Drop in a CSV. People, events and reminders are detected automatically, and a
+        plain sheet of names and emails works fine.
       </p>
 
       <div
@@ -2528,7 +3323,7 @@ function ImportView({ people, events, onPeople, onEvents, onClose }) {
           borderRadius: 12, padding: '15px 15px 6px',
         }}>
           <p style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600, color: C.ink }}>
-            {found.rows.length} {found.kind === 'people' ? 'people' : 'events'} ready
+            {found.rows.length} {found.kind} ready
           </p>
           <p style={{ margin: '0 0 14px', fontSize: 12.5, color: C.faint, lineHeight: 1.5 }}>
             From {found.file}
@@ -2546,7 +3341,7 @@ function ImportView({ people, events, onPeople, onEvents, onClose }) {
                 label="Replace everything"
                 hint={`Removes your current ${found.kind}`} />
               <Button kind="solid" onClick={commit} style={{ width: '100%', marginBottom: 10 }}>
-                {mode === 'replace' ? 'Replace' : 'Add'} {found.rows.length} {found.kind === 'people' ? 'people' : 'events'}
+                {mode === 'replace' ? 'Replace' : 'Add'} {found.rows.length} {found.kind}
               </Button>
             </>
           )}
@@ -2574,6 +3369,8 @@ export default function PersonalCRM() {
   const [view, setView] = useState('list');
   const [events, setEvents] = useState([]);
   const [eventDraft, setEventDraft] = useState(null);
+  const [reminders, setReminders] = useState([]);
+  const [reminderDraft, setReminderDraft] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [year, setYear] = useState(new Date().getFullYear());
   const [backup, setBackup] = useState('');
@@ -2599,6 +3396,12 @@ export default function PersonalCRM() {
         if (ev?.value) setEvents(JSON.parse(ev.value));
       } catch {
         /* no events yet */
+      }
+      try {
+        const rm = await window.storage.get(REMINDERS_KEY);
+        if (rm?.value) setReminders(JSON.parse(rm.value));
+      } catch {
+        /* no reminders yet */
       }
       try {
         const t = await window.storage.get(THEME_KEY);
@@ -2686,17 +3489,43 @@ export default function PersonalCRM() {
     setEventDraft(null);
   };
 
+  const persistReminders = async (next) => {
+    setReminders(next);
+    try {
+      await window.storage.set(REMINDERS_KEY, JSON.stringify(next));
+      setError('');
+    } catch {
+      setError('That reminder is showing here but did not save. Try again.');
+    }
+  };
+
+  // Ticking one off from its card should not also close the form you happen
+  // to have open, so only saving from the form clears the draft.
+  const putReminder = (r) => {
+    const exists = reminders.some((x) => x.id === r.id);
+    persistReminders(exists ? reminders.map((x) => (x.id === r.id ? r : x)) : [...reminders, r]);
+  };
+
+  const saveReminder = (r) => {
+    putReminder(r);
+    setReminderDraft(null);
+  };
+
   const restore = () => {
     try {
       const parsed = JSON.parse(paste);
       // Older backups were a bare array of people.
       const rawPeople = Array.isArray(parsed) ? parsed : parsed.people;
       const rawEvents = Array.isArray(parsed) ? [] : parsed.events || [];
+      const rawReminders = Array.isArray(parsed) ? [] : parsed.reminders || [];
       if (!Array.isArray(rawPeople)) throw new Error('not a backup');
       const clean = rawPeople.filter((r) => r && typeof r.name === 'string' && r.name.trim());
       if (clean.length === 0) throw new Error('nobody in it');
       persist(clean.map((r) => ({ ...r, id: r.id || uid() })));
       persistEvents(rawEvents.filter((e) => e && e.title && e.date));
+      persistReminders((Array.isArray(rawReminders) ? rawReminders : [])
+        .filter((r) => r && r.title && r.next)
+        .map((r) => ({ ...r, id: r.id || uid() })));
       setBackup('');
       setPaste('');
       setError('');
@@ -2774,8 +3603,10 @@ export default function PersonalCRM() {
       if (p.addedOn) found.add(Number(p.addedOn.slice(0, 4)));
       (p.log || []).forEach((e) => e.date && found.add(Number(e.date.slice(0, 4))));
     });
+    reminders.forEach((r) => (r.history || []).forEach((h) =>
+      h?.date && found.add(Number(h.date.slice(0, 4)))));
     return [...found].sort((a, b) => b - a);
-  }, [people]);
+  }, [people, reminders]);
 
   const companies = useMemo(
     () => [...new Set(people.map((p) => p.company).filter(Boolean))].sort(),
@@ -2918,13 +3749,14 @@ export default function PersonalCRM() {
           )}
           {!loading && (
             <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
-              {[['list', 'People'], ['events', 'Events'], ['map', 'Map'], ['recap', 'Recap']].map(([v, l]) => {
+              {[['list', 'People'], ['events', 'Events'], ['reminders', 'Reminders'],
+                ['map', 'Map'], ['recap', 'Recap']].map(([v, l]) => {
                 const on = view === v;
                 return (
                   <button
                     key={v}
                     className="crm-btn"
-                    onClick={() => { setView(v); setEventDraft(null); }}
+                    onClick={() => { setView(v); setEventDraft(null); setReminderDraft(null); }}
                     style={{
                       font: 'inherit', fontSize: 12.5, fontWeight: 600, cursor: 'pointer',
                       color: on ? C.onAccent : C.muted,
@@ -2971,7 +3803,7 @@ export default function PersonalCRM() {
                       <button
                         key={v}
                         className="crm-btn"
-                        onClick={() => { setView(v); setMenuOpen(false); setEventDraft(null); }}
+                        onClick={() => { setView(v); setMenuOpen(false); setEventDraft(null); setReminderDraft(null); }}
                         style={{
                           display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
                           fontSize: 13.5, fontWeight: 600, color: C.ink, cursor: 'pointer',
@@ -3005,9 +3837,11 @@ export default function PersonalCRM() {
           <Upcoming
             people={inCircle}
             events={events}
+            reminders={reminders}
             quiet={tab === 'all' ? quiet.length : 0}
             onShowQuiet={() => { setTab('quiet'); setOpenId(null); }}
             onPerson={(id) => { setOpenId(id); setEditing(null); setAdding(false); }}
+            onReminder={() => { setView('reminders'); setReminderDraft(null); }}
           />
         )}
 
@@ -3039,13 +3873,43 @@ export default function PersonalCRM() {
           </div>
         )}
 
+        {view === 'reminders' && (
+          <div className="crm-full">
+            {reminderDraft ? (
+              <ReminderForm
+                initial={reminderDraft.r}
+                fresh={reminderDraft.fresh}
+                people={people}
+                onSave={saveReminder}
+                onCancel={() => setReminderDraft(null)}
+              />
+            ) : (
+              <RemindersView
+                reminders={reminders}
+                people={people}
+                onAdd={() => setReminderDraft({ r: null, fresh: true })}
+                onEdit={(r) => setReminderDraft({ r, fresh: false })}
+                onStarter={(st) => setReminderDraft({ r: fromStarter(st), fresh: true })}
+                onSave={putReminder}
+                onRemove={(id) => persistReminders(reminders.filter((x) => x.id !== id))}
+                onPerson={(id) => {
+                  setView('list'); setCircleTab('all'); setOpenId(id);
+                  setEditing(null); setAdding(false); setQ(''); setTagFilter(null);
+                }}
+              />
+            )}
+          </div>
+        )}
+
         {view === 'import' && (
           <div className="crm-full">
             <ImportView
               people={people}
               events={events}
+              reminders={reminders}
               onPeople={persist}
               onEvents={persistEvents}
+              onReminders={persistReminders}
               onClose={() => setView('list')}
             />
           </div>
@@ -3053,7 +3917,8 @@ export default function PersonalCRM() {
 
         {view === 'export' && (
           <div className="crm-full">
-            <ExportView people={people} events={events} onClose={() => setView('list')} />
+            <ExportView people={people} events={events} reminders={reminders}
+              onClose={() => setView('list')} />
           </div>
         )}
 
@@ -3066,7 +3931,9 @@ export default function PersonalCRM() {
         {view === 'recap' && (
           <div className="crm-full">
             <Recap people={people} year={year} years={years} onYear={setYear}
-              eventCount={events.filter((e) => Number(e.date.slice(0, 4)) === year).length} />
+              eventCount={events.filter((e) => Number(e.date.slice(0, 4)) === year).length}
+              reminderCount={reminders.reduce((n, r) => n + (r.history || [])
+                .filter((h) => h?.date && Number(h.date.slice(0, 4)) === year).length, 0)} />
           </div>
         )}
 
@@ -3197,7 +4064,7 @@ export default function PersonalCRM() {
                 <textarea
                   readOnly
                   onFocus={(e) => e.target.select()}
-                  value={JSON.stringify({ people, events })}
+                  value={JSON.stringify({ people, events, reminders })}
                   style={{ ...inputStyle, minHeight: 92, fontSize: 12, lineHeight: 1.4, resize: 'vertical' }}
                 />
               </div>
@@ -3250,6 +4117,9 @@ export default function PersonalCRM() {
               myEvents={events
                 .filter((e) => (e.people || []).includes(selectedPerson.id))
                 .sort((a, b) => (a.date < b.date ? 1 : -1))}
+              myReminders={reminders
+                .filter((r) => (r.people || []).includes(selectedPerson.id))
+                .sort(byDue)}
               onLog={logTouch}
               onEditLog={editLog}
               onRemoveLog={removeLog}
