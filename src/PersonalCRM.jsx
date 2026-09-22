@@ -948,7 +948,7 @@ function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle }) {
   );
 }
 
-function PersonDetail({ p, myEvents, myReminders, onLog, onEditLog, onRemoveLog, onEdit, onRemove, onTag, onClose }) {
+function PersonDetail({ p, myEvents, myReminders, myRecs, onLog, onEditLog, onRemoveLog, onEdit, onRemove, onTag, onList, onClose }) {
   const [logging, setLogging] = useState(false);
   const [logDate, setLogDate] = useState(todayStr());
   const [logText, setLogText] = useState('');
@@ -1161,6 +1161,30 @@ function PersonDetail({ p, myEvents, myReminders, onLog, onEditLog, onRemoveLog,
                   </p>
                 );
               })}
+            </div>
+          )}
+
+          {(myRecs || []).length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <p style={{ margin: '0 0 6px', fontSize: 12.5, color: C.faint }}>Recommended</p>
+              {myRecs.map(({ c, it }) => (
+                <button
+                  key={`${c.id}-${it.id}`}
+                  className="crm-btn"
+                  onClick={() => onList(c.id)}
+                  style={{
+                    display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
+                    fontSize: 13, color: C.ink, lineHeight: 1.45, cursor: 'pointer',
+                    background: 'transparent', border: 'none', padding: '0 0 4px',
+                  }}
+                >
+                  {it.title}
+                  <span style={{ color: C.faint }}>
+                    {` — ${c.name}${stagesOf(c).length && stageOf(c, it) === 'done'
+                      ? `, ${stageLabel(c, 'done').toLowerCase()}` : ''}`}
+                  </span>
+                </button>
+              ))}
             </div>
           )}
 
@@ -1480,6 +1504,263 @@ const fromStarter = (s) => ({
   done: false,
 });
 
+/* ---------- lists ---------- */
+// Lists are the things you keep track of that are not people or dates: shows
+// to watch, books to read, the collection you are building. Called
+// "collections" in code, because "list" already means the people list here.
+//
+// Every entry moves through at most three stages. The keys are fixed so a
+// list can be renamed, re-worded or switched between kinds without losing
+// anyone's progress; only the words shown for each stage belong to the list.
+const COLLECTIONS_KEY = 'crm-collections-v1';
+
+const STAGES = ['want', 'doing', 'done'];
+
+// The kind only supplies starting words. Everything it fills in can be
+// changed on the list itself, and "Other" is there for anything at all.
+const COLLECTION_KINDS = [
+  { kind: 'Shows', add: 'Add a show', name: 'Shows to watch', one: 'show', many: 'shows', detail: 'Where to watch',
+    labels: { want: 'Want to watch', doing: 'Watching', done: 'Watched' }, ph: 'Severance' },
+  { kind: 'Movies', add: 'Add a movie', name: 'Movies to see', one: 'movie', many: 'movies', detail: 'Director or year',
+    labels: { want: 'Want to watch', doing: '', done: 'Watched' }, ph: 'Past Lives' },
+  { kind: 'Books', add: 'Add a book', name: 'Books to read', one: 'book', many: 'books', detail: 'Author',
+    labels: { want: 'Want to read', doing: 'Reading', done: 'Read' }, ph: 'The Overstory' },
+  { kind: 'Music', add: 'Add an album', name: 'Albums to hear', one: 'album', many: 'albums', detail: 'Artist',
+    labels: { want: 'Want to hear', doing: '', done: 'Heard' }, ph: 'Blue' },
+  { kind: 'Games', add: 'Add a game', name: 'Games to play', one: 'game', many: 'games', detail: 'Platform',
+    labels: { want: 'Want to play', doing: 'Playing', done: 'Finished' }, ph: 'Wingspan' },
+  { kind: 'Collectibles', add: 'Add a piece', name: 'The collection', one: 'piece', many: 'pieces', detail: 'Set or series',
+    labels: { want: 'Wanted', doing: 'On the way', done: 'In the collection' }, ph: '1st edition Charizard' },
+  { kind: 'Places', add: 'Add a place', name: 'Places to go', one: 'place', many: 'places', detail: 'Where',
+    labels: { want: 'Want to go', doing: '', done: 'Been there' }, ph: 'The Nelson-Atkins' },
+  { kind: 'Other', add: 'Add something', name: '', one: 'thing', many: 'things', detail: 'Detail',
+    labels: { want: 'To do', doing: 'In progress', done: 'Done' }, ph: 'Anything at all' },
+];
+
+const kindOf = (k) => COLLECTION_KINDS.find((x) => x.kind === k) || COLLECTION_KINDS[COLLECTION_KINDS.length - 1];
+
+const COLLECTION_SORTS = [
+  ['manual', 'My order'], ['title', 'A to Z'], ['added', 'Newest first'],
+  ['rating', 'Highest rated'], ['status', 'By progress'],
+];
+
+// The stages a list actually uses, in order. A list can leave out the middle
+// one (a film is rarely half-watched), and one that does not track progress
+// has none at all.
+const stagesOf = (c) => (!c.track ? [] : STAGES.filter((s) => s !== 'doing' || (c.labels?.doing || '').trim()));
+
+const stageLabel = (c, s) => (c.labels?.[s] || '').trim() || kindOf(c.kind).labels[s] || s;
+
+// Where an entry shows. Dropping the middle stage from a list leaves anything
+// already in it stored as it was, so putting the stage back brings it all
+// back; in the meantime it reads as not started, because it is not finished.
+const stageOf = (c, it) => (stagesOf(c).includes(it.status) ? it.status : 'want');
+
+// Tapping the status steps forward through the stages the list uses and
+// wraps round, so nothing is ever more than two taps from where you want it.
+const nextStage = (c, it) => {
+  const used = stagesOf(c);
+  if (used.length === 0) return it.status;
+  return used[(used.indexOf(stageOf(c, it)) + 1) % used.length];
+};
+
+// Only http and https links are ever kept. Links arrive from shared lists and
+// imported sheets as well as the form, and a javascript: URL in an href would
+// run in this page the moment it was clicked.
+const safeLink = (v) => {
+  const s = typeof v === 'string' ? v.trim() : '';
+  if (!s) return '';
+  try {
+    const u = new URL(/^[a-z][a-z0-9+.-]*:/i.test(s) ? s : `https://${s}`);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href.slice(0, 2000) : '';
+  } catch {
+    return '';
+  }
+};
+
+const linkHost = (href) => {
+  try { return new URL(href).hostname.replace(/^www\./, ''); } catch { return 'link'; }
+};
+
+const clip = (v, n) => (typeof v === 'string' || typeof v === 'number' ? String(v).trim().slice(0, n) : '');
+const isDay = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+
+// Everything that comes in from outside, a backup, a sheet or a list someone
+// shared, goes through here, so a hand-edited or hostile file can only ever
+// produce a well-formed list.
+const cleanItem = (raw, seen) => {
+  if (!raw || typeof raw !== 'object') return null;
+  const title = clip(raw.title, 300);
+  if (!title) return null;
+  let id = clip(raw.id, 40);
+  if (!id || seen.has(id)) id = uid();
+  seen.add(id);
+  const status = STAGES.includes(raw.status) ? raw.status : 'want';
+  return {
+    id,
+    title,
+    detail: clip(raw.detail, 300),
+    status,
+    rating: Math.min(5, Math.max(0, Math.round(Number(raw.rating) || 0))),
+    link: safeLink(raw.link),
+    note: clip(raw.note, 5000),
+    from: typeof raw.from === 'string' && raw.from ? raw.from : null,
+    addedOn: isDay(raw.addedOn) ? raw.addedOn : todayStr(),
+    doneOn: status === 'done' && isDay(raw.doneOn) ? raw.doneOn : null,
+  };
+};
+
+const ITEM_CAP = 2000;
+
+const cleanCollection = (raw, seen = new Set()) => {
+  if (!raw || typeof raw !== 'object') return null;
+  const name = clip(raw.name, 120);
+  if (!name) return null;
+  let id = clip(raw.id, 40);
+  if (!id || seen.has(id)) id = uid();
+  seen.add(id);
+  const kind = kindOf(raw.kind).kind;
+  const itemIds = new Set();
+  return {
+    id,
+    addedOn: isDay(raw.addedOn) ? raw.addedOn : todayStr(),
+    // A full timestamp, not a day, so "Recently changed" can tell apart two
+    // lists both touched today.
+    updatedAt: typeof raw.updatedAt === 'string' && !Number.isNaN(Date.parse(raw.updatedAt))
+      ? raw.updatedAt : new Date().toISOString(),
+    name,
+    kind,
+    note: clip(raw.note, 2000),
+    track: raw.track !== false,
+    labels: Object.fromEntries(STAGES.map((s) => [s, clip(raw.labels?.[s], 40)])),
+    detail: clip(raw.detail, 40),
+    sort: COLLECTION_SORTS.some(([v]) => v === raw.sort) ? raw.sort : 'manual',
+    items: (Array.isArray(raw.items) ? raw.items : [])
+      .slice(0, ITEM_CAP)
+      .map((x) => cleanItem(x, itemIds))
+      .filter(Boolean),
+  };
+};
+
+const cleanCollections = (raw) => {
+  const seen = new Set();
+  return (Array.isArray(raw) ? raw : []).map((c) => cleanCollection(c, seen)).filter(Boolean);
+};
+
+// Library order: "The Overstory" files under O, the way a shelf would.
+const shelfKey = (t) => (t || '').replace(/^(the|a|an)\s+/i, '');
+const byShelf = (a, b) =>
+  shelfKey(a.title).localeCompare(shelfKey(b.title), undefined, { sensitivity: 'base', numeric: true });
+
+// Every order but "My order" is a view: the stored sequence is never
+// rewritten, and ties keep the order you gave them.
+const sortItems = (c, items) => {
+  const list = [...items];
+  if (c.sort === 'title') return list.sort(byShelf);
+  if (c.sort === 'added') return list.sort((a, b) => (b.addedOn || '').localeCompare(a.addedOn || ''));
+  if (c.sort === 'rating') return list.sort((a, b) => (b.rating || 0) - (a.rating || 0));
+  if (c.sort === 'status' && c.track) {
+    const order = { doing: 0, want: 1, done: 2 };
+    return list.sort((a, b) => order[stageOf(c, a)] - order[stageOf(c, b)]);
+  }
+  return list;
+};
+
+const withStatus = (it, status) => ({
+  ...it,
+  status,
+  doneOn: status === 'done' ? (it.status === 'done' && it.doneOn ? it.doneOn : todayStr()) : null,
+});
+
+const stars = (n) => '★'.repeat(n) + '☆'.repeat(5 - n);
+
+// Plain text anyone can read, for a message, an email or a note. Grouped by
+// stage when progress is included, because "Watched ★★★★★" is the part a
+// friend actually wants; numbered in your order when it is not.
+const collectionText = (c, { progress, notes }) => {
+  const line = (it, i) => {
+    const bits = [
+      progress ? '-' : `${i + 1}.`,
+      it.title,
+      it.detail ? `(${it.detail})` : '',
+      progress && it.rating ? stars(it.rating) : '',
+      it.link ? `— ${it.link}` : '',
+    ].filter(Boolean).join(' ');
+    return notes && it.note ? `${bits}\n   ${it.note.replace(/\s*\n\s*/g, ' ')}` : bits;
+  };
+  const head = [c.name, notes && c.note ? c.note : ''].filter(Boolean).join('\n');
+  const items = sortItems(c, c.items);
+  if (items.length === 0) return `${head}\n\nNothing on it yet.`;
+  const stages = progress ? stagesOf(c) : [];
+  if (stages.length === 0) return `${head}\n\n${items.map(line).join('\n')}`;
+  const groups = stages
+    .map((s) => [s, items.filter((it) => stageOf(c, it) === s)])
+    .filter(([, g]) => g.length > 0)
+    .map(([s, g]) => `${stageLabel(c, s)}\n${g.map(line).join('\n')}`);
+  return `${head}\n\n${groups.join('\n\n')}`;
+};
+
+// A shared list travels inside the link itself, so there is no server to
+// hold it and nothing to expire. Short keys and trimmed tuples keep the link
+// as short as it can be.
+//
+// It carries the list, never your progress: whoever opens it gets their own
+// copy to work through from the start. Who recommended what is yours alone
+// and is never included, and notes only go when you say so.
+const SHARE_PREFIX = 'share=';
+
+const toCode = (obj) => {
+  const bytes = new TextEncoder().encode(JSON.stringify(obj));
+  let bin = '';
+  bytes.forEach((b) => { bin += String.fromCharCode(b); });
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+};
+
+const fromCode = (code) => {
+  const bin = atob(code.replace(/-/g, '+').replace(/_/g, '/'));
+  return JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, (ch) => ch.charCodeAt(0))));
+};
+
+const shareCode = (c, { notes, by }) => {
+  const trim = (row) => {
+    const out = [...row];
+    while (out.length > 1 && !out[out.length - 1]) out.pop();
+    return out;
+  };
+  return toCode({
+    v: 1,
+    n: c.name,
+    k: c.kind,
+    t: c.track ? 1 : 0,
+    l: STAGES.map((s) => c.labels?.[s] || ''),
+    dl: c.detail || '',
+    ...(notes && c.note ? { d: c.note } : {}),
+    ...(by ? { by } : {}),
+    i: sortItems(c, c.items).map((it) => trim([it.title, it.detail, it.link, notes ? it.note : ''])),
+  });
+};
+
+// Accepts the whole link or just the code after it, since people paste both.
+const readShared = (text) => {
+  const s = String(text || '').trim();
+  const m = s.match(/(?:^|[#&?])share=([A-Za-z0-9_-]+)/) || s.match(/^([A-Za-z0-9_-]{16,})$/);
+  if (!m) return null;
+  try {
+    const o = fromCode(m[1]);
+    if (!o || o.v !== 1 || !Array.isArray(o.i)) return null;
+    const l = Array.isArray(o.l) ? o.l : [];
+    const c = cleanCollection({
+      name: o.n, kind: o.k, note: o.d, track: o.t !== 0, detail: o.dl,
+      labels: { want: l[0], doing: l[1], done: l[2] },
+      items: o.i.filter(Array.isArray)
+        .map((x) => ({ title: x[0], detail: x[1], link: x[2], note: x[3] })),
+    });
+    return c ? { c, by: clip(o.by, 60) } : null;
+  } catch {
+    return null;
+  }
+};
+
 /* ---------- csv ---------- */
 // Arrays are joined with ";" so they survive a comma-delimited file.
 const joinList = (a) => (a || []).join('; ');
@@ -1574,6 +1855,94 @@ const REMINDER_COLS = [
   { h: 'Finished', get: (r) => yesNo(r.done), set: (r, v) => { r.done = isYes(v); } },
   { h: 'Details', get: (r) => r.note || '', set: (r, v) => { r.note = v; } },
 ];
+
+// One row per entry, with the list it belongs to named on every row, which is
+// the shape a spreadsheet wants. Stages go out in the list's own words.
+const ITEM_COLS = [
+  { h: 'List', get: (r) => r.list, set: (r, v) => { r.list = v; } },
+  { h: 'List kind', get: (r) => r.kind, set: (r, v) => { r.kind = v; } },
+  { h: 'Title', get: (r) => r.title, set: (r, v) => { r.title = v; } },
+  { h: 'Detail', get: (r) => r.detail || '', set: (r, v) => { r.detail = v; } },
+  { h: 'Status', get: (r) => r.status || '', set: (r, v) => { r.status = v; } },
+  { h: 'Rating', get: (r) => (r.rating ? String(r.rating) : ''), set: (r, v) => { r.rating = Number(v); } },
+  { h: 'Link', get: (r) => r.link || '', set: (r, v) => { r.link = v; } },
+  { h: 'Notes', get: (r) => r.note || '', set: (r, v) => { r.note = v; } },
+  { h: 'Added', get: (r) => r.addedOn || '', set: (r, v) => { r.addedOn = v; } },
+  { h: 'Finished on', get: (r) => r.doneOn || '', set: (r, v) => { r.doneOn = v; } },
+];
+
+const flattenCollections = (cs) => cs.flatMap((c) => c.items.map((it) => ({
+  list: c.name,
+  kind: c.kind,
+  title: it.title,
+  detail: it.detail,
+  status: stagesOf(c).length ? stageLabel(c, stageOf(c, it)) : '',
+  rating: it.rating,
+  link: it.link,
+  note: it.note,
+  addedOn: it.addedOn,
+  doneOn: it.doneOn,
+})));
+
+// Reads a stage back from whatever a sheet calls it: the list's own words
+// first, then the usual ones, so "Read", "Finished" and "yes" all count as done.
+const stageFrom = (v, labels) => {
+  const s = (v || '').trim().toLowerCase();
+  if (!s) return 'want';
+  const hit = STAGES.find((k) => (labels[k] || '').toLowerCase() === s);
+  if (hit) return hit;
+  if (/^(done|finished|complete|completed|watched|read|seen|heard|played|beaten|have|owned|got|been|yes)\b/.test(s)) return 'done';
+  if (/ing\b|progress|on the way|ordered|started/.test(s)) return 'doing';
+  return 'want';
+};
+
+// A hand-made sheet rarely has a kind column, but the list's name usually
+// says what it is ("Books", "Shows to watch"), and the kind decides what
+// "Reading" means when the stages are read back.
+const KIND_HINTS = [
+  ['Shows', /\b(shows?|series|tv)\b/i],
+  ['Movies', /\b(movies?|films?)\b/i],
+  ['Books', /\b(books?|reading)\b/i],
+  ['Music', /\b(music|albums?|records?|vinyl)\b/i],
+  ['Games', /\b(games?)\b/i],
+  ['Collectibles', /\b(collect\w*)\b/i],
+  ['Places', /\b(places?|travel|trips?|restaurants?)\b/i],
+];
+
+const guessKind = (kind, name) => {
+  const named = COLLECTION_KINDS.find((x) => x.kind.toLowerCase() === (kind || '').trim().toLowerCase());
+  if (named) return named;
+  return kindOf((KIND_HINTS.find(([, re]) => re.test(name || '')) || ['Other'])[0]);
+};
+
+// Rows are grouped into lists by name. A sheet with no list names at all
+// becomes one list, named after the file it came from.
+const gatherCollections = (rows, fallback) => {
+  const groups = new Map();
+  rows.forEach((r) => {
+    const name = (r.list || '').trim() || fallback;
+    const key = name.toLowerCase();
+    if (!groups.has(key)) {
+      const k = guessKind(r.kind, name);
+      groups.set(key, { name, kind: k.kind, track: true, labels: { ...k.labels }, detail: k.detail, items: [] });
+    }
+    const g = groups.get(key);
+    g.items.push({ ...r, status: stageFrom(r.status, g.labels) });
+  });
+  return cleanCollections([...groups.values()]);
+};
+
+// Adding a sheet to lists you already keep: entries for a list with the same
+// name join it rather than starting a second list beside it.
+const mergeCollections = (have, incoming) => {
+  const out = [...have];
+  incoming.forEach((c) => {
+    const i = out.findIndex((x) => x.name.toLowerCase() === c.name.toLowerCase());
+    if (i === -1) out.push(c);
+    else out[i] = { ...out[i], updatedAt: new Date().toISOString(), items: [...out[i].items, ...c.items].slice(0, ITEM_CAP) };
+  });
+  return out;
+};
 
 const norm = (h) => (h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -1879,7 +2248,7 @@ function Stat({ n, label, tone }) {
   );
 }
 
-function Recap({ people, year, years, onYear, eventCount, reminderCount }) {
+function Recap({ people, year, years, onYear, eventCount, reminderCount, listCount }) {
   const r = buildRecap(people, year);
   const maxMonth = Math.max(1, ...r.months);
 
@@ -1909,7 +2278,7 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount }) {
         )}
       </div>
 
-      {r.total === 0 && r.added === 0 && !eventCount && !reminderCount ? (
+      {r.total === 0 && r.added === 0 && !eventCount && !reminderCount && !listCount ? (
         <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.6, margin: 0 }}>
           Nothing logged in {year} yet. Every catch-up you record builds this page, so it
           gets more interesting the longer you use it.
@@ -1922,6 +2291,7 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount }) {
             <Stat n={r.activeMonths} label={`of 12 months with contact`} />
             <Stat n={eventCount} label="events recorded" />
             {reminderCount > 0 && <Stat n={reminderCount} label="reminders kept" />}
+            {listCount > 0 && <Stat n={listCount} label="crossed off your lists" />}
           </div>
 
           {r.top.length > 0 && (
@@ -3010,6 +3380,1055 @@ function RemindersView({ reminders, people, onAdd, onEdit, onSave, onRemove, onS
   );
 }
 
+/* ---------- lists: small pieces ---------- */
+const STAR_PATH = 'M8 1.6 L9.9 5.6 L14.2 6.2 L11.1 9.3 L11.9 13.7 L8 11.6 L4.1 13.7 L4.9 9.3 L1.8 6.2 L6.1 5.6 Z';
+
+// The stages differ in shape as well as colour (empty, half, ticked), so they
+// still read apart for anyone who cannot tell the amber from the green.
+function StageMark({ stage, size = 20 }) {
+  const m = size / 2;
+  const r = m - 1.5;
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden="true" style={{ flexShrink: 0 }}>
+      {stage === 'done' ? (
+        <>
+          <circle cx={m} cy={m} r={r} fill={C.accent} />
+          <path d={`M${size * 0.3} ${size * 0.52} L${size * 0.45} ${size * 0.67} L${size * 0.71} ${size * 0.37}`}
+            fill="none" stroke={C.onAccent} strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
+        </>
+      ) : (
+        <>
+          <circle cx={m} cy={m} r={r} fill="none" strokeWidth="1.5"
+            stroke={stage === 'doing' ? C.soonBar : C.faint} />
+          {stage === 'doing' && <path d={`M${m} ${m - r} A${r} ${r} 0 0 1 ${m} ${m + r} Z`} fill={C.soonBar} />}
+        </>
+      )}
+    </svg>
+  );
+}
+
+function StarRow({ n, size = 11 }) {
+  return (
+    <span role="img" aria-label={`Rated ${n} of 5`}
+      style={{ display: 'inline-flex', gap: 1, color: C.soonText, flexShrink: 0 }}>
+      {[1, 2, 3, 4, 5].map((i) => (
+        <svg key={i} width={size} height={size} viewBox="0 0 16 16" aria-hidden="true">
+          <path d={STAR_PATH} fill={i <= n ? 'currentColor' : 'none'}
+            stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+        </svg>
+      ))}
+    </span>
+  );
+}
+
+function StarPicker({ value, onChange }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap' }}>
+      {[1, 2, 3, 4, 5].map((i) => (
+        <button
+          key={i}
+          className="crm-btn"
+          onClick={() => onChange(i === value ? 0 : i)}
+          aria-label={`${i} out of 5`}
+          aria-pressed={i === value}
+          style={{
+            background: 'transparent', border: 'none', padding: 5, cursor: 'pointer', lineHeight: 0,
+            color: i <= value ? C.soonText : C.faint,
+          }}
+        >
+          <svg width="22" height="22" viewBox="0 0 16 16" aria-hidden="true">
+            <path d={STAR_PATH} fill={i <= value ? 'currentColor' : 'none'}
+              stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+          </svg>
+        </button>
+      ))}
+      <span style={{ fontSize: 12, color: C.faint, marginLeft: 8 }}>
+        {value ? 'Tap the same star again to clear it.' : 'Not rated.'}
+      </span>
+    </div>
+  );
+}
+
+// How far through a list you are, as a bar and in words. The words are what
+// a screen reader gets; the bar is there to be taken in at a glance.
+function Progress({ c, thin }) {
+  const total = c.items.length;
+  const done = c.items.filter((it) => stageOf(c, it) === 'done').length;
+  const doing = c.items.filter((it) => stageOf(c, it) === 'doing').length;
+  const pct = (n) => `${total ? (n / total) * 100 : 0}%`;
+  return (
+    <span style={{ display: 'block', marginTop: thin ? 10 : 14 }}>
+      <span aria-hidden="true" style={{
+        display: 'flex', height: thin ? 4 : 6, borderRadius: 6, background: C.line, overflow: 'hidden',
+      }}>
+        <span style={{ width: pct(done), background: C.accent }} />
+        <span style={{ width: pct(doing), background: C.soonBar }} />
+      </span>
+      {!thin && (
+        <span style={{ display: 'block', fontSize: 12.5, color: C.faint, marginTop: 6 }}>
+          {done} of {total} {stageLabel(c, 'done').toLowerCase()}
+          {doing > 0 ? ` · ${doing} ${stageLabel(c, 'doing').toLowerCase()}` : ''}
+        </span>
+      )}
+    </span>
+  );
+}
+
+// Functions rather than objects: C changes with the theme, and an object
+// built once at load would keep the colours of whichever theme came first.
+const kindChip = () => ({
+  fontSize: 11, fontWeight: 600, color: C.muted, flexShrink: 0,
+  border: `1px solid ${C.line}`, borderRadius: 20, padding: '2px 8px',
+});
+
+const filterChip = (on) => ({
+  font: 'inherit', fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.01em',
+  padding: '6px 12px', borderRadius: 20, cursor: 'pointer',
+  background: on ? C.accent : 'transparent',
+  border: `1px solid ${on ? C.accent : C.line}`,
+  color: on ? C.onAccent : C.muted,
+});
+
+const hintStyle = () => ({ display: 'block', fontSize: 12, color: C.faint, marginTop: 6, lineHeight: 1.5 });
+const small = { fontSize: 12.5, padding: '6px 11px' };
+
+/* ---------- lists: a new list, or changing one ---------- */
+function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
+  const first = kindOf(initial?.kind || startKind || 'Shows');
+  const [kind, setKind] = useState(first.kind);
+  const [name, setName] = useState(initial ? initial.name : first.name);
+  const [note, setNote] = useState(initial?.note || '');
+  const [track, setTrack] = useState(initial ? initial.track : true);
+  // The middle stage is the only one that may be blank, meaning "skip it".
+  const [labels, setLabels] = useState(initial
+    ? { want: stageLabel(initial, 'want'), doing: initial.labels?.doing || '', done: stageLabel(initial, 'done') }
+    : { ...first.labels });
+  const [detail, setDetail] = useState(initial ? initial.detail : first.detail);
+  const [missing, setMissing] = useState(false);
+
+  // A new kind brings its own words, but only into fields still holding the
+  // old kind's words. Anything typed in by hand stays as it was.
+  const pickKind = (k) => {
+    const was = kindOf(kind);
+    const now = kindOf(k);
+    setKind(now.kind);
+    if (!name.trim() || name === was.name) setName(now.name);
+    if (STAGES.every((s) => (labels[s] || '') === was.labels[s])) setLabels({ ...now.labels });
+    if (!detail.trim() || detail === was.detail) setDetail(now.detail);
+  };
+
+  const save = () => {
+    const n = name.trim();
+    if (!n) { setMissing(true); return; }
+    const k = kindOf(kind);
+    onSave({
+      id: initial?.id || uid(),
+      addedOn: initial?.addedOn || todayStr(),
+      name: n.slice(0, 120),
+      kind,
+      note: note.trim(),
+      track,
+      labels: {
+        want: labels.want.trim() || k.labels.want,
+        doing: labels.doing.trim(),
+        done: labels.done.trim() || k.labels.done,
+      },
+      detail: detail.trim(),
+      sort: initial?.sort || 'manual',
+      items: initial?.items || [],
+    });
+  };
+
+  const k = kindOf(kind);
+  const pick = (on) => ({
+    flex: 1, font: 'inherit', fontSize: 13, fontWeight: 600, padding: '8px 0',
+    borderRadius: 7, cursor: 'pointer',
+    background: on ? C.accent : 'transparent',
+    border: `1px solid ${on ? C.accent : C.line}`,
+    color: on ? C.onAccent : C.muted,
+  });
+
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
+      <Group label="What kind of list">
+        <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+          {COLLECTION_KINDS.map((x) => (
+            <button key={x.kind} className="crm-btn" onClick={() => pickKind(x.kind)}
+              aria-pressed={kind === x.kind} style={filterChip(kind === x.kind)}>
+              {x.kind}
+            </button>
+          ))}
+        </div>
+        <span style={hintStyle()}>Sets the starting words below. Every one of them can be changed.</span>
+      </Group>
+
+      <Field label="Name">
+        <input style={inputStyle} value={name} maxLength={120}
+          aria-invalid={missing || undefined}
+          aria-describedby={missing ? 'crm-list-name-missing' : undefined}
+          onChange={(e) => { setName(e.target.value); setMissing(false); }}
+          placeholder={k.name || 'Gift ideas for Mom'} />
+      </Field>
+      {/* Outside the label, or it would become part of the field's name. */}
+      {missing && (
+        <p id="crm-list-name-missing" style={{ margin: '-8px 0 14px', fontSize: 12, color: C.overdue }}>
+          Give the list a name first.
+        </p>
+      )}
+
+      <Field label="What it is for">
+        <textarea
+          className="crm-serif"
+          style={{ ...inputStyle, minHeight: 64, resize: 'vertical', lineHeight: 1.55 }}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="Everything people keep telling me to watch."
+        />
+      </Field>
+
+      <Group label="Keep track of progress">
+        <div style={{ display: 'flex', gap: 8, marginBottom: track ? 10 : 0 }}>
+          {[[true, 'Yes, in stages'], [false, 'No, just a list']].map(([v, l]) => (
+            <button key={l} className="crm-btn" onClick={() => setTrack(v)}
+              aria-pressed={track === v} style={pick(track === v)}>
+              {l}
+            </button>
+          ))}
+        </div>
+        {track ? (
+          <>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {[['want', 'Not started'], ['doing', 'Under way'], ['done', 'Finished']].map(([s, cap]) => (
+                <div key={s} style={{ flex: '1 1 130px' }}>
+                  <span style={{ display: 'block', fontSize: 12, color: C.faint, marginBottom: 4 }}>{cap}</span>
+                  <input
+                    style={{ ...inputStyle, minHeight: 38, fontSize: 14 }}
+                    value={labels[s]}
+                    maxLength={40}
+                    aria-label={`Name for the ${cap.toLowerCase()} stage`}
+                    placeholder={s === 'doing' ? 'Empty skips it' : k.labels[s]}
+                    onChange={(e) => setLabels({ ...labels, [s]: e.target.value })}
+                  />
+                </div>
+              ))}
+            </div>
+            <span style={hintStyle()}>
+              Your own words for each stage. Leave the middle one empty when there is no in-between.
+            </span>
+          </>
+        ) : (
+          <span style={hintStyle()}>
+            A plain list in the order you choose: rankings, gift ideas, the good taco places.
+            Turning stages back on later brings any progress back with it.
+          </span>
+        )}
+      </Group>
+
+      <Field label="The line under each title">
+        <input style={inputStyle} value={detail} maxLength={40}
+          onChange={(e) => setDetail(e.target.value)} placeholder={k.detail} />
+        <span style={hintStyle()}>
+          What each entry notes besides its name: the author, where to watch it, the set it
+          belongs to. Leave it empty to skip it.
+        </span>
+      </Field>
+
+      <div style={{ display: 'flex', gap: 8 }}>
+        <Button kind="solid" onClick={save} style={{ flex: 1 }}>
+          {initial ? 'Save changes' : 'Make this list'}
+        </Button>
+        <Button onClick={onCancel}>Cancel</Button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- lists: one entry ---------- */
+function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
+  const [title, setTitle] = useState(it.title);
+  const [detail, setDetail] = useState(it.detail || '');
+  const [status, setStatus] = useState(stageOf(c, it));
+  const [rating, setRating] = useState(it.rating || 0);
+  const [from, setFrom] = useState(people.some((p) => p.id === it.from) ? it.from : '');
+  const [link, setLink] = useState(it.link || '');
+  const [note, setNote] = useState(it.note || '');
+  const [problem, setProblem] = useState('');
+  const [confirm, setConfirm] = useState(false);
+  const used = stagesOf(c);
+  const byName = [...people].sort((a, b) => a.name.localeCompare(b.name));
+
+  const save = () => {
+    const t = title.trim();
+    if (!t) { setProblem('It needs a title.'); return; }
+    const href = safeLink(link);
+    if (link.trim() && !href) {
+      setProblem('That link does not look right. Paste the whole address, starting with https://');
+      return;
+    }
+    // Left alone, the stage and its finish date stay exactly as stored, so
+    // tidying a title never stamps a finish date on something imported.
+    const base = status !== stageOf(c, it) ? withStatus(it, status) : it;
+    onSave({
+      ...base,
+      title: t.slice(0, 300),
+      detail: detail.trim().slice(0, 300),
+      rating,
+      from: from || null,
+      link: href,
+      note: note.trim(),
+    });
+  };
+
+  return (
+    <div className="crm-entry crm-open" style={{
+      padding: '15px 15px 12px', background: C.paper, borderBottom: `1px solid ${C.line}`,
+    }}>
+      <Field label="Title">
+        <input autoFocus style={inputStyle} value={title} maxLength={300}
+          onChange={(e) => { setTitle(e.target.value); setProblem(''); }} placeholder={kindOf(c.kind).ph} />
+      </Field>
+
+      {(c.detail || detail) && (
+        <Field label={c.detail || 'Detail'}>
+          <input style={inputStyle} value={detail} maxLength={300} onChange={(e) => setDetail(e.target.value)} />
+        </Field>
+      )}
+
+      {used.length > 0 && (
+        <Group label="Where it stands">
+          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+            {used.map((s) => (
+              <button key={s} className="crm-btn" onClick={() => setStatus(s)}
+                aria-pressed={status === s}
+                style={{ ...filterChip(status === s), display: 'flex', alignItems: 'center', gap: 6 }}>
+                <StageMark stage={s} size={14} />
+                {stageLabel(c, s)}
+              </button>
+            ))}
+          </div>
+        </Group>
+      )}
+
+      <Group label="Your rating">
+        <StarPicker value={rating} onChange={setRating} />
+      </Group>
+
+      {people.length > 0 && (
+        <Field label="Recommended by">
+          <select className="crm-select" style={inputStyle} value={from} onChange={(e) => setFrom(e.target.value)}>
+            <option value="">Nobody in particular</option>
+            {byName.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </Field>
+      )}
+
+      <Field label="Link">
+        <input type="url" inputMode="url" style={inputStyle} value={link} placeholder="https://"
+          onChange={(e) => { setLink(e.target.value); setProblem(''); }} />
+      </Field>
+
+      <Field label="Notes">
+        <textarea
+          className="crm-serif"
+          style={{ ...inputStyle, minHeight: 64, resize: 'vertical', lineHeight: 1.55 }}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="Why it is on here, who to watch it with, what it cost."
+        />
+      </Field>
+
+      <p style={{ margin: '0 0 10px', fontSize: 12, color: C.faint }}>
+        Added {prettyDate(it.addedOn)}
+        {it.doneOn && stageOf(c, it) === 'done' ? ` · ${stageLabel(c, 'done')} ${prettyDate(it.doneOn)}` : ''}
+      </p>
+
+      {problem && <p style={{ margin: '0 0 10px', fontSize: 13, color: C.overdue }}>{problem}</p>}
+
+      <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+        <Button kind="solid" onClick={save} style={small}>Save</Button>
+        <Button onClick={onCancel} style={small}>Cancel</Button>
+        <Button kind="danger" onClick={() => (confirm ? onRemove(it.id) : setConfirm(true))}
+          style={{ fontSize: 12.5, padding: '6px 8px', marginLeft: 'auto', ...(confirm ? { fontWeight: 700 } : {}) }}>
+          {confirm ? 'Tap again to remove' : 'Remove'}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function ItemRow({ c, it, people, index, total, reordering, onStep, onEdit, onMove }) {
+  const used = stagesOf(c);
+  const st = stageOf(c, it);
+  const from = it.from ? people.find((p) => p.id === it.from) : null;
+  const meta = [it.detail, from && `from ${from.name}`].filter(Boolean).join(' · ');
+  const side = {
+    width: 46, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+    background: 'transparent', border: 'none', cursor: 'pointer', font: 'inherit',
+  };
+
+  const body = (
+    <>
+      <span style={{
+        display: 'block', fontSize: 15.5, fontWeight: 600, letterSpacing: '-0.015em',
+        color: used.length > 0 && st === 'done' ? C.muted : C.ink,
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      }}>{it.title}</span>
+      {(meta || it.rating > 0) && (
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 3, minWidth: 0 }}>
+          {it.rating > 0 && <StarRow n={it.rating} />}
+          {meta && (
+            <span style={{
+              fontSize: 12.5, color: C.muted, minWidth: 0,
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}>{meta}</span>
+          )}
+        </span>
+      )}
+      {it.note && !reordering && (
+        <span className="crm-serif" style={{
+          display: 'block', fontSize: 13.5, color: C.muted, marginTop: 4,
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>{it.note}</span>
+      )}
+    </>
+  );
+
+  return (
+    <div className="crm-entry" style={{
+      display: 'flex', alignItems: 'stretch', background: C.surface, borderBottom: `1px solid ${C.line}`,
+    }}>
+      {used.length > 0 && !reordering ? (
+        <button
+          className="crm-btn"
+          onClick={onStep}
+          title={`${stageLabel(c, st)}. Tap for ${stageLabel(c, nextStage(c, it))}.`}
+          aria-label={`${it.title}: ${stageLabel(c, st)}. Mark as ${stageLabel(c, nextStage(c, it))}`}
+          style={{ ...side, borderRight: `1px solid ${C.line}` }}
+        >
+          <StageMark stage={st} />
+        </button>
+      ) : (
+        <span aria-hidden="true" style={{
+          ...side, cursor: 'default', fontSize: 12.5, fontWeight: 600, color: C.faint,
+          fontVariantNumeric: 'tabular-nums',
+        }}>{index + 1}</span>
+      )}
+
+      {reordering ? (
+        <div style={{ flex: 1, minWidth: 0, padding: '12px 14px' }}>{body}</div>
+      ) : (
+        <button className="crm-btn crm-row" onClick={onEdit} style={{
+          flex: 1, minWidth: 0, display: 'block', textAlign: 'left', font: 'inherit', color: C.ink,
+          background: 'transparent', border: 'none', padding: '12px 14px', cursor: 'pointer',
+        }}>{body}</button>
+      )}
+
+      {it.link && !reordering && (
+        <a href={it.link} target="_blank" rel="noreferrer" title={linkHost(it.link)}
+          aria-label={`Open ${it.title} on ${linkHost(it.link)}`}
+          style={{ ...side, width: 42, color: C.muted, borderLeft: `1px solid ${C.line}` }}>
+          <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+            <path d="M5.5 2.5 H11.5 V8.5 M11.5 2.5 L3 11" fill="none" stroke="currentColor"
+              strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </a>
+      )}
+
+      {reordering && [[-1, 'up'], [1, 'down']].map(([d, word]) => {
+        const off = (d < 0 && index === 0) || (d > 0 && index === total - 1);
+        return (
+          <button
+            key={word}
+            className="crm-btn"
+            data-move={`${it.id}:${d}`}
+            disabled={off}
+            onClick={() => onMove(it.id, d)}
+            aria-label={`Move ${it.title} ${word}`}
+            style={{
+              ...side, width: 44, color: C.muted, borderLeft: `1px solid ${C.line}`,
+              cursor: off ? 'default' : 'pointer', opacity: off ? 0.3 : 1,
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+              <path d={d < 0 ? 'M3 9 L7 5 L11 9' : 'M3 5 L7 9 L11 5'} fill="none" stroke="currentColor"
+                strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---------- lists: sharing ---------- */
+function SharePanel({ c, people, owner }) {
+  const [progress, setProgress] = useState(true);
+  const [notes, setNotes] = useState(false);
+  const [to, setTo] = useState('');
+  const [said, setSaid] = useState('');
+  const [fallback, setFallback] = useState('');
+
+  const text = collectionText(c, { progress, notes });
+  const link = `${window.location.origin}${window.location.pathname}#${SHARE_PREFIX}${shareCode(c, { notes, by: owner })}`;
+  const mailable = people.filter((p) => (p.email || '').includes('@'))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const who = mailable.find((p) => p.id === to) || mailable[0] || null;
+  const mail = who
+    ? `mailto:${who.email}?subject=${encodeURIComponent(c.name)}&body=${encodeURIComponent(text)}`
+    : '';
+  const canShare = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
+
+  // The clipboard is refused outright on plain http and in some embeds, so
+  // there is always a way to get at the text by hand.
+  const copy = async (value, what) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setSaid(`${what} is copied. Paste it wherever you like.`);
+      setFallback('');
+    } catch {
+      setSaid('Copying was blocked here. Select the text below and copy it yourself.');
+      setFallback(value);
+    }
+  };
+
+  const sheet = async () => {
+    try {
+      await navigator.share({ title: c.name, text });
+    } catch (e) {
+      if (e?.name !== 'AbortError') copy(text, 'The list');
+    }
+  };
+
+  return (
+    <div className="crm-open" style={{
+      background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12,
+      padding: '15px 15px 12px', margin: '16px 0 0',
+    }}>
+      <p style={{ margin: '0 0 11px', fontSize: 13, fontWeight: 600, color: C.ink }}>Share this list</p>
+      <Check on={progress} onChange={setProgress} label="Show progress and ratings"
+        hint="In the text. An Orbit link always gives them a fresh start." />
+      <Check on={notes} onChange={setNotes} label="Include my notes"
+        hint="What the list is for, and the notes on each entry. Who recommended what always stays with you." />
+
+      <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginTop: 4 }}>
+        <Button kind="solid" onClick={() => copy(text, 'The list')} style={small}>Copy as text</Button>
+        {canShare && <Button onClick={sheet} style={small}>Share…</Button>}
+      </div>
+
+      {who && (
+        <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
+          <select
+            className="crm-select"
+            aria-label="Who to email it to"
+            value={who.id}
+            onChange={(e) => setTo(e.target.value)}
+            style={{ ...inputStyle, width: 'auto', flex: '1 1 170px', minHeight: 36, padding: '6px 11px', fontSize: 13 }}
+          >
+            {mailable.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+          <a href={mail} className="crm-btn" style={{
+            fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.01em', color: C.ink, textDecoration: 'none',
+            padding: '7px 11px', borderRadius: 7, border: `1px solid ${C.line}`, whiteSpace: 'nowrap',
+          }}>Email it to {who.name.split(' ')[0]}</a>
+        </div>
+      )}
+      {who && mail.length > 1900 && (
+        <span style={hintStyle()}>Some mail apps cut long lists short. Copying the text is the sure way.</span>
+      )}
+
+      <div style={{ borderTop: `1px solid ${C.line}`, marginTop: 14, paddingTop: 12 }}>
+        <p style={{ margin: '0 0 9px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+          Sending it to someone else who uses Orbit? A link gives them their own copy to work
+          through. They open it, or paste it under Add a shared list.
+        </p>
+        <Button onClick={() => copy(link, 'The link')} style={small}>Copy Orbit link</Button>
+        {link.length > 4000 && (
+          <span style={hintStyle()}>
+            This is a long one. Some messaging apps trim long links, so if it arrives broken, send
+            the text instead.
+          </span>
+        )}
+      </div>
+
+      <p aria-live="polite" style={{ margin: said ? '12px 0 0' : 0, fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+        {said}
+      </p>
+      {fallback && (
+        <textarea
+          readOnly
+          aria-label="Text to copy"
+          onFocus={(e) => e.target.select()}
+          value={fallback}
+          style={{ ...inputStyle, marginTop: 8, minHeight: 120, fontSize: 12, lineHeight: 1.45, resize: 'vertical' }}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------- lists: one list, opened ---------- */
+function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }) {
+  const [draft, setDraft] = useState('');
+  const [added, setAdded] = useState('');
+  const [stage, setStage] = useState('all');
+  const [q, setQ] = useState('');
+  const [editing, setEditing] = useState(null);
+  const [reordering, setReordering] = useState(false);
+  const [sharing, setSharing] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const [moved, setMoved] = useState(null);
+  const addBox = useRef(null);
+
+  const k = kindOf(c.kind);
+  const used = stagesOf(c);
+  const items = c.items;
+  // A stage filter left over from before the list dropped that stage
+  // would otherwise hide everything with no chip on screen to undo it.
+  const on = used.includes(stage) ? stage : 'all';
+  const query = q.trim().toLowerCase();
+  const count = (s) => items.filter((it) => stageOf(c, it) === s).length;
+
+  // Reordering works on the whole list in your order, whatever the view was,
+  // so "up" always means up in the order that is actually kept.
+  const shown = reordering ? items : sortItems(c, items)
+    .filter((it) => on === 'all' || stageOf(c, it) === on)
+    .filter((it) => !query || `${it.title} ${it.detail} ${it.note}`.toLowerCase().includes(query));
+
+  // Swapping two rows can pull the focused arrow out of the page and put it
+  // back, which drops keyboard focus. Hand it back so the next press works.
+  useEffect(() => {
+    if (!moved) return;
+    const find = (d) => document.querySelector(`[data-move="${CSS.escape(`${moved.id}:${d}`)}"]`);
+    const same = find(moved.d);
+    (same && !same.disabled ? same : find(-moved.d))?.focus();
+  }, [moved]);
+
+  const put = (next) => onSave({ ...c, items: next });
+
+  // New entries land in whatever stage you are looking at, so adding to the
+  // "Watched" view does not make the new entry vanish from it.
+  const add = () => {
+    const t = draft.trim();
+    if (!t) return;
+    if (items.length >= ITEM_CAP) { setAdded(`This list is full at ${ITEM_CAP}. Start another one.`); return; }
+    const fresh = withStatus({
+      id: uid(), title: t.slice(0, 300), detail: '', status: 'want', rating: 0, link: '', note: '',
+      from: null, addedOn: todayStr(), doneOn: null,
+    }, on === 'all' ? 'want' : on);
+    put([fresh, ...items]);
+    setDraft('');
+    setQ('');
+    setAdded(`Added ${t}${on === 'all' ? '' : ` as ${stageLabel(c, on).toLowerCase()}`}.`);
+    addBox.current?.focus();
+  };
+
+  const step = (it) => put(items.map((x) => (x.id === it.id ? withStatus(x, nextStage(c, x)) : x)));
+  const saveItem = (it) => { put(items.map((x) => (x.id === it.id ? it : x))); setEditing(null); };
+  const removeItem = (id) => { put(items.filter((x) => x.id !== id)); setEditing(null); };
+
+  const move = (id, d) => {
+    const i = items.findIndex((x) => x.id === id);
+    const j = i + d;
+    if (i < 0 || j < 0 || j >= items.length) return;
+    const next = [...items];
+    [next[i], next[j]] = [next[j], next[i]];
+    put(next);
+    setMoved({ id, d });
+  };
+
+  return (
+    <div>
+      <button className="crm-btn" onClick={onBack} style={{
+        font: 'inherit', fontSize: 13, fontWeight: 600, color: C.muted, background: 'transparent',
+        border: 'none', padding: '0 0 12px', cursor: 'pointer',
+      }}>
+        ← All lists
+      </button>
+
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+        <h1 style={{
+          margin: 0, fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em', minWidth: 0,
+          overflowWrap: 'anywhere',
+        }}>{c.name}</h1>
+        <div style={{ display: 'flex', gap: 8, marginLeft: 'auto' }}>
+          <Button onClick={() => setSharing(!sharing)} style={small}>{sharing ? 'Done sharing' : 'Share'}</Button>
+          <Button onClick={onEdit} style={small}>Edit list</Button>
+        </div>
+      </div>
+
+      <p style={{ margin: '7px 0 0', fontSize: 13, color: C.muted, display: 'flex', gap: 8, alignItems: 'baseline' }}>
+        <span style={kindChip()}>{c.kind}</span>
+        <span>{items.length} {items.length === 1 ? k.one : k.many}</span>
+      </p>
+
+      {c.note && (
+        <p className="crm-serif" style={{ margin: '10px 0 0', fontSize: 15, lineHeight: 1.6, color: C.ink }}>{c.note}</p>
+      )}
+
+      {used.length > 0 && items.length > 0 && <Progress c={c} />}
+
+      {sharing && <SharePanel c={c} people={people} owner={owner} />}
+
+      <div style={{ display: 'flex', gap: 8, marginTop: 18 }}>
+        <input
+          ref={addBox}
+          style={inputStyle}
+          value={draft}
+          maxLength={300}
+          aria-label={k.add}
+          placeholder={on === 'all' ? k.add : `${k.add} as ${stageLabel(c, on).toLowerCase()}`}
+          onChange={(e) => { setDraft(e.target.value); setAdded(''); }}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } }}
+        />
+        <Button kind="solid" onClick={add}>Add</Button>
+      </div>
+      <p aria-live="polite" style={{ margin: '6px 0 0', minHeight: 17, fontSize: 12.5, color: C.faint }}>{added}</p>
+
+      {items.length > 0 && (
+        <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', alignItems: 'center', margin: '8px 0 12px' }}>
+          {!reordering && used.length > 0 && (
+            <>
+              <button className="crm-btn" onClick={() => setStage('all')} aria-pressed={on === 'all'}
+                style={filterChip(on === 'all')}>
+                All <span style={{ opacity: 0.7 }}>{items.length}</span>
+              </button>
+              {used.map((s) => (
+                <button key={s} className="crm-btn" onClick={() => setStage(s)} aria-pressed={on === s}
+                  style={filterChip(on === s)}>
+                  {stageLabel(c, s)} <span style={{ opacity: 0.7 }}>{count(s)}</span>
+                </button>
+              ))}
+            </>
+          )}
+          <div style={{ display: 'flex', gap: 7, marginLeft: 'auto' }}>
+            {!reordering && (
+              <select
+                className="crm-select"
+                aria-label="Order"
+                value={c.sort}
+                onChange={(e) => onSave({ ...c, sort: e.target.value }, false)}
+                style={{
+                  ...inputStyle, width: 'auto', minHeight: 34, padding: '5px 11px',
+                  fontSize: 12.5, fontWeight: 600, color: C.muted,
+                }}
+              >
+                {COLLECTION_SORTS
+                  .filter(([v]) => v !== 'status' || used.length > 0 || c.sort === 'status')
+                  .map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+              </select>
+            )}
+            {(reordering || (c.sort === 'manual' && items.length > 1)) && (
+              <Button onClick={() => { setReordering(!reordering); setEditing(null); }} style={small}>
+                {reordering ? 'Done' : 'Reorder'}
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {reordering && (
+        <p style={{ margin: '0 0 10px', fontSize: 12.5, color: C.faint, lineHeight: 1.5 }}>
+          Use the arrows to move things up and down. Press Done when it is in the order you want.
+        </p>
+      )}
+
+      {!reordering && (items.length > 8 || query) && (
+        <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+          <input style={{ ...inputStyle, minHeight: 38, fontSize: 14 }} value={q}
+            aria-label={`Search ${k.many}`}
+            onChange={(e) => setQ(e.target.value)} placeholder={`Search these ${k.many}`} />
+          {query && <Button onClick={() => setQ('')} style={small}>Clear</Button>}
+        </div>
+      )}
+
+      {items.length === 0 ? (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.55, margin: '2px 0 0' }}>
+          Nothing on it yet. Type the first {k.one} above and press Enter.
+        </p>
+      ) : shown.length === 0 ? (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.55, margin: 0 }}>
+          {query
+            ? 'Nothing matches that. Try a looser search, or set it back to All.'
+            : `Nothing marked ${stageLabel(c, on).toLowerCase()} yet.`}
+        </p>
+      ) : (
+        <div style={{ border: `1px solid ${C.line}`, borderRadius: 12, overflow: 'hidden', background: C.surface }}>
+          {shown.map((it, i) => (editing === it.id ? (
+            <ItemEditor key={it.id} c={c} it={it} people={people}
+              onSave={saveItem} onRemove={removeItem} onCancel={() => setEditing(null)} />
+          ) : (
+            <ItemRow key={it.id} c={c} it={it} people={people} index={i} total={shown.length}
+              reordering={reordering} onStep={() => step(it)} onEdit={() => setEditing(it.id)} onMove={move} />
+          )))}
+        </div>
+      )}
+
+      <div style={{
+        marginTop: 22, borderTop: `1px solid ${C.line}`, paddingTop: 12,
+        display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+      }}>
+        <span style={{ flex: 1, fontSize: 12, color: C.faint }}>Started {prettyDate(c.addedOn)}</span>
+        <Button kind="danger" onClick={() => (confirm ? onRemove() : setConfirm(true))}
+          style={{ fontSize: 12.5, padding: '6px 8px', ...(confirm ? { fontWeight: 700 } : {}) }}>
+          {confirm ? 'Tap again to remove the list' : 'Remove this list'}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- lists: the tab ---------- */
+const LIST_ORDERS = [['recent', 'Recently changed'], ['name', 'A to Z'], ['size', 'Biggest first']];
+
+function CollectionCard({ c, found, onOpen }) {
+  const k = kindOf(c.kind);
+  const used = stagesOf(c);
+  const n = c.items.length;
+  const done = c.items.filter((it) => stageOf(c, it) === 'done').length;
+  const doing = used.includes('doing') ? c.items.filter((it) => stageOf(c, it) === 'doing').length : 0;
+  const peek = (found.length ? found : sortItems(c, c.items)).slice(0, 4).map((it) => it.title);
+  const more = (found.length || n) - peek.length;
+
+  // A flex column, because a button centres what is inside it, and cards in
+  // a row share the tallest one's height: shorter ones would sit lower down.
+  return (
+    <button className="crm-btn" onClick={onOpen} style={{
+      display: 'flex', flexDirection: 'column', justifyContent: 'flex-start',
+      width: '100%', textAlign: 'left', font: 'inherit', color: C.ink,
+      background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12,
+      padding: '14px 15px 13px', cursor: 'pointer',
+    }}>
+      <span style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+        <span style={{
+          flex: 1, minWidth: 0, fontSize: 16.5, fontWeight: 600, letterSpacing: '-0.02em',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>{c.name}</span>
+        <span style={kindChip()}>{c.kind}</span>
+      </span>
+      <span style={{ display: 'block', fontSize: 12.5, color: C.muted, marginTop: 3 }}>
+        {n === 0 ? 'Nothing on it yet' : `${n} ${n === 1 ? k.one : k.many}`}
+        {used.length > 0 && n > 0 ? ` · ${done} ${stageLabel(c, 'done').toLowerCase()}` : ''}
+        {doing > 0 ? ` · ${doing} ${stageLabel(c, 'doing').toLowerCase()}` : ''}
+      </span>
+      {used.length > 0 && n > 0 && <Progress c={c} thin />}
+      {peek.length > 0 && (
+        <span style={{
+          display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+          fontSize: 13, color: C.muted, marginTop: 10, lineHeight: 1.45,
+        }}>
+          {found.length > 0 && <span style={{ color: C.faint }}>{found.length} matching: </span>}
+          {peek.join(' · ')}{more > 0 ? ` and ${more} more` : ''}
+        </span>
+      )}
+    </button>
+  );
+}
+
+function CollectionsView({ collections, incoming, onOpen, onNew, onTakeShared, onDropShared }) {
+  const [q, setQ] = useState('');
+  const [kind, setKind] = useState('All');
+  const [order, setOrder] = useState('recent');
+  const [pasting, setPasting] = useState(false);
+  const [paste, setPaste] = useState('');
+  const [problem, setProblem] = useState('');
+
+  const query = q.trim().toLowerCase();
+  const kindsPresent = COLLECTION_KINDS.map((x) => x.kind).filter((x) => collections.some((c) => c.kind === x));
+  const onKind = kindsPresent.includes(kind) ? kind : 'All';
+  const narrowed = Boolean(query) || onKind !== 'All';
+
+  // A search looks inside lists as well as at their names, and a list found
+  // by what is on it shows those entries instead of its first few.
+  const shown = collections
+    .filter((c) => onKind === 'All' || c.kind === onKind)
+    .map((c) => ({
+      c,
+      found: query ? c.items.filter((it) => `${it.title} ${it.detail} ${it.note}`.toLowerCase().includes(query)) : [],
+      named: !query || `${c.name} ${c.note}`.toLowerCase().includes(query),
+    }))
+    .filter((x) => x.named || x.found.length > 0)
+    .sort((a, b) => {
+      if (order === 'name') return a.c.name.localeCompare(b.c.name, undefined, { sensitivity: 'base', numeric: true });
+      if (order === 'size') return b.c.items.length - a.c.items.length;
+      return (b.c.updatedAt || '').localeCompare(a.c.updatedAt || '');
+    });
+
+  const takePaste = () => {
+    const got = readShared(paste);
+    if (!got) {
+      setProblem('That does not look like a shared list. Paste the whole link, or the code at the end of it.');
+      return;
+    }
+    onTakeShared(got);
+    setPaste('');
+    setPasting(false);
+    setProblem('');
+  };
+
+  let head = 'No lists yet';
+  let sub = 'Shows to watch, books to read, the collection you are building. Anything worth keeping a list of.';
+  if (collections.length > 0) {
+    if (narrowed) {
+      head = `${countThings(shown.length, 'list', 'lists')} ${shown.length === 1 ? 'matches' : 'match'}`;
+      sub = query ? 'Looking through every list and everything on them.' : `Showing ${onKind} lists only.`;
+    } else {
+      head = `${countThings(collections.length, 'list', 'lists')} on the go`;
+      sub = order === 'name' ? 'A to Z.' : order === 'size' ? 'Biggest first.' : 'Most recently changed first.';
+    }
+  }
+
+  return (
+    <div>
+      {incoming && (
+        <div className="crm-open" style={{
+          background: C.accentSoft, border: `1px solid ${C.accent}`, borderRadius: 12,
+          padding: '14px 15px', marginBottom: 20,
+        }}>
+          {incoming.broken ? (
+            <>
+              <p style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600, color: C.ink }}>
+                That shared list could not be read
+              </p>
+              <p style={{ margin: '0 0 12px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+                The link may have been cut short on its way here. Ask for it again, or ask for the
+                text instead.
+              </p>
+              <Button onClick={onDropShared} style={small}>Close</Button>
+            </>
+          ) : (
+            <>
+              <p style={{ margin: '0 0 3px', fontSize: 12.5, color: C.muted }}>
+                {incoming.by ? `${incoming.by} shared a list with you` : 'A list was shared with you'}
+              </p>
+              <p style={{ margin: '0 0 3px', fontSize: 18, fontWeight: 600, letterSpacing: '-0.02em', color: C.ink }}>
+                {incoming.c.name}
+              </p>
+              <p style={{ margin: '0 0 12px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+                {incoming.c.items.length === 0
+                  ? 'Nothing on it yet.'
+                  : `${incoming.c.items.length} ${incoming.c.items.length === 1 ? kindOf(incoming.c.kind).one : kindOf(incoming.c.kind).many}: ${incoming.c.items.slice(0, 4).map((it) => it.title).join(', ')}${incoming.c.items.length > 4 ? ', and more' : ''}.`}
+              </p>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <Button kind="solid" onClick={() => onTakeShared(incoming)} style={small}>Add to my lists</Button>
+                <Button onClick={onDropShared} style={small}>Not now</Button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap', marginBottom: 6 }}>
+        <h1 style={{ margin: 0, fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>{head}</h1>
+        <Button kind="solid" onClick={() => onNew(null)} style={{ marginLeft: 'auto' }}>New list</Button>
+      </div>
+
+      {collections.length === 0 && <EmptySky />}
+
+      <p style={{ margin: '0 0 18px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>{sub}</p>
+
+      {collections.length === 0 && (
+        <div style={{ marginBottom: 20 }}>
+          <p style={{
+            margin: '0 0 8px', fontSize: 11, fontWeight: 600, letterSpacing: '0.06em',
+            textTransform: 'uppercase', color: C.faint,
+          }}>Start a list of</p>
+          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+            {COLLECTION_KINDS.map((x) => (
+              <button key={x.kind} className="crm-btn" onClick={() => onNew(x.kind)} style={filterChip(false)}>
+                {x.kind === 'Other' ? 'Something else' : x.kind}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {collections.length > 0 && (
+        <>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+            <input
+              style={inputStyle}
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Search lists and everything on them"
+            />
+            {query && <Button onClick={() => setQ('')}>Clear</Button>}
+          </div>
+
+          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', alignItems: 'center', marginBottom: 18 }}>
+            {kindsPresent.length > 1 && (
+              <>
+                <button className="crm-btn" onClick={() => setKind('All')} aria-pressed={onKind === 'All'}
+                  style={filterChip(onKind === 'All')}>All</button>
+                {kindsPresent.map((x) => (
+                  <button key={x} className="crm-btn" onClick={() => setKind(x)} aria-pressed={onKind === x}
+                    style={filterChip(onKind === x)}>{x}</button>
+                ))}
+              </>
+            )}
+            <select
+              className="crm-select"
+              aria-label="Order"
+              value={order}
+              onChange={(e) => setOrder(e.target.value)}
+              style={{
+                ...inputStyle, width: 'auto', marginLeft: 'auto',
+                minHeight: 34, padding: '5px 11px', fontSize: 12.5, fontWeight: 600, color: C.muted,
+              }}
+            >
+              {LIST_ORDERS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+            </select>
+          </div>
+        </>
+      )}
+
+      {collections.length > 0 && shown.length === 0 && (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.55, margin: 0 }}>
+          Nothing matches that. Try a looser search, or set the kind back to All.
+        </p>
+      )}
+
+      {shown.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(250px, 1fr))', gap: 10 }}>
+          {shown.map(({ c, found }) => (
+            <CollectionCard key={c.id} c={c} found={found} onOpen={() => onOpen(c.id)} />
+          ))}
+        </div>
+      )}
+
+      <div style={{ marginTop: 22 }}>
+        {pasting ? (
+          <div className="crm-open" style={{
+            background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '14px 15px',
+          }}>
+            <Field label="Paste a shared list">
+              <textarea
+                autoFocus
+                value={paste}
+                onChange={(e) => { setPaste(e.target.value); setProblem(''); }}
+                placeholder="The Orbit link someone sent you, or the code at the end of it"
+                style={{ ...inputStyle, minHeight: 72, fontSize: 13, lineHeight: 1.45, resize: 'vertical' }}
+              />
+            </Field>
+            {problem && <p style={{ margin: '-4px 0 10px', fontSize: 13, color: C.overdue }}>{problem}</p>}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Button kind="solid" onClick={takePaste} style={small}>Add it</Button>
+              <Button onClick={() => { setPasting(false); setPaste(''); setProblem(''); }} style={small}>Cancel</Button>
+            </div>
+          </div>
+        ) : (
+          <button className="crm-btn" onClick={() => setPasting(true)} style={{
+            font: 'inherit', fontSize: 13, fontWeight: 600, color: C.muted, background: 'transparent',
+            border: 'none', padding: 0, cursor: 'pointer', textDecoration: 'underline',
+            textDecorationColor: C.line, textUnderlineOffset: 3,
+          }}>
+            Add a shared list
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ---------- map ---------- */
 // No basemap here on purpose: tile servers are outside the sandbox allowlist,
 // so Leaflet would load and then render an empty grey square. The pins live
@@ -3120,8 +4539,8 @@ function Check({ on, onChange, label, hint }) {
   );
 }
 
-function ExportView({ people, events, reminders, onClose }) {
-  const [what, setWhat] = useState({ people: true, events: true, reminders: true, log: false });
+function ExportView({ people, events, reminders, collections, onClose }) {
+  const [what, setWhat] = useState({ people: true, events: true, reminders: true, lists: true, log: false });
   const [circle, setCircle] = useState('all');
   const [withPaused, setWithPaused] = useState(true);
   const [groups, setGroups] = useState(
@@ -3140,6 +4559,7 @@ function ExportView({ people, events, reminders, onClose }) {
     if (what.people) parts.push(['people', toCsv(cols, chosen)]);
     if (what.events) parts.push(['events', toCsv(EVENT_COLS, events)]);
     if (what.reminders) parts.push(['reminders', toCsv(REMINDER_COLS, reminders)]);
+    if (what.lists) parts.push(['lists', toCsv(ITEM_COLS, flattenCollections(collections))]);
     if (what.log) {
       const rows = [];
       chosen.forEach((p) => (p.log || []).forEach((e) => rows.push({ p, e })));
@@ -3184,6 +4604,8 @@ function ExportView({ people, events, reminders, onClose }) {
           label={`Events (${events.length})`} />
         <Check on={what.reminders} onChange={(v) => setWhat({ ...what, reminders: v })}
           label={`Reminders (${reminders.length})`} />
+        <Check on={what.lists} onChange={(v) => setWhat({ ...what, lists: v })}
+          label={`Lists (${collections.length})`} hint="One row per entry, with the list it is on" />
         <Check on={what.log} onChange={(v) => setWhat({ ...what, log: v })}
           label="Catch-up log" hint="Every logged catch-up as its own row" />
       </div>
@@ -3235,7 +4657,7 @@ function ExportView({ people, events, reminders, onClose }) {
   );
 }
 
-function ImportView({ people, events, reminders, onPeople, onEvents, onReminders, onClose }) {
+function ImportView({ people, events, reminders, collections, onPeople, onEvents, onReminders, onCollections, onClose }) {
   const [over, setOver] = useState(false);
   const [found, setFound] = useState(null);
   const [problem, setProblem] = useState('');
@@ -3265,6 +4687,8 @@ function ImportView({ people, events, reminders, onPeople, onEvents, onReminders
       const looksLikeReminders = headers.includes('nextdue')
         || headers.includes('repeatevery') || headers.includes('noticedays');
       const looksLikeEvents = headers.includes('title') && (headers.includes('start') || headers.includes('date'));
+      // People sheets have a List column too, but never a Title.
+      const looksLikeLists = headers.includes('title') && headers.includes('list');
 
       if (looksLikeReminders) {
         const { out, skipped } = fromCsv(REMINDER_COLS, rows, () => ({
@@ -3279,6 +4703,14 @@ function ImportView({ people, events, reminders, onPeople, onEvents, onReminders
             ? { ...r, every: { ...r.every, dom: everyFrom(r.next).dom } }
             : r));
         setFound({ kind: 'reminders', rows: good, skipped: skipped + (out.length - good.length), file: file.name });
+      } else if (looksLikeLists) {
+        const { out, skipped } = fromCsv(ITEM_COLS, rows, () => ({
+          list: '', kind: '', title: '', detail: '', status: '', rating: 0,
+          link: '', note: '', addedOn: '', doneOn: '',
+        }));
+        const good = out.filter((r) => r.title);
+        const lists = gatherCollections(good, file.name.replace(/\.csv$/i, '').trim() || 'Imported list');
+        setFound({ kind: 'lists', rows: lists, skipped: skipped + (out.length - good.length), file: file.name });
       } else if (looksLikeEvents) {
         const { out, skipped } = fromCsv(EVENT_COLS, rows, () => ({
           id: uid(), addedOn: todayStr(), kind: 'Other', people: [],
@@ -3305,6 +4737,8 @@ function ImportView({ people, events, reminders, onPeople, onEvents, onReminders
       onPeople(mode === 'replace' ? found.rows : [...people, ...found.rows]);
     } else if (found.kind === 'reminders') {
       onReminders(mode === 'replace' ? found.rows : [...reminders, ...found.rows]);
+    } else if (found.kind === 'lists') {
+      onCollections(mode === 'replace' ? found.rows : mergeCollections(collections, found.rows));
     } else {
       onEvents(mode === 'replace' ? found.rows : [...events, ...found.rows]);
     }
@@ -3318,7 +4752,7 @@ function ImportView({ people, events, reminders, onPeople, onEvents, onReminders
         <Button onClick={onClose} style={{ marginLeft: 'auto' }}>Done</Button>
       </div>
       <p style={{ margin: '0 0 20px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
-        Drop in a CSV. People, events and reminders are detected automatically, and a
+        Drop in a CSV. People, events, reminders and lists are detected automatically, and a
         plain sheet of names and emails works fine.
       </p>
 
@@ -3361,16 +4795,18 @@ function ImportView({ people, events, reminders, onPeople, onEvents, onReminders
           </p>
           <p style={{ margin: '0 0 14px', fontSize: 12.5, color: C.faint, lineHeight: 1.5 }}>
             From {found.file}
-            {found.skipped > 0 && `, ${found.skipped} row${found.skipped === 1 ? '' : 's'} skipped for having no ${found.kind === 'people' ? 'name' : 'title or date'}`}
+            {found.skipped > 0 && `, ${found.skipped} row${found.skipped === 1 ? '' : 's'} skipped for having no ${found.kind === 'people' ? 'name' : found.kind === 'lists' ? 'title' : 'title or date'}`}
           </p>
 
           {found.rows.length > 0 && (
             <>
               <p style={{ margin: '0 0 8px', fontSize: 12.5, color: C.muted }}>
-                First few: {found.rows.slice(0, 4).map((r) => r.name || r.title).join(', ')}
+                First few: {found.rows.slice(0, 4)
+                  .map((r) => (found.kind === 'lists' ? `${r.name} (${r.items.length})` : r.name || r.title)).join(', ')}
               </p>
               <Check on={mode === 'add'} onChange={() => setMode('add')}
-                label="Add to what I already have" />
+                label="Add to what I already have"
+                hint={found.kind === 'lists' ? 'Entries for a list you already keep join that list' : undefined} />
               <Check on={mode === 'replace'} onChange={() => setMode('replace')}
                 label="Replace everything"
                 hint={`Removes your current ${found.kind}`} />
@@ -3405,6 +4841,10 @@ export default function PersonalCRM() {
   const [eventDraft, setEventDraft] = useState(null);
   const [reminders, setReminders] = useState([]);
   const [reminderDraft, setReminderDraft] = useState(null);
+  const [collections, setCollections] = useState([]);
+  const [collectionOpen, setCollectionOpen] = useState(null);
+  const [collectionDraft, setCollectionDraft] = useState(null);
+  const [incoming, setIncoming] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [year, setYear] = useState(new Date().getFullYear());
   const [backup, setBackup] = useState('');
@@ -3438,6 +4878,12 @@ export default function PersonalCRM() {
         /* no reminders yet */
       }
       try {
+        const cl = await window.storage.get(COLLECTIONS_KEY);
+        if (cl?.value) setCollections(cleanCollections(JSON.parse(cl.value)));
+      } catch {
+        /* no lists yet */
+      }
+      try {
         const t = await window.storage.get(THEME_KEY);
         if (t?.value && THEMES[t.value]) { applyTheme(t.value); setTheme(t.value); }
       } catch {
@@ -3459,6 +4905,24 @@ export default function PersonalCRM() {
     document.addEventListener('click', shut);
     return () => document.removeEventListener('click', shut);
   }, [menuOpen]);
+
+  // Someone opened a shared list's link. Nothing is added until they say so,
+  // and the link is taken out of the address bar straight away, so a reload
+  // or a bookmark does not offer the same list again.
+  useEffect(() => {
+    const look = () => {
+      if (!window.location.hash.startsWith(`#${SHARE_PREFIX}`)) return;
+      const got = readShared(window.location.hash);
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      setIncoming(got || { broken: true });
+      setView('collections');
+      setCollectionOpen(null);
+      setCollectionDraft(null);
+    };
+    look();
+    window.addEventListener('hashchange', look);
+    return () => window.removeEventListener('hashchange', look);
+  }, []);
 
   const persist = async (next) => {
     setPeople(next);
@@ -3551,6 +5015,47 @@ export default function PersonalCRM() {
     setReminderDraft(null);
   };
 
+  const persistCollections = async (next) => {
+    setCollections(next);
+    try {
+      await window.storage.set(COLLECTIONS_KEY, JSON.stringify(next));
+      setError('');
+      return true;
+    } catch {
+      setError('That list is showing here but did not save. Try again.');
+      return false;
+    }
+  };
+
+  // Choosing a different order is how you look at a list, not a change to
+  // it, so it does not move the list up "Recently changed".
+  const putCollection = (c, touch = true) => {
+    const next = touch ? { ...c, updatedAt: new Date().toISOString() } : c;
+    const exists = collections.some((x) => x.id === c.id);
+    persistCollections(exists ? collections.map((x) => (x.id === c.id ? next : x)) : [...collections, next]);
+  };
+
+  const openCollectionById = (id) => {
+    setCollectionOpen(id);
+    setCollectionDraft(null);
+    window.scrollTo(0, 0);
+  };
+
+  const saveCollection = (c) => {
+    putCollection(c);
+    openCollectionById(c.id);
+  };
+
+  // A list with the same name is not overwritten; the new one says where it
+  // came from instead.
+  const takeShared = ({ c, by }) => {
+    const clash = collections.some((x) => x.name.toLowerCase() === c.name.toLowerCase());
+    const named = clash ? { ...c, name: `${c.name} (from ${by || 'a friend'})`.slice(0, 120) } : c;
+    putCollection(named);
+    setIncoming(null);
+    openCollectionById(named.id);
+  };
+
   const restore = async () => {
     let parts;
     try {
@@ -3559,27 +5064,32 @@ export default function PersonalCRM() {
       const rawPeople = Array.isArray(parsed) ? parsed : parsed.people;
       const rawEvents = Array.isArray(parsed) ? [] : parsed.events || [];
       const rawReminders = Array.isArray(parsed) ? [] : parsed.reminders || [];
+      const rawCollections = Array.isArray(parsed) ? [] : parsed.collections || [];
       if (!Array.isArray(rawPeople)) throw new Error('not a backup');
       const clean = rawPeople.filter((r) => r && typeof r.name === 'string' && r.name.trim());
-      if (clean.length === 0) throw new Error('nobody in it');
       parts = {
         people: clean.map((r) => ({ ...r, id: r.id || uid() })),
         events: (Array.isArray(rawEvents) ? rawEvents : []).filter((e) => e && e.title && e.date),
         reminders: (Array.isArray(rawReminders) ? rawReminders : [])
           .filter((r) => r && r.title && r.next)
           .map((r) => ({ ...r, id: r.id || uid() })),
+        collections: cleanCollections(rawCollections),
       };
+      // Someone can keep lists and nobody on them, so an empty people list is
+      // only a bad backup when there is nothing else in it either.
+      if (Object.values(parts).every((x) => x.length === 0)) throw new Error('nothing in it');
     } catch {
       setError("That backup could not be read. Paste the whole thing, starting with [ and ending with ].");
       return;
     }
     // Writing is kept out of the block above so a storage failure is never
     // reported as an unreadable backup. Each write clears the error on its
-    // own success, so the verdict has to be settled once all three are in --
+    // own success, so the verdict has to be settled once they are all in --
     // otherwise a list that saved would wipe the warning about one that did
     // not, and the restore would look complete when it was partial.
     const saved = await Promise.all([
       persist(parts.people), persistEvents(parts.events), persistReminders(parts.reminders),
+      persistCollections(parts.collections),
     ]);
     setBackup('');
     setPaste('');
@@ -3659,8 +5169,10 @@ export default function PersonalCRM() {
     });
     reminders.forEach((r) => (r.history || []).forEach((h) =>
       h?.date && found.add(Number(h.date.slice(0, 4)))));
+    collections.forEach((c) => c.items.forEach((it) =>
+      it.doneOn && found.add(Number(it.doneOn.slice(0, 4)))));
     return [...found].sort((a, b) => b - a);
-  }, [people, reminders]);
+  }, [people, reminders, collections]);
 
   const companies = useMemo(
     () => [...new Set(people.map((p) => p.company).filter(Boolean))].sort(),
@@ -3756,7 +5268,7 @@ export default function PersonalCRM() {
           .crm-back { display: none; }
           .crm-idle { display: block; }
         }
-        .crm-person:last-child { border-bottom: none !important; }
+        .crm-person:last-child, .crm-entry:last-child { border-bottom: none !important; }
         .crm-select {
           appearance: none; -webkit-appearance: none;
           background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.5 4.5 L6 8 L9.5 4.5' fill='none' stroke='${encodeURIComponent(C.muted)}' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
@@ -3804,13 +5316,16 @@ export default function PersonalCRM() {
           {!loading && (
             <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
               {[['list', 'People'], ['events', 'Events'], ['reminders', 'Reminders'],
-                ['map', 'Map'], ['recap', 'Recap']].map(([v, l]) => {
+                ['collections', 'Lists'], ['map', 'Map'], ['recap', 'Recap']].map(([v, l]) => {
                 const on = view === v;
                 return (
                   <button
                     key={v}
                     className="crm-btn"
-                    onClick={() => { setView(v); setEventDraft(null); setReminderDraft(null); }}
+                    onClick={() => {
+                      setView(v); setEventDraft(null); setReminderDraft(null);
+                      setCollectionDraft(null); setCollectionOpen(null);
+                    }}
                     style={{
                       font: 'inherit', fontSize: 12.5, fontWeight: 600, cursor: 'pointer',
                       color: on ? C.onAccent : C.muted,
@@ -3857,7 +5372,10 @@ export default function PersonalCRM() {
                       <button
                         key={v}
                         className="crm-btn"
-                        onClick={() => { setView(v); setMenuOpen(false); setEventDraft(null); setReminderDraft(null); }}
+                        onClick={() => {
+                          setView(v); setMenuOpen(false); setEventDraft(null); setReminderDraft(null);
+                          setCollectionDraft(null);
+                        }}
                         style={{
                           display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
                           fontSize: 13.5, fontWeight: 600, color: C.ink, cursor: 'pointer',
@@ -3955,15 +5473,55 @@ export default function PersonalCRM() {
           </div>
         )}
 
+        {view === 'collections' && (
+          <div className="crm-full">
+            {loading ? (
+              <p style={{ fontSize: 14, color: C.muted }}>One moment.</p>
+            ) : collectionDraft ? (
+              <CollectionForm
+                initial={collectionDraft.c}
+                kind={collectionDraft.kind}
+                onSave={saveCollection}
+                onCancel={() => setCollectionDraft(null)}
+              />
+            ) : collections.some((x) => x.id === collectionOpen) ? (
+              <CollectionDetail
+                key={collectionOpen}
+                c={collections.find((x) => x.id === collectionOpen)}
+                people={people}
+                owner={owner}
+                onSave={putCollection}
+                onEdit={() => setCollectionDraft({ c: collections.find((x) => x.id === collectionOpen) })}
+                onRemove={() => {
+                  persistCollections(collections.filter((x) => x.id !== collectionOpen));
+                  setCollectionOpen(null);
+                }}
+                onBack={() => setCollectionOpen(null)}
+              />
+            ) : (
+              <CollectionsView
+                collections={collections}
+                incoming={incoming}
+                onOpen={openCollectionById}
+                onNew={(kind) => setCollectionDraft({ c: null, kind })}
+                onTakeShared={takeShared}
+                onDropShared={() => setIncoming(null)}
+              />
+            )}
+          </div>
+        )}
+
         {view === 'import' && (
           <div className="crm-full">
             <ImportView
               people={people}
               events={events}
               reminders={reminders}
+              collections={collections}
               onPeople={persist}
               onEvents={persistEvents}
               onReminders={persistReminders}
+              onCollections={persistCollections}
               onClose={() => setView('list')}
             />
           </div>
@@ -3971,7 +5529,7 @@ export default function PersonalCRM() {
 
         {view === 'export' && (
           <div className="crm-full">
-            <ExportView people={people} events={events} reminders={reminders}
+            <ExportView people={people} events={events} reminders={reminders} collections={collections}
               onClose={() => setView('list')} />
           </div>
         )}
@@ -3987,7 +5545,9 @@ export default function PersonalCRM() {
             <Recap people={people} year={year} years={years} onYear={setYear}
               eventCount={events.filter((e) => Number(e.date.slice(0, 4)) === year).length}
               reminderCount={reminders.reduce((n, r) => n + (r.history || [])
-                .filter((h) => h?.date && Number(h.date.slice(0, 4)) === year).length, 0)} />
+                .filter((h) => h?.date && Number(h.date.slice(0, 4)) === year).length, 0)}
+              listCount={collections.reduce((n, c) => n + c.items
+                .filter((it) => it.doneOn && Number(it.doneOn.slice(0, 4)) === year).length, 0)} />
           </div>
         )}
 
@@ -4076,7 +5636,7 @@ export default function PersonalCRM() {
           </div>
         )}
 
-        {!loading && people.length > 0 && (
+        {!loading && people.length + events.length + reminders.length + collections.length > 0 && (
           <div style={{ marginTop: 18, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
             <p style={{ fontSize: 12, color: C.faint, margin: '0 0 10px', lineHeight: 1.5 }}>
               Saved locally, in this browser on this device. Only you can see it. It will not
@@ -4118,7 +5678,7 @@ export default function PersonalCRM() {
                 <textarea
                   readOnly
                   onFocus={(e) => e.target.select()}
-                  value={JSON.stringify({ people, events, reminders })}
+                  value={JSON.stringify({ people, events, reminders, collections })}
                   style={{ ...inputStyle, minHeight: 92, fontSize: 12, lineHeight: 1.4, resize: 'vertical' }}
                 />
               </div>
@@ -4127,7 +5687,8 @@ export default function PersonalCRM() {
             {backup === 'in' && (
               <div style={{ marginTop: 10 }}>
                 <p style={{ fontSize: 12, color: C.muted, margin: '0 0 6px' }}>
-                  Paste a backup. This replaces everyone currently on your lists.
+                  Paste a backup. This replaces everything saved here now: people, events,
+                  reminders and lists.
                 </p>
                 <textarea
                   value={paste}
@@ -4174,6 +5735,10 @@ export default function PersonalCRM() {
               myReminders={reminders
                 .filter((r) => (r.people || []).includes(selectedPerson.id))
                 .sort(byDue)}
+              myRecs={collections.flatMap((c) => c.items
+                .filter((it) => it.from === selectedPerson.id)
+                .map((it) => ({ c, it })))}
+              onList={(id) => { setView('collections'); openCollectionById(id); }}
               onLog={logTouch}
               onEditLog={editLog}
               onRemoveLog={removeLog}
