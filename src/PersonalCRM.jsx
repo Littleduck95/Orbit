@@ -541,7 +541,7 @@ function PersonForm({ initial, defaultCircle, inline, families, allGroups, compa
         </span>
       </Field>
 
-      <Field label="Circle">
+      <Group label="Circle">
         <div style={{ display: 'flex', gap: 8 }}>
           {[['friend', 'Personal'], ['work', 'Professional']].map(([v, l]) => (
             <button
@@ -560,7 +560,7 @@ function PersonForm({ initial, defaultCircle, inline, families, allGroups, compa
             </button>
           ))}
         </div>
-      </Field>
+      </Group>
 
       {circle === 'friend' && (
         <Field label="Closeness">
@@ -2138,7 +2138,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
           placeholder="Dana and Sam got married" />
       </Field>
 
-      <Field label="When">
+      <Group label="When">
         <div style={{ display: 'flex', gap: 8, marginBottom: 9 }}>
           {[[false, 'One day'], [true, 'Over several days']].map(([v, l]) => (
             <button
@@ -2160,18 +2160,20 @@ function EventForm({ initial, people, onSave, onCancel }) {
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <div style={{ flex: '1 1 138px' }}>
               <span style={{ display: 'block', fontSize: 12, color: C.faint, marginBottom: 4 }}>Started</span>
-              <input type="date" style={inputStyle} value={date} onChange={(e) => setDate(e.target.value)} />
+              <input type="date" style={inputStyle} value={date} aria-label="Started"
+                onChange={(e) => setDate(e.target.value)} />
             </div>
             <div style={{ flex: '1 1 138px' }}>
               <span style={{ display: 'block', fontSize: 12, color: C.faint, marginBottom: 4 }}>Ended</span>
-              <input type="date" style={inputStyle} value={endDate} min={date}
+              <input type="date" style={inputStyle} value={endDate} min={date} aria-label="Ended"
                 onChange={(e) => setEndDate(e.target.value)} />
             </div>
           </div>
         ) : (
-          <input type="date" style={inputStyle} value={date} onChange={(e) => setDate(e.target.value)} />
+          <input type="date" style={inputStyle} value={date} aria-label="When"
+            onChange={(e) => setDate(e.target.value)} />
         )}
-      </Field>
+      </Group>
 
       <Field label="Kind">
         <select className="crm-select" style={inputStyle} value={kind} onChange={(e) => setKind(e.target.value)}>
@@ -3463,8 +3465,10 @@ export default function PersonalCRM() {
     try {
       await window.storage.set(STORE_KEY, JSON.stringify(next));
       setError('');
+      return true;
     } catch {
       setError('That change is showing here but did not save. Try again.');
+      return false;
     }
   };
 
@@ -3510,8 +3514,10 @@ export default function PersonalCRM() {
     try {
       await window.storage.set(EVENTS_KEY, JSON.stringify(next));
       setError('');
+      return true;
     } catch {
       setError('That event is showing here but did not save. Try again.');
+      return false;
     }
   };
 
@@ -3526,8 +3532,10 @@ export default function PersonalCRM() {
     try {
       await window.storage.set(REMINDERS_KEY, JSON.stringify(next));
       setError('');
+      return true;
     } catch {
       setError('That reminder is showing here but did not save. Try again.');
+      return false;
     }
   };
 
@@ -3543,7 +3551,8 @@ export default function PersonalCRM() {
     setReminderDraft(null);
   };
 
-  const restore = () => {
+  const restore = async () => {
+    let parts;
     try {
       const parsed = JSON.parse(paste);
       // Older backups were a bare array of people.
@@ -3553,17 +3562,30 @@ export default function PersonalCRM() {
       if (!Array.isArray(rawPeople)) throw new Error('not a backup');
       const clean = rawPeople.filter((r) => r && typeof r.name === 'string' && r.name.trim());
       if (clean.length === 0) throw new Error('nobody in it');
-      persist(clean.map((r) => ({ ...r, id: r.id || uid() })));
-      persistEvents(rawEvents.filter((e) => e && e.title && e.date));
-      persistReminders((Array.isArray(rawReminders) ? rawReminders : [])
-        .filter((r) => r && r.title && r.next)
-        .map((r) => ({ ...r, id: r.id || uid() })));
-      setBackup('');
-      setPaste('');
-      setError('');
+      parts = {
+        people: clean.map((r) => ({ ...r, id: r.id || uid() })),
+        events: (Array.isArray(rawEvents) ? rawEvents : []).filter((e) => e && e.title && e.date),
+        reminders: (Array.isArray(rawReminders) ? rawReminders : [])
+          .filter((r) => r && r.title && r.next)
+          .map((r) => ({ ...r, id: r.id || uid() })),
+      };
     } catch {
       setError("That backup could not be read. Paste the whole thing, starting with [ and ending with ].");
+      return;
     }
+    // Writing is kept out of the block above so a storage failure is never
+    // reported as an unreadable backup. Each write clears the error on its
+    // own success, so the verdict has to be settled once all three are in --
+    // otherwise a list that saved would wipe the warning about one that did
+    // not, and the restore would look complete when it was partial.
+    const saved = await Promise.all([
+      persist(parts.people), persistEvents(parts.events), persistReminders(parts.reminders),
+    ]);
+    setBackup('');
+    setPaste('');
+    setError(saved.every(Boolean)
+      ? ''
+      : 'Your lists are showing here but part of that backup did not save. Try again.');
   };
 
   const remove = (id) => {
