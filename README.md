@@ -24,6 +24,17 @@ Then open http://localhost:5173.
 | `npm run build` | Production build into `dist/` |
 | `npm run preview` | Serve the built `dist/` locally |
 | `npm run lint` | ESLint over the project |
+| `npm test` | Logic and storage tests (Node's built-in runner, no extra installs) |
+| `npm run test:browser` | Drives the real app in Chromium; needs Playwright installed |
+
+The tests are characterization tests: they pin down what the app does today,
+with the clock, timezone and locale fixed so dates are repeatable. Checks whose
+names start `CURRENT:` record behaviour an audit flagged as questionable; if
+that behaviour is changed on purpose, the check changes in the same commit.
+`tests/app.mjs` compiles the real `src/PersonalCRM.jsx` with Vite's own
+transformer to reach its private helpers, without touching the source.
+Playwright is not a dependency of this project; the browser runner finds an
+installed copy, or says plainly that there is none.
 
 ## Layout
 
@@ -32,6 +43,7 @@ index.html            page shell, mounts #root
 src/main.jsx          entry point — installs the storage shim, renders the app
 src/storage.js        window.storage shim backed by localStorage
 src/PersonalCRM.jsx   the app
+tests/                characterization tests (logic, storage, browser)
 vite.config.js        build config
 eslint.config.js      lint config
 ```

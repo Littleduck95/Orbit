@@ -25,7 +25,12 @@ export default [
     },
   },
   {
-    files: ['vite.config.js', 'eslint.config.js'],
+    files: ['vite.config.js', 'eslint.config.js', 'tests/**/*.{js,mjs}'],
     languageOptions: { globals: { ...globals.node } },
+  },
+  {
+    // Browser tests run in Node, but pass functions into the page to run there.
+    files: ['tests/browser/**/*.{js,mjs}'],
+    languageOptions: { globals: { ...globals.node, ...globals.browser } },
   },
 ];
