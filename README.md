@@ -24,7 +24,7 @@ Then open http://localhost:5173.
 | `npm run build` | Production build into `dist/` |
 | `npm run preview` | Serve the built `dist/` locally |
 | `npm run lint` | ESLint over the project |
-| `npm test` | Logic and storage tests (Node's built-in runner, no extra installs) |
+| `npm test` | Logic, storage and account tests (Node's built-in runner, no extra installs) |
 | `npm run test:browser` | Drives the real app in Chromium; needs Playwright installed |
 
 The tests are characterization tests: they pin down what the app does today,
@@ -40,8 +40,13 @@ installed copy, or says plainly that there is none.
 
 ```
 index.html            page shell, mounts #root
-src/main.jsx          entry point — installs the storage shim, renders the app
-src/storage.js        window.storage shim backed by localStorage
+src/main.jsx          entry point — signs in (or installs local storage), renders the app
+src/storage.js        window.storage backed by localStorage, when there are no accounts
+src/supabase.js       the Supabase client, from the settings in .env
+src/Account.jsx       sign-in screen; opens the account before the app is drawn
+src/cloudStorage.js   window.storage backed by the signed-in account
+supabase/schema.sql   the table and its access rules, run once in Supabase
+.env                  which Supabase project to use (public values)
 src/Recovery.jsx      shown instead of a blank page if drawing ever fails
 src/PersonalCRM.jsx   the app
 tests/                characterization tests (logic, storage, browser)
@@ -126,6 +131,61 @@ their own copy can paste the link, or just the code at the end of it, under
 kept: only `http` and `https` links survive, and text is trimmed to sensible
 lengths.
 
+## Accounts
+
+Orbit asks people to sign in, by a link sent to their email or with Google,
+and keeps their data in their own account on [Supabase](https://supabase.com),
+so it is the same on every device they sign in on. The project is set in
+`.env`. Both values there are public by design: the publishable key can only
+do what the row-level security in `supabase/schema.sql` allows, which is each
+signed-in person reading and writing their own rows. Leave either value empty
+and Orbit runs as it did before, saving only in the browser with no sign-in.
+The browser tests do exactly that.
+
+Each of the app's keys (below) is one row in the `orbit_data` table, holding
+the same text the app always stored. The whole account is read once when it
+opens, and every change is written straight to it; a change only counts as
+saved once the account has it, so the app's "did not save" message still
+means what it says. If two devices change the same kind of thing (say, both
+edit people) the later save wins.
+
+- **The first sign-in** moves everything this browser had saved into an empty
+  account, then removes the browser's copy, so the next person to sign in on
+  the same computer does not inherit it. If the account already has data and
+  so does the browser, the two are never mixed: Orbit asks which to keep, and
+  offers the browser's copy as a download first. Keeping the account's moves
+  the browser's older data aside (under `orbit:parked:`) rather than deleting it.
+- **Offline**, Orbit opens from a copy of the account kept in this browser
+  (under `orbit:@<user id>:`) and says so. Changes do not save until the
+  connection is back. With no copy, it says it cannot reach the account rather
+  than opening empty. Signing out removes the copy.
+- **A shared-list link** opened while signed out is held through sign-in and
+  offered afterwards.
+- **Sign out** is in the ⋮ menu, under your email address.
+
+### Setting up the Supabase project
+
+Done once, in the [Supabase dashboard](https://supabase.com/dashboard):
+
+1. **Create the table.** SQL Editor → New query → paste all of
+   `supabase/schema.sql` → Run.
+2. **Say where Orbit lives.** Authentication → URL Configuration. Set *Site
+   URL* to the address Orbit is served from, and add every address people sign
+   in from under *Redirect URLs*: for example `http://localhost:5173/` for
+   `npm run dev`, and the hosted address. A link that sends someone to an
+   address not on the list is refused.
+3. **Email links** work out of the box. Supabase's built-in email is heavily
+   rate-limited (a few emails an hour) and meant for trying things out; for
+   real use, add an SMTP provider under Authentication → Emails → SMTP Settings.
+4. **Google.** In [Google Cloud Console](https://console.cloud.google.com/)
+   → APIs & Services: set up the OAuth consent screen, then Credentials →
+   Create credentials → OAuth client ID → *Web application*. Under *Authorized
+   redirect URIs* add
+   `https://zteqzxfqodbhbrtzrmdf.supabase.co/auth/v1/callback`. Copy the client
+   ID and secret into Supabase under Authentication → Sign In / Providers →
+   Google, and turn it on. Until then, *Continue with Google* shows Supabase's
+   "provider is not enabled" error.
+
 ## What the app stores
 
 People, events, reminders, lists, the chosen theme, and your name live under
@@ -134,15 +194,16 @@ six keys (`crm-people-v1`, `crm-events-v1`, `crm-reminders-v1`,
 collections in the code, because "list" already means the people list there.
 The app reads and writes them through an async `window.storage` object.
 
-`src/storage.js` provides that object, backed by `localStorage` and namespaced
-under an `orbit:` prefix. Writes are allowed to fail loudly — the app already
+When signed in, `src/cloudStorage.js` provides that object, backed by the
+account (see [Accounts](#accounts)). Without accounts, `src/storage.js` provides
+it, backed by `localStorage` and namespaced under an `orbit:` prefix. Writes are allowed to fail loudly — the app already
 catches a rejected write and tells you the change did not save, which is the
 honest outcome when the browser refuses to persist (private mode, exhausted
 quota, blocked site data).
 
 There is a **Back up** button in the app that exports everything as JSON, and a
-**Restore** button that reads it back. Use them; `localStorage` is per-browser
-and per-device. Older backups that predate reminders or lists still restore —
+**Restore** button that reads it back. Without accounts, use them;
+`localStorage` is per-browser and per-device. Older backups that predate reminders or lists still restore —
 the app treats a missing `reminders` or `collections` key as an empty list. A
 backup with lists but nobody in it restores too. Back up and Restore sit under
 the People tab and appear once anything at all is saved.

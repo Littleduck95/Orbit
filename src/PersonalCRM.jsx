@@ -5121,7 +5121,9 @@ function ImportView({ people, events, reminders, collections, onPeople, onEvents
 }
 
 /* ---------- app ---------- */
-export default function PersonalCRM() {
+// account is { email, signOut } when Orbit is signed in to (see Account.jsx),
+// and null when it saves only in this browser.
+export default function PersonalCRM({ account = null } = {}) {
   const [people, setPeople] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -5718,6 +5720,23 @@ export default function PersonalCRM() {
                         }}
                       >{l}</button>
                     ))}
+                    {account && (
+                      <div style={{ borderTop: `1px solid ${C.line}` }}>
+                        <p style={{
+                          margin: 0, padding: '9px 13px 0', fontSize: 12, color: C.muted,
+                          maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        }} title={account.email}>{account.email || 'Signed in'}</p>
+                        <button
+                          className="crm-btn"
+                          onClick={() => { setMenuOpen(false); account.signOut(); }}
+                          style={{
+                            display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
+                            fontSize: 13.5, fontWeight: 600, color: C.ink, cursor: 'pointer',
+                            padding: '4px 13px 10px', background: 'transparent', border: 'none',
+                          }}
+                        >Sign out</button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
