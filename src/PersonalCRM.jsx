@@ -254,6 +254,13 @@ const rank = (p) => {
   return base + (p.vip ? 10000 : 0);
 };
 
+// Most urgent first. Works out each person's rank once, rather than twice in
+// every comparison; the comparisons, and so the order, are the same.
+const byRank = (list) =>
+  list.map((p) => ({ p, r: rank(p) }))
+    .sort((a, b) => b.r - a.r)
+    .map((x) => x.p);
+
 
 // lastContact is derived, so any edit to the log has to rebuild it.
 const withLog = (p, log) => {
@@ -5441,10 +5448,7 @@ export default function PersonalCRM() {
     try { await window.storage.set(OWNER_KEY, name); } catch { /* not fatal */ }
   };
 
-  const sorted = useMemo(
-    () => [...inCircle].sort((a, b) => rank(b) - rank(a)),
-    [inCircle]
-  );
+  const sorted = useMemo(() => byRank(inCircle), [inCircle]);
   const quiet = useMemo(() => sorted.filter((p) => status(p).over), [sorted]);
 
   const soonest = useMemo(() => {
@@ -5467,10 +5471,7 @@ export default function PersonalCRM() {
       .toLowerCase()
       .includes(query);
 
-  const everyone = useMemo(
-    () => [...people].sort((a, b) => rank(b) - rank(a)),
-    [people]
-  );
+  const everyone = useMemo(() => byRank(people), [people]);
 
   const families = useMemo(
     () => [...new Set(people.flatMap((p) => p.families || []))].sort(),

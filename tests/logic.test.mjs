@@ -136,6 +136,24 @@ describe('who needs reaching out to', () => {
     assert.equal(A.rank({ cadence: 0, vip: true }), 11000);
   });
 
+  it('sorts by rank in exactly the order comparing ranks directly gives, ties and all', () => {
+    let seed = 11;
+    const rnd = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; };
+    const pick = (a) => a[Math.floor(rnd() * a.length)];
+    const person = (i) => ({
+      i, vip: rnd() < 0.1, paused: rnd() < 0.08, child: rnd() < 0.05,
+      cadence: pick([0, 7, 30, 90, '30', '0', null, undefined, NaN, 'often']),
+      lastContact: pick([null, ago(0), ago(3), ago(29), ago(30), ago(400), 'March 3', '']),
+    });
+    for (let round = 0; round < 2000; round += 1) {
+      const list = Array.from({ length: Math.floor(rnd() * 40) }, (_, i) => person(i));
+      const before = [...list].sort((a, b) => A.rank(b) - A.rank(a));
+      const after = A.byRank(list);
+      assert.deepEqual(after.map((p) => p.i), before.map((p) => p.i), `round ${round}`);
+      assert.ok(after.every((p, k) => p === before[k]), 'the same objects come back');
+    }
+  });
+
   it('rebuilds last contact from the log', () => {
     const p = A.withLog({ name: 'x' }, [{ date: '2026-01-02' }, { date: '' }, { date: '2026-05-01', text: 'b' }]);
     assert.deepEqual(p.log.map((e) => e.date), ['2026-05-01', '2026-01-02']);
