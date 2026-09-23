@@ -5362,7 +5362,8 @@ export default function PersonalCRM() {
       const clean = cleanAll(rawPeople.filter((r) => r && typeof r.name === 'string' && r.name.trim()), cleanPerson);
       parts = {
         people: clean.map((r) => ({ ...r, id: r.id || uid() })),
-        events: cleanAll((Array.isArray(rawEvents) ? rawEvents : []).filter((e) => e && e.title && e.date), cleanEvent),
+        events: cleanAll((Array.isArray(rawEvents) ? rawEvents : []).filter((e) => e && e.title && e.date), cleanEvent)
+          .map((e) => ({ ...e, id: e.id || uid() })),
         reminders: cleanAll((Array.isArray(rawReminders) ? rawReminders : []).filter((r) => r && r.title && r.next), cleanReminder)
           .map((r) => ({ ...r, id: r.id || uid() })),
         collections: cleanCollections(rawCollections),

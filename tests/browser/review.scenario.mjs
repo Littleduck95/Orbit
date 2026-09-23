@@ -121,23 +121,24 @@ export default async function review({ newPage, check, shots }) {
     await done();
   }
 
-  // ---- restored events without ids ----
+  // ---- fixed (M3): restored events without ids are given ids ----
   {
     const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [person('h', 'Hana Hill')] } });
     await open();
     await page.getByRole('button', { name: 'Restore' }).click();
     await page.getByPlaceholder('Paste here').fill(JSON.stringify({
       people: [person('h', 'Hana Hill')],
-      events: [{ title: 'One', date: '2026-01-01' }, { title: 'Two', date: '2026-02-01' }],
+      events: [{ title: 'One', date: '2026-01-01' }, { title: 'Two', date: '2026-02-01' }, { id: 'keep', title: 'Three', date: '2026-03-01' }],
     }));
     await page.getByRole('button', { name: 'Replace my lists' }).click();
-    check('CURRENT: restored events keep no id', (await stored('crm-events-v1')).every((e) => e.id === undefined));
+    const ids = (await stored('crm-events-v1')).map((e) => e.id);
+    check('restored events without ids get distinct ones, and existing ids are kept',
+      ids.length === 3 && new Set(ids).size === 3 && ids[2] === 'keep' && ids.every((id) => typeof id === 'string' && id), ids);
     await page.getByRole('button', { name: 'Events', exact: true }).click();
     await page.getByRole('button', { name: 'Remove', exact: true }).first().click();
     await page.getByRole('button', { name: 'Tap again to remove' }).click();
-    check('CURRENT: so removing one of them removes all of them', (await stored('crm-events-v1')).length === 0);
-    // Without ids they also share a React key, which React warns about.
-    await done({ allow: /unique "key" prop|Check the render method/ });
+    check('so removing one removes only that one', (await stored('crm-events-v1')).length === 2);
+    await done();
   }
 
   // ---- the catch-up log export skips formula escaping ----
