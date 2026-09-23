@@ -34,16 +34,27 @@ export default async function review({ newPage, check, shots }) {
     await done();
   }
 
-  // ---- editing someone with no reminder quietly gives them one ----
+  // ---- fixed (H4): editing someone with no reminder keeps it that way ----
   {
-    const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [person('c', 'Cleo Cruz', { cadence: 0, lastContact: '2026-09-20' })] } });
+    const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [
+      person('c', 'Cleo Cruz', { cadence: 0, lastContact: '2026-09-20' }),
+      person('c2', 'Cy Cole', { cadence: '0', lastContact: '2026-09-20' }),
+      { id: 'c3', name: 'Cam Cho', circle: 'friend', tier: 'friend', log: [] },
+    ] } });
     await open();
-    await page.locator('.crm-person .crm-row', { hasText: 'Cleo Cruz' }).click();
-    await page.getByRole('button', { name: 'Edit', exact: true }).click();
-    check('CURRENT: the form shows "every few months" for someone set to no reminder',
-      (await page.getByLabel('Check in').inputValue()) === '90');
-    await page.getByRole('button', { name: 'Save changes' }).click();
-    check('CURRENT: saving without touching it changes them to a 90-day check-in', (await stored('crm-people-v1'))[0].cadence === 90);
+    const cadenceAfterSave = async (name) => {
+      await page.getByRole('button', { name: /^Everyone/ }).click();
+      await page.locator('.crm-person .crm-row', { hasText: name }).click();
+      await page.getByRole('button', { name: 'Edit', exact: true }).click();
+      const shown = await page.getByLabel('Check in').inputValue();
+      await page.getByRole('button', { name: 'Save changes' }).click();
+      return [shown, (await stored('crm-people-v1')).find((p) => p.name === name).cadence];
+    };
+    const [shown, saved] = await cadenceAfterSave('Cleo Cruz');
+    check('the form shows "no reminder" for someone set to no reminder', shown === '0', shown);
+    check('saving without touching it keeps no reminder', saved === 0, saved);
+    check('a "0" stored as text is kept as no reminder too', JSON.stringify(await cadenceAfterSave('Cy Cole')) === '["0",0]');
+    check('a missing cadence still falls back to every few months', JSON.stringify(await cadenceAfterSave('Cam Cho')) === '["90",90]');
     await done();
   }
 

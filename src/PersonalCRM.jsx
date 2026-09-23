@@ -487,7 +487,10 @@ function PersonForm({ initial, defaultCircle, inline, families, allGroups, compa
   const [groups, setGroups] = useState((initial?.groups || []).join(', '));
   const [partnerName, setPartnerName] = useState(initial?.partner?.name || '');
   const [partnerStatus, setPartnerStatus] = useState(initial?.partner?.status || '');
-  const [cadence, setCadence] = useState(initial?.cadence || 90);
+  // 0 is a real choice ("no reminder", which status() also reads from a
+  // stored "0"), so it is kept. Only a missing or unreadable cadence falls
+  // back to 90, as before.
+  const [cadence, setCadence] = useState([0, '0'].includes(initial?.cadence) ? 0 : initial?.cadence || 90);
   const [cadenceTouched, setCadenceTouched] = useState(Boolean(initial));
   const [birthday, setBirthday] = useState(initial?.birthday || '');
   const [age, setAge] = useState(initial?.age ? String(initial.age) : '');
