@@ -303,7 +303,7 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
   await page.getByRole('button', { name: 'Done', exact: true }).click();
   await page.getByRole('button', { name: 'More', exact: true }).click();
   await page.getByRole('button', { name: 'Import', exact: true }).click();
-  await page.locator('input[type=file]').setInputFiles(sheet);
+  await page.getByLabel('CSV file').setInputFiles(sheet);
   await page.waitForSelector('text=lists ready');
   check('import recognises a lists sheet', await page.getByText('3 lists ready').isVisible());
   await page.getByRole('button', { name: /^Add 3 lists/ }).click();
@@ -447,12 +447,12 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
   fs.writeFileSync(peopleSheet, 'Name,List,Title,Email\nAva Chen,Professional,Director,ava@example.com\n');
   await P.getByRole('button', { name: 'More', exact: true }).click();
   await P.getByRole('button', { name: 'Import', exact: true }).click();
-  await P.locator('input[type=file]').setInputFiles(peopleSheet);
+  await P.getByLabel('CSV file').setInputFiles(peopleSheet);
   await P.waitForSelector('text=ready');
   check('a people sheet with a Title column is still read as people', await P.getByText('1 people ready').isVisible());
   const bookSheet = path.join(OUT, 'more-books.csv');
   fs.writeFileSync(bookSheet, 'List,Title,Status\nAlmost full,Extra 1,Read\nAlmost full,Extra 2,\nAlmost full,Extra 3,\n');
-  await P.locator('input[type=file]').setInputFiles(bookSheet);
+  await P.getByLabel('CSV file').setInputFiles(bookSheet);
   await P.waitForSelector('text=lists ready');
   check('an import past the limit says how many will not fit', await P.getByText('Two entries will not fit. A list holds at most 2,000.').isVisible());
   await P.getByLabel('Replace everything').check();

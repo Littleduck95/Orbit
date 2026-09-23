@@ -1014,8 +1014,9 @@ function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle }) {
   );
 }
 
-function PersonDetail({ p, myEvents, myReminders, myRecs, onLog, onEditLog, onRemoveLog, onEdit, onRemove, onTag, onList, onClose }) {
+function PersonDetail({ p, owner, myEvents, myReminders, myRecs, onLog, onEditLog, onRemoveLog, onEdit, onRemove, onTag, onList, onClearVia, onClose }) {
   const [logging, setLogging] = useState(false);
+  const [sharing, setSharing] = useState(false);
   const [logDate, setLogDate] = useState(todayStr());
   const [logText, setLogText] = useState('');
   const [confirmRemove, setConfirmRemove] = useState(false);
@@ -1205,6 +1206,15 @@ function PersonDetail({ p, myEvents, myReminders, myRecs, onLog, onEditLog, onRe
               </a>
             </div>
           )}
+          {p.via && (
+            <p style={{ margin: '0 0 14px', fontSize: 12.5, color: C.faint, display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+              <span>{p.via.by ? `From ${p.via.by}` : 'Shared with you'}{isDay(p.via.on) ? ` · ${prettyDate(p.via.on)}` : ''}</span>
+              <button className="crm-btn" onClick={onClearVia} aria-label="Remove the note about where this came from"
+                style={{ font: 'inherit', fontSize: 12, fontWeight: 600, color: C.muted, background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textDecoration: 'underline' }}>
+                Remove note
+              </button>
+            </p>
+          )}
           {(myEvents || []).length > 0 && (
             <div style={{ marginBottom: 14 }}>
               <p style={{ margin: '0 0 6px', fontSize: 12.5, color: C.faint }}>Moments together</p>
@@ -1279,6 +1289,7 @@ function PersonDetail({ p, myEvents, myReminders, myRecs, onLog, onEditLog, onRe
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: p.log?.length ? 14 : 0 }}>
               <Button kind="solid" onClick={() => setLogging(true)}>Log a catch-up</Button>
               <Button onClick={onEdit}>Edit</Button>
+              <Button onClick={() => setSharing(!sharing)} style={sharing ? { borderColor: C.accent } : undefined}>Share</Button>
               <Button
                 kind="danger"
                 onClick={() => (confirmRemove ? onRemove() : setConfirmRemove(true))}
@@ -1286,6 +1297,12 @@ function PersonDetail({ p, myEvents, myReminders, myRecs, onLog, onEditLog, onRe
               >
                 {confirmRemove ? 'Tap again to remove' : 'Remove'}
               </Button>
+            </div>
+          )}
+
+          {sharing && !logging && (
+            <div style={{ marginTop: p.log?.length ? 0 : 14 }}>
+              <PersonShare p={p} owner={owner} onClose={() => setSharing(false)} />
             </div>
           )}
 
@@ -1345,6 +1362,391 @@ function PersonDetail({ p, myEvents, myReminders, myRecs, onLog, onEditLog, onRe
             </div>
           )}
       </div>
+    </div>
+  );
+}
+
+/* ---------- sharing a copy: sending ---------- */
+// Drawn from the link itself, dark on white whatever the theme, since that
+// is what phone cameras read best. The library is only fetched the first
+// time a code is shown.
+function QrCode({ text, label }) {
+  const [cells, setCells] = useState(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let live = true;
+    import('qrcode-generator').then((m) => {
+      const qr = (m.default || m)(0, 'M');
+      qr.addData(text);
+      qr.make();
+      const n = qr.getModuleCount();
+      let d = '';
+      for (let r = 0; r < n; r += 1) for (let c = 0; c < n; c += 1) if (qr.isDark(r, c)) d += `M${c} ${r}h1v1h-1z`;
+      if (live) setCells({ n, d });
+    }, () => { if (live) setFailed(true); });
+    return () => { live = false; };
+  }, [text]);
+  if (failed) return <p style={{ fontSize: 13, color: C.muted }}>The QR code could not be drawn here. Copy the link instead.</p>;
+  if (!cells) return <p style={{ fontSize: 13, color: C.muted }}>Drawing the code…</p>;
+  const pad = 4;
+  return (
+    <svg role="img" aria-label={label} viewBox={`${-pad} ${-pad} ${cells.n + pad * 2} ${cells.n + pad * 2}`}
+      shapeRendering="crispEdges" style={{ width: 232, maxWidth: '100%', height: 'auto', display: 'block', background: '#FFFFFF', borderRadius: 8 }}>
+      <rect x={-pad} y={-pad} width={cells.n + pad * 2} height={cells.n + pad * 2} fill="#FFFFFF" />
+      <path d={cells.d} fill="#000000" />
+    </svg>
+  );
+}
+
+const fileSlug = (s) => (s || 'contact').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'contact';
+
+function PersonShare({ p, owner, onClose }) {
+  const fields = PERSON_SHARE_FIELDS.filter((f) => f.has(p));
+  const [picks, setPicks] = useState(() => defaultPicks(p));
+  const [by, setBy] = useState(owner || '');
+  const [said, setSaid] = useState('');
+  const [fallback, setFallback] = useState('');
+  const [qr, setQr] = useState(false);
+  const payload = useMemo(() => sharePeoplePayload([sharePerson(p, picks)], { by: by.trim() }), [p, picks, by]);
+  // The code is tied to the payload it was made from. Until the new one is
+  // ready nothing can be sent, so a field just unticked can never go out in
+  // a link made a moment before.
+  const [made, setMade] = useState({ payload: null, code: '' });
+  useEffect(() => {
+    let live = true;
+    encodeShare(payload).then((code) => { if (live) setMade({ payload, code }); }, () => {
+      if (live) setMade({ payload, code: '' });
+    });
+    return () => { live = false; };
+  }, [payload]);
+  const ready = made.payload === payload && Boolean(made.code);
+  const link = ready ? shareLink(made.code) : '';
+  const tooLong = link.length > SHARE_LINK_CAP;
+  const canSheet = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
+  const first = p.name.split(' ')[0];
+  const going = ['Name', ...fields.filter((f) => picks[f.key]).map((f) => (f.labelFor ? f.labelFor(p) : f.label))];
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(link);
+      setSaid('The link is copied. Send it however you like.');
+      setFallback('');
+    } catch {
+      setSaid('Copying was blocked here. Select the link below and copy it yourself.');
+      setFallback(link);
+    }
+  };
+  const sheet = async () => {
+    try {
+      await navigator.share({ title: p.name, text: `${by.trim() || 'Someone'} shared ${p.name}'s contact from Orbit.`, url: link });
+    } catch (e) {
+      if (e?.name !== 'AbortError') copy();
+    }
+  };
+  const save = () => {
+    const ok = downloadCsv(`${fileSlug(p.name)}.orbit`, shareFileText(payload), 'application/json');
+    setSaid(ok ? `Saved ${fileSlug(p.name)}.orbit. They open it from Import in their Orbit.` : 'This browser would not save the file.');
+  };
+
+  const box = (f) => (
+    <Check key={f.key} on={Boolean(picks[f.key])} onChange={(v) => setPicks({ ...picks, [f.key]: v })}
+      label={f.labelFor ? f.labelFor(p) : f.label} hint={f.show(p)} />
+  );
+
+  return (
+    <div className="crm-open" style={{
+      background: C.paper, border: `1px solid ${C.line}`, borderRadius: 12, padding: '14px 14px 12px', margin: '0 0 14px',
+    }}>
+      <p style={{ margin: '0 0 3px', fontSize: 14, fontWeight: 600, color: C.ink }}>Share {first}’s card</p>
+      <p style={{ margin: '0 0 13px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+        They get their own copy to keep and change. Nothing stays linked to yours. Only what you tick goes.
+      </p>
+
+      <p style={{ margin: '0 0 9px', fontSize: 12, fontWeight: 600, color: C.faint, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Card</p>
+      <p style={{ margin: '0 0 11px 26px', fontSize: 14, color: C.ink }}>
+        Name
+        <span style={{ display: 'block', fontSize: 12, color: C.faint, marginTop: 2 }}>{p.name}. Always included.</span>
+      </p>
+      {fields.filter((f) => !f.private).map(box)}
+
+      {fields.some((f) => f.private) && (
+        <>
+          <p style={{ margin: '6px 0 3px', fontSize: 12, fontWeight: 600, color: C.faint, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Private</p>
+          <p style={{ margin: '0 0 9px', fontSize: 12, color: C.faint, lineHeight: 1.5 }}>
+            Only tick these if you are sure. Anyone with the link can read them.
+          </p>
+          {fields.filter((f) => f.private).map(box)}
+        </>
+      )}
+      <p style={{ margin: '4px 0 12px', fontSize: 12, color: C.faint, lineHeight: 1.5 }}>
+        Never shared: how close you are, check-in history, last contact, VIP, and anything else about the two of you.
+      </p>
+
+      <Field label="From">
+        <input style={{ ...inputStyle, minHeight: 38 }} value={by} maxLength={60} onChange={(e) => setBy(e.target.value)}
+          placeholder="Your name, so they know who sent it" />
+      </Field>
+
+      <p style={{ margin: '0 0 10px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+        Sending: {going.join(', ')}.
+      </p>
+
+      {tooLong ? (
+        <p style={{ margin: '0 0 10px', fontSize: 12.5, color: C.soonText, lineHeight: 1.5 }}>
+          This is too long for a link that arrives in one piece. Save it as a file instead.
+        </p>
+      ) : (
+        <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginBottom: 8 }}>
+          {canSheet && <Button kind="solid" onClick={sheet} style={small}>{ready ? 'Share…' : 'Getting it ready…'}</Button>}
+          <Button kind={canSheet ? 'quiet' : 'solid'} onClick={() => ready && copy()} style={small}>Copy link</Button>
+          <Button onClick={() => ready && setQr(!qr)} style={small}>{qr ? 'Hide QR code' : 'QR code'}</Button>
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+        <Button onClick={save} style={small}>Save as file</Button>
+        <Button onClick={onClose} style={small}>Done</Button>
+      </div>
+
+      {qr && ready && !tooLong && (
+        <div style={{ marginTop: 12 }}>
+          {link.length > SHARE_QR_CAP ? (
+            <p style={{ fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+              Too much for a QR code a phone can read. Untick something, or send the link.
+            </p>
+          ) : (
+            <>
+              <QrCode text={link} label={`QR code for ${p.name}'s card`} />
+              <p style={{ margin: '8px 0 0', fontSize: 12, color: C.faint, lineHeight: 1.5 }}>
+                They point their phone’s camera at it and open the link.
+              </p>
+            </>
+          )}
+        </div>
+      )}
+
+      <p aria-live="polite" style={{ margin: said ? '10px 0 0' : 0, fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>{said}</p>
+      {fallback && (
+        <textarea readOnly aria-label="Link to copy" onFocus={(e) => e.target.select()} value={fallback}
+          style={{ ...inputStyle, marginTop: 8, minHeight: 90, fontSize: 12, lineHeight: 1.45, resize: 'vertical' }} />
+      )}
+    </div>
+  );
+}
+
+/* ---------- sharing a copy: receiving ---------- */
+// What arrived, field by field, in the words the picker used to send it.
+const sharedFacts = (inc) => PERSON_SHARE_FIELDS.filter((f) => f.has(inc)).map((f) => ({
+  key: f.key,
+  label: f.labelFor ? f.labelFor(inc) : f.label,
+  value: f.key === 'socials'
+    ? SOCIALS.filter((s) => inc.socials[s.key]).map((s) => `${s.label} ${s.at ? '@' : ''}${inc.socials[s.key]}`).join(', ')
+    : f.show(inc),
+}));
+
+// Where each incoming person goes: merged into someone already here, added
+// as someone new, or left out.
+const planFor = (inc, people) => {
+  const matches = findMatches(inc, people);
+  return matches.length
+    ? { action: 'merge', target: matches[0].p.id, rows: mergePlan(matches[0].p, inc) }
+    : { action: 'add', target: null, rows: [] };
+};
+
+function MergeRows({ rows, onChange }) {
+  if (!rows.length) {
+    return <p style={{ margin: '4px 0 0', fontSize: 13, color: C.muted }}>Nothing new. Your card already has all of this.</p>;
+  }
+  const set = (i, take) => onChange(rows.map((r, j) => (j === i ? { ...r, take } : r)));
+  return (
+    <div style={{ marginTop: 8 }}>
+      {rows.map((r, i) => (r.kind === 'differs' ? (
+        <fieldset key={r.id} style={{ border: 'none', padding: 0, margin: '0 0 11px' }}>
+          <legend style={{ fontSize: 13, fontWeight: 600, color: C.ink, padding: 0, marginBottom: 5 }}>{r.label}</legend>
+          {[[false, 'Keep mine', r.mine], [true, 'Use theirs', r.theirs]].map(([take, word, value]) => (
+            <label key={word} style={{ display: 'flex', gap: 9, alignItems: 'flex-start', marginBottom: 5, cursor: 'pointer' }}>
+              <input type="radio" name={`merge-${r.id}`} checked={r.take === take} onChange={() => set(i, take)}
+                style={{ marginTop: 3, accentColor: C.accentDeep }} />
+              <span style={{ fontSize: 13, color: C.ink, lineHeight: 1.45 }}>
+                <span style={{ color: C.faint }}>{word}: </span>{value}
+              </span>
+            </label>
+          ))}
+        </fieldset>
+      ) : (
+        <Check key={r.id} on={r.take} onChange={(v) => set(i, v)}
+          label={r.kind === 'add' ? `Add to ${r.label.toLowerCase()}: ${r.theirs}` : `Fill in ${r.label.toLowerCase()}: ${r.theirs}`} />
+      )))}
+    </div>
+  );
+}
+
+function ReceiveView({ share, people, onSave, onClose }) {
+  const [circle, setCircle] = useState('friend');
+  const [keepVia, setKeepVia] = useState(true);
+  const [plans, setPlans] = useState(() => (share.people || []).map((inc) => planFor(inc, people)));
+
+  if (share.broken) {
+    return (
+      <div style={{ maxWidth: 560 }}>
+        <h1 style={{ margin: '0 0 8px', fontSize: 24, fontWeight: 600, letterSpacing: '-0.03em' }}>That share could not be read</h1>
+        <p style={{ margin: '0 0 14px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
+          The link may have been cut short on its way here. Ask them to send it again, or to send it as a file.
+        </p>
+        <Button onClick={onClose}>Close</Button>
+      </div>
+    );
+  }
+
+  const by = share.by;
+  const when = share.on ? prettyDate(share.on) : '';
+  const one = share.people.length === 1;
+  const setPlan = (i, next) => setPlans(plans.map((pl, j) => (j === i ? next : pl)));
+  const adding = plans.filter((pl) => pl.action === 'add').length;
+  const merging = plans.filter((pl) => pl.action === 'merge').length;
+
+  const save = () => {
+    const via = keepVia ? { by: by || '', on: todayStr() } : null;
+    let next = [...people];
+    let focus = null;
+    share.people.forEach((inc, i) => {
+      const pl = plans[i];
+      if (pl.action === 'add') {
+        const made = personFromShare(inc, { circle, via });
+        next.push(made);
+        focus = focus || made.id;
+      } else if (pl.action === 'merge') {
+        next = next.map((x) => (x.id === pl.target ? applyMerge(x, inc, pl.rows, via) : x));
+        focus = focus || pl.target;
+      }
+    });
+    onSave(next, focus);
+  };
+
+  return (
+    <div style={{ maxWidth: 620 }}>
+      <p style={{ margin: '0 0 4px', fontSize: 13, color: C.muted }}>
+        {by ? `${by} sent you ${one ? 'a contact' : 'some contacts'}` : `${one ? 'A contact was' : 'Some contacts were'} shared with you`}
+        {when ? ` on ${when}` : ''}
+      </p>
+      <h1 style={{ margin: '0 0 6px', fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>
+        {one ? share.people[0].name : `${share.people.length} people`}
+      </h1>
+      <p style={{ margin: '0 0 18px', fontSize: 12.5, color: C.faint, lineHeight: 1.5 }}>
+        {by ? `“${by}” is the name the sender gave; Orbit cannot check it. ` : ''}
+        Nothing is added until you say so, and whatever you keep is yours to change.
+      </p>
+
+      {share.people.map((inc, i) => {
+        const pl = plans[i];
+        const matches = findMatches(inc, people);
+        const target = people.find((x) => x.id === pl.target);
+        return (
+          <div key={i} style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '14px 15px', marginBottom: 14 }}>
+            {!one && <p style={{ margin: '0 0 6px', fontSize: 16, fontWeight: 600, color: C.ink }}>{inc.name}</p>}
+            <p style={{ margin: '0 0 6px', fontSize: 12, fontWeight: 600, color: C.faint, textTransform: 'uppercase', letterSpacing: '0.06em' }}>In this share</p>
+            <p style={{ margin: '0 0 4px', fontSize: 13, lineHeight: 1.5, color: C.ink }}><span style={{ color: C.faint }}>Name </span>{inc.name}</p>
+            {sharedFacts(inc).map((f) => (
+              <p key={f.key} style={{ margin: '0 0 4px', fontSize: 13, lineHeight: 1.5, color: C.ink, whiteSpace: 'pre-line', overflowWrap: 'anywhere' }}>
+                <span style={{ color: C.faint }}>{f.label} </span>{f.value}
+              </p>
+            ))}
+
+            {matches.length > 0 && (
+              <div style={{ borderTop: `1px solid ${C.line}`, marginTop: 12, paddingTop: 12 }}>
+                <p style={{ margin: '0 0 9px', fontSize: 13.5, color: C.ink, lineHeight: 1.5 }}>
+                  <strong style={{ fontWeight: 600 }}>You may already have them.</strong>{' '}
+                  {matches.map((m) => `${m.p.name} (${m.why.map((w) => REASON_WORDS[w]).join(', ')})`).join('; ')}.
+                </p>
+                <div role="radiogroup" aria-label={`What to do with ${inc.name}`} style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginBottom: 6 }}>
+                  {[['merge', 'Merge'], ['add', 'Add as new'], ['skip', 'Skip']].map(([v, l]) => (
+                    <button key={v} role="radio" aria-checked={pl.action === v} className="crm-btn"
+                      onClick={() => setPlan(i, v === 'merge'
+                        ? { action: 'merge', target: pl.target || matches[0].p.id, rows: mergePlan(people.find((x) => x.id === (pl.target || matches[0].p.id)), inc) }
+                        : { ...pl, action: v })}
+                      style={segment(pl.action === v)}>{l}</button>
+                  ))}
+                </div>
+                {pl.action === 'merge' && matches.length > 1 && (
+                  <select className="crm-select" aria-label="Merge into" value={pl.target}
+                    onChange={(e) => setPlan(i, { ...pl, target: e.target.value, rows: mergePlan(people.find((x) => x.id === e.target.value), inc) })}
+                    style={{ ...inputStyle, minHeight: 36, fontSize: 13, margin: '4px 0 6px' }}>
+                    {matches.map((m) => <option key={m.p.id} value={m.p.id}>{m.p.name}</option>)}
+                  </select>
+                )}
+                {pl.action === 'merge' && target && (
+                  <>
+                    <p style={{ margin: '6px 0 0', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+                      Into {target.name}. Only what you tick changes; everything else on the card stays as it is.
+                    </p>
+                    <MergeRows rows={pl.rows} onChange={(rows) => setPlan(i, { ...pl, rows })} />
+                  </>
+                )}
+                {pl.action === 'skip' && <p style={{ margin: '4px 0 0', fontSize: 13, color: C.muted }}>{inc.name} will be left out.</p>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      {adding > 0 && (
+        <Group label={`Add ${adding === 1 && one ? 'them' : adding === 1 ? 'the new one' : 'the new ones'} to`}>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {CIRCLES.map(([v, l]) => (
+              <button key={v} className="crm-btn" onClick={() => setCircle(v)} style={segment(circle === v)} aria-pressed={circle === v}>{l}</button>
+            ))}
+          </div>
+        </Group>
+      )}
+      {(adding > 0 || merging > 0) && (
+        <Check on={keepVia} onChange={setKeepVia}
+          label={by ? `Note that this came from ${by}` : 'Note that this was shared with me'}
+          hint="A small line on the card. You can take it off any time." />
+      )}
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+        <Button kind="solid" onClick={save}>
+          {adding + merging === 0 ? 'Done' : [adding && `Add ${adding === 1 ? (one ? share.people[0].name.split(' ')[0] : 'one') : adding}`, merging && `Merge ${merging === 1 ? '' : merging}`.trim()].filter(Boolean).join(' and ')}
+        </Button>
+        <Button onClick={onClose}>{adding + merging === 0 ? 'Close' : 'Not now'}</Button>
+      </div>
+    </div>
+  );
+}
+
+// Paste a link, or pick a file someone sent. Both end up at the same preview.
+function OpenShared({ onOpen }) {
+  const [text, setText] = useState('');
+  const [problem, setProblem] = useState('');
+  const picker = useRef(null);
+  const open = async (value) => {
+    setProblem('');
+    const got = await readAnyShare(value);
+    if (!got) { setProblem('That is not something Orbit can open. Paste the whole link, or choose the .orbit file.'); return; }
+    setText('');
+    onOpen(got);
+  };
+  const readFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onerror = () => setProblem('The file could not be read.');
+    reader.onload = () => open(String(reader.result || ''));
+    reader.readAsText(file);
+  };
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '14px 15px', marginBottom: 20 }}>
+      <p style={{ margin: '0 0 3px', fontSize: 14, fontWeight: 600, color: C.ink }}>Open something shared with you</p>
+      <p style={{ margin: '0 0 10px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+        Paste the link, or choose the .orbit file they sent. You see what is in it before anything is added.
+      </p>
+      <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+        <input aria-label="Shared link" value={text} onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (isEnter(e)) open(text); }}
+          placeholder="https://…#share=…" style={{ ...inputStyle, flex: '1 1 220px', minHeight: 38 }} />
+        <Button kind="solid" onClick={() => open(text)} style={small}>Open</Button>
+        <Button onClick={() => picker.current?.click()} style={small}>Choose a file</Button>
+        <input ref={picker} type="file" aria-label="Shared file" onChange={(e) => { readFile(e.target.files[0]); e.target.value = ''; }} style={{ display: 'none' }} />
+      </div>
+      {problem && <p role="alert" style={{ margin: '10px 0 0', fontSize: 13, color: C.overdue, lineHeight: 1.5 }}>{problem}</p>}
     </div>
   );
 }
@@ -1877,6 +2279,328 @@ const readShared = (text) => {
   }
 };
 
+/* ---------- sharing a copy: people ---------- */
+// Sending someone a person sends a copy: a snapshot they own and can change
+// however they like. Nothing stays linked to the sender's card.
+//
+// What goes is decided field by field on the way out, and checked again on
+// the way in. The two lists below are the only way anything gets into a
+// share or out of one: the sender side copies only the fields ticked, never
+// the record, and the receiving side rebuilds a person from the fields it
+// knows, so anything else in a share (a closeness tier, a check-in history,
+// a hand-edited extra) is simply never read.
+//
+// Some things are never offered at all, because they describe the sender's
+// side of the relationship, not the person: closeness, relation ("Mom"),
+// check-in history and last contact, VIP, paused, circle, and dates added.
+
+// Shares are compressed and marked with a leading "z", which a list link
+// (plain JSON in base64, so always starting "eyJ") can never begin with.
+const SHARE_V2 = 'z';
+// Past this, a link risks being cut short by a messaging app, so the share
+// is offered as a file instead.
+const SHARE_LINK_CAP = 8000;
+// Past this, a QR code gets too dense for a phone camera to read reliably.
+const SHARE_QR_CAP = 1200;
+
+const PERSON_SHARE_FIELDS = [
+  { key: 'work', label: 'Role and company', on: true,
+    has: (p) => Boolean(p.role || p.company),
+    show: (p) => [p.role, p.company].filter(Boolean).join(', '),
+    put: (p, o) => { if (p.role) o.ro = p.role; if (p.company) o.co = p.company; } },
+  { key: 'aka', label: 'Also known as', on: true,
+    has: (p) => (p.aka || []).length > 0, show: (p) => p.aka.join(', '),
+    put: (p, o) => { o.a = [...p.aka]; } },
+  { key: 'email', label: 'Email', has: (p) => Boolean(p.email), show: (p) => p.email,
+    put: (p, o) => { o.e = p.email; } },
+  { key: 'phone', label: 'Phone', has: (p) => Boolean(p.phone), show: (p) => p.phone,
+    put: (p, o) => { o.ph = p.phone; } },
+  { key: 'address', label: 'Address', has: (p) => Boolean(p.address), show: (p) => p.address,
+    put: (p, o) => { o.ad = p.address; } },
+  { key: 'birthday', label: 'Birthday', has: (p) => Boolean(p.birthday) || ageOf(p) !== null,
+    labelFor: (p) => (p.birthday ? 'Birthday' : 'Age'),
+    show: (p) => (p.birthday ? prettyBirthday(p.birthday) : String(ageOf(p))),
+    // An age with no birthday goes as the age today, so it keeps counting up
+    // on their side from the day it was sent.
+    put: (p, o) => { if (p.birthday) o.b = p.birthday; else { o.ag = ageOf(p); o.at = todayStr(); } } },
+  { key: 'dates', label: 'Other dates to remember', has: (p) => (p.dates || []).some((d) => d.date),
+    show: (p) => p.dates.filter((d) => d.date).map(dateLabel).join(', '),
+    put: (p, o) => { o.d = p.dates.filter((d) => d.date).map((d) => [d.kind, d.kind === 'Other' ? d.label || '' : '', d.date]); } },
+  { key: 'partner', label: 'Partner', has: (p) => Boolean(p.partner?.name),
+    show: (p) => `${p.partner.name}${p.partner.status ? ` (${p.partner.status})` : ''}`,
+    put: (p, o) => { o.pt = [p.partner.name, p.partner.status || '']; } },
+  { key: 'kids', label: 'Kids', has: (p) => (p.kids || []).length > 0, show: (p) => p.kids.join(', '),
+    put: (p, o) => { o.k = [...p.kids]; } },
+  { key: 'socials', label: 'Socials', has: (p) => SOCIALS.some((s) => p.socials?.[s.key]),
+    show: (p) => SOCIALS.filter((s) => p.socials?.[s.key]).map((s) => s.label).join(', '),
+    put: (p, o) => { o.so = Object.fromEntries(SOCIALS.filter((s) => p.socials?.[s.key]).map((s) => [s.key, p.socials[s.key]])); } },
+  { key: 'hobbies', label: 'Hobbies', has: (p) => Boolean(p.hobbies), show: (p) => p.hobbies,
+    put: (p, o) => { o.h = p.hobbies; } },
+  { key: 'note', label: 'Notes', private: true, has: (p) => Boolean(p.note), show: (p) => p.note,
+    put: (p, o) => { o.no = p.note; } },
+  { key: 'groups', label: '“Knows” tags', private: true, has: (p) => (p.groups || []).length > 0,
+    show: (p) => p.groups.join(', '), put: (p, o) => { o.g = [...p.groups]; } },
+  { key: 'families', label: 'Family names', private: true, has: (p) => (p.families || []).length > 0,
+    show: (p) => p.families.join(', '), put: (p, o) => { o.f = [...p.families]; } },
+  { key: 'cadence', label: 'Check-in cadence', private: true,
+    has: (p) => !p.child && CADENCES.some((c) => c.days === Number(p.cadence)),
+    show: (p) => CADENCES.find((c) => c.days === Number(p.cadence)).label,
+    put: (p, o) => { o.c = Number(p.cadence); } },
+];
+
+// The fields ticked when the picker opens: only what identifies someone.
+const defaultPicks = (p) => Object.fromEntries(
+  PERSON_SHARE_FIELDS.filter((f) => f.has(p)).map((f) => [f.key, Boolean(f.on)]));
+
+// One person as it goes into a share: the name, and each ticked field the
+// person actually has. Built up from nothing, never copied from the record.
+const sharePerson = (p, picks) => {
+  const o = { n: p.name };
+  PERSON_SHARE_FIELDS.forEach((f) => { if (picks[f.key] && f.has(p)) f.put(p, o); });
+  return o;
+};
+
+const sharePeoplePayload = (list, { by, on = todayStr() } = {}) => ({
+  v: 2, t: 'people', ...(by ? { by: clip(by, 60) } : {}), on, p: list,
+});
+
+const bytesToCode = (bytes) => {
+  const parts = [];
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+  }
+  return btoa(parts.join('')).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+};
+const codeToBytes = (code) => Uint8Array.from(atob(code.replace(/-/g, '+').replace(/_/g, '/')), (ch) => ch.charCodeAt(0));
+
+// Built-in compression, so no library travels with the app for it.
+const squeeze = async (bytes, how) => new Uint8Array(await new Response(
+  new Blob([bytes]).stream().pipeThrough(how === 'in' ? new CompressionStream('deflate-raw') : new DecompressionStream('deflate-raw')),
+).arrayBuffer());
+
+const encodeShare = async (payload) =>
+  SHARE_V2 + bytesToCode(await squeeze(new TextEncoder().encode(JSON.stringify(payload)), 'in'));
+
+const shareLink = (code) => `${window.location.origin}${window.location.pathname}#${SHARE_PREFIX}${code}`;
+
+// The file holds the same share as plain JSON, readable by anyone who opens
+// it, and marked so it is never mistaken for a backup.
+const shareFileText = (payload) => JSON.stringify({ orbit: 'share', ...payload }, null, 2);
+
+// One incoming person, rebuilt from the fields a share may carry, each one
+// checked and trimmed. Returns only the fields present, under the names the
+// app uses, or null when there is no name.
+const listOf = (v, n, cap) => (Array.isArray(v) ? v : [])
+  .map((x) => clip(x, n)).filter(Boolean).slice(0, cap);
+
+const cleanSharedPerson = (raw) => {
+  if (!isPlainObject(raw)) return null;
+  const name = clip(raw.n, 120);
+  if (!name) return null;
+  const out = { name };
+  const text = (k, field, n) => { const v = clip(raw[k], n); if (v) out[field] = v; };
+  text('ro', 'role', 120);
+  text('co', 'company', 120);
+  text('e', 'email', 200);
+  text('ph', 'phone', 40);
+  text('ad', 'address', 300);
+  text('h', 'hobbies', 500);
+  text('no', 'note', NOTE_CAP);
+  const lists = [['a', 'aka', 60, 10], ['k', 'kids', 60, 20], ['g', 'groups', 60, 20], ['f', 'families', 60, 20]];
+  lists.forEach(([k, field, n, cap]) => { const v = listOf(raw[k], n, cap); if (v.length) out[field] = v; });
+  if (isDay(raw.b)) out.birthday = raw.b;
+  else if (Number.isInteger(raw.ag) && raw.ag >= 0 && raw.ag <= 130) {
+    out.age = raw.ag;
+    out.ageAsOf = isDay(raw.at) ? raw.at : todayStr();
+  }
+  if (Array.isArray(raw.d)) {
+    const dates = raw.d.filter(Array.isArray).filter((d) => isDay(d[2])).slice(0, 20).map((d) => {
+      const kind = DATE_KINDS.includes(d[0]) ? d[0] : 'Other';
+      return { kind, label: kind === 'Other' ? clip(d[1] || d[0], 60) : '', date: d[2] };
+    });
+    if (dates.length) out.dates = dates;
+  }
+  if (Array.isArray(raw.pt) && clip(raw.pt[0], 120)) {
+    out.partner = { name: clip(raw.pt[0], 120), status: PARTNER_STATUSES.includes(raw.pt[1]) ? raw.pt[1] : '' };
+  }
+  if (isPlainObject(raw.so)) {
+    const so = {};
+    SOCIALS.forEach((s) => { const v = handle(clip(raw.so[s.key], 200)); if (v) so[s.key] = v; });
+    if (Object.keys(so).length) out.socials = so;
+  }
+  if (CADENCES.some((c) => c.days === raw.c)) out.cadence = raw.c;
+  return out;
+};
+
+const PEOPLE_SHARE_CAP = 500;
+const readPeopleShare = (o) => {
+  if (!isPlainObject(o) || o.v !== 2 || o.t !== 'people' || !Array.isArray(o.p)) return null;
+  const people = o.p.slice(0, PEOPLE_SHARE_CAP).map(cleanSharedPerson).filter(Boolean);
+  if (!people.length) return null;
+  return { type: 'people', by: clip(o.by, 60), on: isDay(o.on) ? o.on : null, people };
+};
+
+// Anything that might be a share: a link, the code on its own, or the text of
+// a share file. Old list links still open as lists.
+const readAnyShare = async (text) => {
+  const s = String(text || '').trim();
+  if (!s) return null;
+  if (s.startsWith('{')) {
+    try {
+      const o = JSON.parse(s);
+      return o?.orbit === 'share' ? readPeopleShare(o) : null;
+    } catch {
+      return null;
+    }
+  }
+  const m = s.match(/(?:^|[#&?])share=([A-Za-z0-9_-]+)/) || s.match(/^([A-Za-z0-9_-]{16,})$/);
+  if (!m) return null;
+  if (!m[1].startsWith(SHARE_V2)) {
+    const list = readShared(s);
+    return list ? { type: 'list', ...list } : null;
+  }
+  try {
+    return readPeopleShare(JSON.parse(new TextDecoder().decode(await squeeze(codeToBytes(m[1].slice(1)), 'out'))));
+  } catch {
+    return null;
+  }
+};
+
+/* ---------- sharing a copy: is this someone I already have? ---------- */
+// Names are compared without case, accents, punctuation or spacing, so
+// "José  O'Neil" is "jose oneil". "Also known as" counts on both sides.
+const personKey = (s) => String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '')
+  .toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+// The last ten digits, so +1 (816) 555-0142 and 816.555.0142 are the same
+// number. Anything under seven digits is too short to trust.
+const phoneKey = (s) => {
+  const d = String(s || '').replace(/\D/g, '');
+  return d.length < 7 ? '' : d.slice(-10);
+};
+const emailKey = (s) => {
+  const e = String(s || '').trim().toLowerCase();
+  return e.includes('@') ? e : '';
+};
+
+const namesOf = (p) => [p.name, ...(p.aka || [])].map(personKey).filter(Boolean);
+
+// Why an incoming person looks like one already here, strongest first.
+const matchReasons = (inc, p) => {
+  const why = [];
+  const ph = phoneKey(inc.phone);
+  if (ph && ph === phoneKey(p.phone)) why.push('phone');
+  const em = emailKey(inc.email);
+  if (em && em === emailKey(p.email)) why.push('email');
+  const mine = namesOf(p);
+  const theirs = namesOf(inc);
+  if (personKey(inc.name) === personKey(p.name)) why.push('name');
+  else if (theirs.some((n) => mine.includes(n))) why.push('aka');
+  return why;
+};
+
+const findMatches = (inc, people) => people
+  .map((p) => ({ p, why: matchReasons(inc, p) }))
+  .filter((m) => m.why.length)
+  .sort((a, b) => b.why.length - a.why.length);
+
+const REASON_WORDS = { phone: 'same phone', email: 'same email', name: 'same name', aka: 'a name they also go by' };
+
+/* ---------- sharing a copy: merging into someone I have ---------- */
+// A merge never changes anything without it being shown. Each field that
+// would change is a row: a blank filled from theirs, an addition to a list,
+// or a real difference. Blanks and additions start ticked, since they lose
+// nothing; a difference starts on keeping mine.
+const MERGE_TEXT = [
+  ['name', 'Name'], ['role', 'Role'], ['company', 'Company'], ['email', 'Email'], ['phone', 'Phone'],
+  ['address', 'Address'], ['birthday', 'Birthday'], ['hobbies', 'Hobbies'], ['note', 'Notes'],
+];
+const MERGE_LISTS = [['aka', 'Also known as'], ['kids', 'Kids'], ['groups', '“Knows” tags'], ['families', 'Family names']];
+
+const sameText = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+// Phones and emails are the same when matching says they are, so a number
+// written another way is never offered as a change.
+const sameField = (k, a, b) => {
+  if (k === 'phone' && phoneKey(a)) return phoneKey(a) === phoneKey(b);
+  if (k === 'email' && emailKey(a)) return emailKey(a) === emailKey(b);
+  return sameText(a, b);
+};
+const showDay = (s) => (isDay(s) ? prettyDate(s) : s);
+
+const mergePlan = (mine, inc) => {
+  const rows = [];
+  MERGE_TEXT.forEach(([k, label]) => {
+    const theirs = inc[k];
+    if (!theirs || sameField(k, theirs, mine[k])) return;
+    // A name that differs is kept as one they go by, below, not offered as
+    // a replacement for the name you know them by.
+    if (k === 'name') return;
+    const shown = k === 'birthday' ? showDay : (x) => x;
+    rows.push({ id: k, label, kind: mine[k] ? 'differs' : 'fill', mine: mine[k] ? shown(mine[k]) : '', theirs: shown(theirs) });
+  });
+  if (inc.age != null && !mine.birthday && ageOf(mine) === null && !inc.birthday) {
+    rows.push({ id: 'age', label: 'Age', kind: 'fill', mine: '', theirs: String(ageOf(inc)) });
+  }
+  if (inc.partner?.name && !(sameText(inc.partner.name, mine.partner?.name) && (inc.partner.status || '') === (mine.partner?.status || ''))) {
+    const say = (pt) => (pt?.name ? `${pt.name}${pt.status ? ` (${pt.status})` : ''}` : '');
+    rows.push({ id: 'partner', label: 'Partner', kind: mine.partner?.name ? 'differs' : 'fill', mine: say(mine.partner), theirs: say(inc.partner) });
+  }
+  const candidates = { ...inc, aka: [...(inc.aka || []), ...(sameText(inc.name, mine.name) ? [] : [inc.name])] };
+  MERGE_LISTS.forEach(([k, label]) => {
+    const have = new Set([...(mine[k] || []), ...(k === 'aka' ? [mine.name] : [])].map(personKey));
+    const add = [...new Set((candidates[k] || []).filter((x) => !have.has(personKey(x))))];
+    if (add.length) rows.push({ id: k, label, kind: 'add', mine: (mine[k] || []).join(', '), theirs: add.join(', '), add });
+  });
+  const dayKey = (d) => `${d.kind}|${personKey(d.label)}|${d.date}`;
+  const haveDates = new Set((mine.dates || []).map(dayKey));
+  const newDates = (inc.dates || []).filter((d) => !haveDates.has(dayKey(d)));
+  if (newDates.length) {
+    rows.push({ id: 'dates', label: 'Dates to remember', kind: 'add', mine: '', theirs: newDates.map((d) => `${dateLabel(d)} ${showDay(d.date)}`).join(', '), add: newDates });
+  }
+  SOCIALS.forEach((s) => {
+    const theirs = inc.socials?.[s.key];
+    const have = mine.socials?.[s.key];
+    if (!theirs || sameText(theirs, have)) return;
+    rows.push({ id: `social:${s.key}`, label: s.label, kind: have ? 'differs' : 'fill', mine: have || '', theirs });
+  });
+  if (inc.cadence != null && !mine.child && Number(inc.cadence) !== Number(mine.cadence)) {
+    const say = (d) => CADENCES.find((c) => c.days === Number(d))?.label || '';
+    rows.push({ id: 'cadence', label: 'Check-in cadence', kind: 'differs', mine: say(mine.cadence), theirs: say(inc.cadence) });
+  }
+  return rows.map((r) => ({ ...r, take: r.kind !== 'differs' }));
+};
+
+// Applies the rows ticked. Anything a share cannot carry (history, closeness,
+// VIP, circle, and so on) is left exactly as it was.
+const applyMerge = (mine, inc, rows, via) => {
+  const out = { ...mine, socials: { ...(mine.socials || {}) } };
+  rows.filter((r) => r.take).forEach((r) => {
+    if (r.id.startsWith('social:')) { out.socials[r.id.slice(7)] = inc.socials[r.id.slice(7)]; return; }
+    if (r.id === 'age') { out.age = inc.age; out.ageAsOf = inc.ageAsOf; return; }
+    if (r.id === 'birthday') { out.birthday = inc.birthday; out.age = null; out.ageAsOf = null; return; }
+    if (r.id === 'dates') { out.dates = [...(mine.dates || []), ...r.add]; return; }
+    if (r.add) { out[r.id] = [...(mine[r.id] || []), ...r.add]; return; }
+    out[r.id] = inc[r.id];
+  });
+  if (via) out.via = via;
+  return out;
+};
+
+// A new card from a share, with this app's usual starting values for
+// everything the share did not bring.
+const personFromShare = (inc, { circle = 'friend', via = null } = {}) => ({
+  id: uid(),
+  addedOn: todayStr(),
+  circle,
+  tier: circle === 'friend' ? 'friend' : null,
+  role: '', company: '', hobbies: '', aka: [], email: '', kids: [], paused: false, child: false,
+  families: [], relation: '', groups: [], partner: null, cadence: 90,
+  birthday: null, age: null, ageAsOf: null, dates: [], phone: '', address: '', socials: {},
+  note: '', lastContact: null, log: [],
+  ...inc,
+  ...(circle === 'work' ? { tier: null } : {}),
+  ...(via ? { via } : {}),
+});
+
 /* ---------- repairing saved data ---------- */
 // Saved data and backups are only as well-formed as whatever wrote them: an
 // older version, a hand edit, another tool. One field of the wrong type (a
@@ -1949,6 +2673,7 @@ const PERSON_FIXES = [
   ['dates', fixEntries([['kind', fixText], ['label', fixText], ['date', fixText]])],
   ['socials', fixObject((s) => fixFields(s, Object.keys(s).map((k) => [k, fixText])), () => ({}))],
   ['partner', fixObject((pt) => fixFields(pt, [['name', fixText], ['status', fixText]]), () => null)],
+  ['via', fixObject((v) => fixFields(v, [['by', fixText], ['on', fixText]]), () => null)],
 ];
 
 const EVENT_FIXES = [
@@ -4939,7 +5664,7 @@ function ExportView({ people, events, reminders, collections, onClose }) {
   );
 }
 
-function ImportView({ people, events, reminders, collections, onPeople, onEvents, onReminders, onCollections, onClose }) {
+function ImportView({ people, events, reminders, collections, onPeople, onEvents, onReminders, onCollections, onShared, onClose }) {
   const [over, setOver] = useState(false);
   const [found, setFound] = useState(null);
   const [problem, setProblem] = useState('');
@@ -4950,6 +5675,12 @@ function ImportView({ people, events, reminders, collections, onPeople, onEvents
     setProblem('');
     setFound(null);
     if (!file) return;
+    // A share file dropped here opens the same as from the box above.
+    if (/\.orbit$/i.test(file.name)) {
+      file.text().then(readAnyShare).then((got) => (got ? onShared(got) : setProblem('That .orbit file could not be read.')),
+        () => setProblem('The file could not be read.'));
+      return;
+    }
     if (!/\.csv$/i.test(file.name) && file.type && !/csv|text/i.test(file.type)) {
       setProblem('That does not look like a CSV. Export one from a spreadsheet first.');
       return;
@@ -5050,6 +5781,8 @@ function ImportView({ people, events, reminders, collections, onPeople, onEvents
         plain sheet of names and emails works fine.
       </p>
 
+      <OpenShared onOpen={onShared} />
+
       <div
         onDragOver={(e) => { e.preventDefault(); setOver(true); }}
         onDragLeave={() => setOver(false)}
@@ -5069,6 +5802,7 @@ function ImportView({ people, events, reminders, collections, onPeople, onEvents
         <input
           ref={picker}
           type="file"
+          aria-label="CSV file"
           accept=".csv,text/csv"
           onChange={(e) => read(e.target.files[0])}
           style={{ display: 'none' }}
@@ -5146,6 +5880,8 @@ export default function PersonalCRM({ account = null } = {}) {
   const [collectionOpen, setCollectionOpen] = useState(null);
   const [collectionDraft, setCollectionDraft] = useState(null);
   const [incoming, setIncoming] = useState(null);
+  // People someone shared, waiting to be looked at on the Receive screen.
+  const [received, setReceived] = useState(null);
   const listsLook = useRef({ q: '', kind: 'All', order: 'recent' });
   // Saved lists that could not be read as they were: their original text,
   // shown in a warning with a way to download it.
@@ -5219,10 +5955,18 @@ export default function PersonalCRM({ account = null } = {}) {
   // open yet. A link pasted into the address bar later only raises a notice
   // (see sharedWaiting), so a half-filled form is never thrown away for it.
   useEffect(() => {
-    const look = (arriving) => {
-      if (!window.location.hash.startsWith(`#${SHARE_PREFIX}`)) return;
-      const got = readShared(window.location.hash);
+    const look = async (arriving) => {
+      const hash = window.location.hash;
+      if (!hash.startsWith(`#${SHARE_PREFIX}`)) return;
       window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      const got = await readAnyShare(hash);
+      // A link that will not read is reported where its kind would have
+      // gone: newer shares on the Receive screen, lists with the lists.
+      if (got?.type === 'people' || (!got && hash.startsWith(`#${SHARE_PREFIX}${SHARE_V2}`))) {
+        setReceived(got || { broken: true });
+        if (arriving) setView('receive');
+        return;
+      }
       setIncoming(got || { broken: true });
       if (arriving) setView('collections');
     };
@@ -5260,6 +6004,35 @@ export default function PersonalCRM({ account = null } = {}) {
     setAdding(false);
     setEditing(null);
     setOpenId(person.id);
+  };
+
+  // Something shared, opened from Import: people go to the Receive screen,
+  // a list to the lists, the same as arriving by link.
+  const openShare = (got) => {
+    if (got.type === 'list') { setIncoming(got); setView('collections'); setCollectionOpen(null); setCollectionDraft(null); return; }
+    setReceived(got);
+    setView('receive');
+  };
+
+  const saveReceived = async (next, focus) => {
+    await persist(next);
+    setReceived(null);
+    setView('list');
+    const shown = next.find((x) => x.id === focus);
+    if (shown) {
+      setCircleTab((c) => (c === 'all' || c === 'vip' ? c : shown.circle));
+      setTagFilter(null);
+      setQ('');
+      setOpenId(shown.id);
+    }
+  };
+
+  const clearVia = (id) => {
+    persist(people.map((x) => {
+      if (x.id !== id) return x;
+      const { via: _via, ...rest } = x;
+      return rest;
+    }));
   };
 
   const toggleVip = (id) => {
@@ -5798,6 +6571,17 @@ export default function PersonalCRM({ account = null } = {}) {
             </div>
           );
         })()}
+        {received && view !== 'receive' && (
+          <p role="status" style={{ margin: '12px 0 0', fontSize: 13, color: C.ink, display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
+            {received.broken
+              ? 'Something shared with you arrived but could not be read.'
+              : `${received.by || 'Someone'} shared ${received.people.length === 1 ? `a contact with you: ${received.people[0].name}` : `${received.people.length} contacts with you`}.`}
+            <button className="crm-btn" onClick={() => setView('receive')}
+              style={{ font: 'inherit', fontSize: 13, fontWeight: 600, color: C.ink, background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textDecoration: 'underline' }}>
+              See it
+            </button>
+          </p>
+        )}
         {sharedWaiting && (
           <p role="status" style={{ margin: '12px 0 0', fontSize: 13, color: C.ink, display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
             {incoming.broken
@@ -5902,6 +6686,18 @@ export default function PersonalCRM({ account = null } = {}) {
           </div>
         )}
 
+        {view === 'receive' && received && !loading && (
+          <div className="crm-full">
+            <ReceiveView
+              key={received.on + (received.by || '') + (received.people?.length || 0)}
+              share={received}
+              people={people}
+              onSave={saveReceived}
+              onClose={() => { setReceived(null); setView('list'); }}
+            />
+          </div>
+        )}
+
         {view === 'import' && (
           <div className="crm-full">
             <ImportView
@@ -5913,6 +6709,7 @@ export default function PersonalCRM({ account = null } = {}) {
               onEvents={persistEvents}
               onReminders={persistReminders}
               onCollections={persistCollections}
+              onShared={openShare}
               onClose={() => setView('list')}
             />
           </div>
@@ -6139,6 +6936,8 @@ export default function PersonalCRM({ account = null } = {}) {
               onEdit={() => setEditing(selectedPerson.id)}
               onRemove={() => remove(selectedPerson.id)}
               onTag={(kind, value) => { setTagFilter({ kind, value }); setQ(''); setOpenId(null); }}
+              owner={owner}
+              onClearVia={() => clearVia(selectedPerson.id)}
               onClose={() => setOpenId(null)}
             />
           )}

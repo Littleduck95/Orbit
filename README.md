@@ -132,6 +132,38 @@ their own copy can paste the link, or just the code at the end of it, under
 kept: only `http` and `https` links survive, and text is trimmed to sensible
 lengths.
 
+## Sharing people
+
+Anyone in Orbit can be sent to another Orbit user as a **copy**: the recipient
+gets their own card to keep and change, and nothing stays linked to the
+sender's. **Share** on a person's card opens a field picker:
+
+| Starts | Fields |
+| --- | --- |
+| Always sent | Name |
+| Ticked | Role and company, Also known as |
+| Unticked | Email, phone, address, birthday or age, other dates, partner, kids, socials, hobbies |
+| Unticked, marked private | Notes, "Knows" tags, family names, check-in cadence |
+| Never offered | Closeness, relation, check-in history, last contact, VIP, paused, circle |
+
+The share goes as a link (compressed into the part after `#`, which is never
+sent to the server), a `.orbit` file (the same content as readable JSON), or a
+QR code of the link for passing a card across a table. A link too long to
+arrive in one piece is only offered as a file.
+
+Opening a link, or pasting one or choosing a file under **Import**, shows
+exactly what arrived and who says they sent it, before anything is saved. If
+the person looks like someone already here (same name, a name either side
+also goes by, the same phone however it is written, or the same email), the
+choice is **Merge**, **Add as new**, or **Skip**. A merge lists every field
+that would change: blanks and additions start ticked, and anything that
+differs starts on keeping yours. New people go into the circle you pick. Each
+card can carry a small "From Brock · date" note, which can be taken off.
+
+Both ends go through one whitelist of fields, so a share can never carry more
+than the picker offered, and a hand-edited one cannot slip anything else in.
+Lists shared with the older links still open as before.
+
 ## Accounts
 
 Orbit asks people to sign in, by a link sent to their email or with Google,

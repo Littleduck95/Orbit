@@ -83,7 +83,7 @@ export default async function data({ newPage, check, shots }) {
     fs.writeFileSync(p, text);
     await page.getByRole('button', { name: 'More', exact: true }).click();
     await page.getByRole('button', { name: 'Import', exact: true }).click();
-    await page.locator('input[type=file]').setInputFiles(p);
+    await page.getByLabel('CSV file').setInputFiles(p);
     await page.waitForSelector('text=ready');
     return (await page.locator('.crm-full').innerText()).replace(/\s+/g, ' ');
   };
