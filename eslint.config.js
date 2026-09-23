@@ -30,7 +30,7 @@ export default [
   },
   {
     // Browser tests and the profiler run in Node, but pass code into the page.
-    files: ['tests/browser/**/*.{js,mjs}', 'tests/perf/**/*.{js,mjs}'],
+    files: ['tests/browser/**/*.{js,mjs}', 'tests/account/**/*.{js,mjs}', 'tests/perf/**/*.{js,mjs}'],
     languageOptions: { globals: { ...globals.node, ...globals.browser } },
   },
 ];

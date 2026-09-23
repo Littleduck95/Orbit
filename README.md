@@ -26,6 +26,7 @@ Then open http://localhost:5173.
 | `npm run lint` | ESLint over the project |
 | `npm test` | Logic, storage and account tests (Node's built-in runner, no extra installs) |
 | `npm run test:browser` | Drives the real app in Chromium; needs Playwright installed |
+| `npm run test:account` | Drives sign-in in Chromium against a stand-in for Supabase; needs Playwright |
 
 The tests are characterization tests: they pin down what the app does today,
 with the clock, timezone and locale fixed so dates are repeatable. Checks whose
@@ -49,7 +50,7 @@ supabase/schema.sql   the table and its access rules, run once in Supabase
 .env                  which Supabase project to use (public values)
 src/Recovery.jsx      shown instead of a blank page if drawing ever fails
 src/PersonalCRM.jsx   the app
-tests/                characterization tests (logic, storage, browser)
+tests/                characterization tests (logic, storage, account, browser)
 vite.config.js        build config
 eslint.config.js      lint config
 ```
@@ -140,7 +141,9 @@ so it is the same on every device they sign in on. The project is set in
 do what the row-level security in `supabase/schema.sql` allows, which is each
 signed-in person reading and writing their own rows. Leave either value empty
 and Orbit runs as it did before, saving only in the browser with no sign-in.
-The browser tests do exactly that.
+The browser tests do exactly that. `npm run test:account` covers signing in
+itself, against a stand-in that answers like Supabase, so it never touches the
+real project.
 
 Each of the app's keys (below) is one row in the `orbit_data` table, holding
 the same text the app always stored. The whole account is read once when it
