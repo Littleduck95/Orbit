@@ -100,6 +100,31 @@ describe('dates', () => {
     assert.deepEqual(A.eventWhen({ date: '2026-06-03', endDate: '2026-06-10' }), { text: 'Jun 3–10, 2026', days: 8 });
     assert.deepEqual(A.eventWhen({ date: '2026-06-28', endDate: '2026-07-02' }), { text: 'Jun 28 – Jul 2, 2026', days: 5 });
     assert.deepEqual(A.eventWhen({ date: '2026-12-30', endDate: '2027-01-02' }), { text: 'Dec 30, 2026 – Jan 2, 2027', days: 4 });
+  });
+
+  it('formats days exactly as toLocaleDateString would, in any timezone, even one changed mid-visit', () => {
+    const days = ['0100-00-01', '0050-06-15', '0001-01-01', '2026-02-30', '2026-13-01', '2011-12-30', '2026-03-08', '2026-11-01',
+      '9999-12-31', '1899-12-31', 'March 3', ''];
+    for (let t = Date.UTC(1995, 0, 1); t < Date.UTC(2035, 0, 1); t += 13 * 86400000) days.push(new Date(t).toISOString().slice(0, 10));
+    const compare = (zone) => days.forEach((s) => {
+      const d = A.parseDate(s);
+      assert.equal(A.prettyDate(s), d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }), `${zone} ${s}`);
+      assert.equal(A.prettyBirthday(s), d.toLocaleDateString(undefined, { month: 'long', day: 'numeric' }), `${zone} ${s}`);
+    });
+    const tz = process.env.TZ;
+    const offsets = new Set();
+    try {
+      // The formatters are already built (above, in Chicago); switching the
+      // timezone afterwards must not shift any day.
+      for (const zone of ['America/Chicago', 'Pacific/Kiritimati', 'Pacific/Pago_Pago', 'Asia/Kolkata']) {
+        process.env.TZ = zone;
+        offsets.add(new Date(2026, 0, 1, 12).getTimezoneOffset());
+        compare(zone);
+      }
+    } finally {
+      process.env.TZ = tz;
+    }
+    assert.equal(offsets.size, 4, 'the timezone really changed each time');
     assert.equal(A.eventYear({ date: '2026-06-03' }), 2026);
   });
 });

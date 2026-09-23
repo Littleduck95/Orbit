@@ -48,7 +48,7 @@ export default async function data({ newPage, check, shots }) {
     && (await stored('crm-people-v1')).length === 1);
   await page.getByRole('button', { name: 'Cancel restore' }).click();
 
-  await restore(JSON.stringify([{ name: 'Old Format' }, { name: '' }, { nope: 1 }]));
+  await restore(JSON.stringify([{ name: 'Old Format' }, { name: '' }, { nope: 1 }, { name: 42 }]));
   check('an old backup (a bare list of people) restores, keeping only named people',
     JSON.stringify((await stored('crm-people-v1')).map((p) => p.name)) === '["Old Format"]');
   check('CURRENT: restoring an old backup empties events, reminders and lists',

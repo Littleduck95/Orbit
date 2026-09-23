@@ -57,6 +57,33 @@ export default async function failures({ newPage, check }) {
     await done();
   }
 
+  // ---- fixed (H2): a list that loads, but not exactly as saved ----
+  {
+    // A person with one field of the wrong shape: repaired, not dropped.
+    const people = [
+      { id: 'a', name: 'Ann Able', circle: 'friend', tier: 'friend', cadence: 30, log: 'oops' },
+      { id: 'b', name: 'Bo Best', circle: 'friend', tier: 'friend', cadence: 30, log: [] },
+    ];
+    // An entry that is not an event at all: dropped.
+    const events = [{ id: 'e', title: 'Kept', date: '2026-01-01', people: [] }, 3];
+    const { page, open, done } = await newPage({ seed: {
+      'crm-people-v1': people, 'crm-events-v1': events, 'crm-people-v1-set-aside': ['an older copy'],
+    } });
+    await open();
+    await page.getByRole('button', { name: /^Everyone/ }).click();
+    const banner = page.getByRole('status').filter({ hasText: 'could not be read exactly as saved' });
+    check('a repaired record counts as not read exactly, with a warning, and everyone still shows',
+      (await banner.innerText()).includes('Some saved people, events could not be read')
+        && await page.locator('.crm-person', { hasText: 'Ann Able' }).count() === 1
+        && await page.locator('.crm-person', { hasText: 'Bo Best' }).count() === 1);
+    const [peopleAside, eventsAside] = await page.evaluate(() => ['people', 'events']
+      .map((k) => JSON.parse(localStorage.getItem(`orbit:crm-${k}-v1-set-aside`))));
+    check('an earlier set-aside copy is kept, and the new original is added after it',
+      JSON.stringify(peopleAside) === JSON.stringify(['an older copy', JSON.stringify(people)]), peopleAside);
+    check('a dropped entry sets its list aside too', JSON.stringify(eventsAside) === JSON.stringify([JSON.stringify(events)]), eventsAside);
+    await done();
+  }
+
   // ---- fixed (H2): with no room to keep the original, that list is not saved over ----
   {
     const RAW = '[{"name": "cut';
