@@ -29,8 +29,8 @@ export default [
     languageOptions: { globals: { ...globals.node } },
   },
   {
-    // Browser tests run in Node, but pass functions into the page to run there.
-    files: ['tests/browser/**/*.{js,mjs}'],
+    // Browser tests and the profiler run in Node, but pass code into the page.
+    files: ['tests/browser/**/*.{js,mjs}', 'tests/perf/**/*.{js,mjs}'],
     languageOptions: { globals: { ...globals.node, ...globals.browser } },
   },
 ];
