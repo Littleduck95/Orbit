@@ -58,7 +58,7 @@ export default async function review({ newPage, check, shots }) {
     await done();
   }
 
-  // ---- a log edit lands on whichever entry now sits in that position ----
+  // ---- fixed (M1): an open catch-up edit follows its entry when the history changes ----
   {
     const log = [{ date: '2026-09-10', text: 'Lunch' }, { date: '2026-08-01', text: 'Hike' }];
     const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [person('d', 'Dev Dunn', { log, lastContact: '2026-09-10' })] } });
@@ -67,10 +67,17 @@ export default async function review({ newPage, check, shots }) {
     await page.getByRole('button', { name: /Hike/ }).click();
     await page.getByPlaceholder('What came up?').fill('Hike, edited');
     await page.getByRole('button', { name: 'Log a catch-up with Dev Dunn today' }).click();
+    check('the open edit keeps what was typed while the history shifts',
+      (await page.getByPlaceholder('What came up?').inputValue()) === 'Hike, edited');
     await page.getByRole('button', { name: 'Save', exact: true }).click();
-    const texts = (await stored('crm-people-v1'))[0].log.map((e) => e.text);
-    check('CURRENT: logging a catch-up while an entry is open makes Save overwrite a different entry',
-      texts.includes('Hike') && texts.includes('Hike, edited') && !texts.includes('Lunch'), texts);
+    let texts = (await stored('crm-people-v1'))[0].log.map((e) => e.text);
+    check('Save changes the entry that was opened, and no other', JSON.stringify(texts) === JSON.stringify(['', 'Lunch', 'Hike, edited']), texts);
+
+    await page.getByRole('button', { name: /Lunch/ }).click();
+    await page.getByRole('button', { name: 'Log a catch-up with Dev Dunn today' }).click();
+    await page.getByRole('button', { name: 'Delete', exact: true }).click();
+    texts = (await stored('crm-people-v1'))[0].log.map((e) => e.text);
+    check('Delete removes the entry that was opened, and no other', JSON.stringify(texts) === JSON.stringify(['', '', 'Hike, edited']), texts);
     await done();
   }
 

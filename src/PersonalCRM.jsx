@@ -990,7 +990,11 @@ function PersonDetail({ p, myEvents, myReminders, myRecs, onLog, onEditLog, onRe
   const [logDate, setLogDate] = useState(todayStr());
   const [logText, setLogText] = useState('');
   const [confirmRemove, setConfirmRemove] = useState(false);
-  const [editLog, setEditLog] = useState(null);
+  // The entry being edited, held as the entry itself rather than its place
+  // in the list. Logging another catch-up while this is open moves every
+  // entry down one; following the entry keeps Save and Delete on the one
+  // that was opened. If it is gone, the editor simply closes.
+  const [editEntry, setEditEntry] = useState(null);
   const [draft, setDraft] = useState({ date: '', text: '' });
   const [allLog, setAllLog] = useState(false);
 
@@ -1259,7 +1263,7 @@ function PersonDetail({ p, myEvents, myReminders, myRecs, onLog, onEditLog, onRe
           {p.log?.length > 0 && (
             <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
               {(allLog ? p.log : p.log.slice(0, 4)).map((e, i) => (
-                editLog === i ? (
+                e === editEntry ? (
                   <div key={i} style={{ marginBottom: 10 }}>
                     <input type="date" max={todayStr()} value={draft.date}
                       onChange={(ev) => setDraft({ ...draft, date: ev.target.value })}
@@ -1270,18 +1274,18 @@ function PersonDetail({ p, myEvents, myReminders, myRecs, onLog, onEditLog, onRe
                       style={{ ...inputStyle, marginBottom: 7, minHeight: 38, fontSize: 14 }} />
                     <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
                       <Button kind="solid" style={{ fontSize: 12.5, padding: '6px 11px' }}
-                        onClick={() => { onEditLog(p.id, i, draft); setEditLog(null); }}>Save</Button>
+                        onClick={() => { onEditLog(p.id, i, draft); setEditEntry(null); }}>Save</Button>
                       <Button style={{ fontSize: 12.5, padding: '6px 11px' }}
-                        onClick={() => setEditLog(null)}>Cancel</Button>
+                        onClick={() => setEditEntry(null)}>Cancel</Button>
                       <Button kind="danger" style={{ fontSize: 12.5, padding: '6px 9px' }}
-                        onClick={() => { onRemoveLog(p.id, i); setEditLog(null); }}>Delete</Button>
+                        onClick={() => { onRemoveLog(p.id, i); setEditEntry(null); }}>Delete</Button>
                     </div>
                   </div>
                 ) : (
                   <button
                     key={i}
                     className="crm-btn"
-                    onClick={() => { setEditLog(i); setDraft({ date: e.date, text: e.text || '' }); }}
+                    onClick={() => { setEditEntry(e); setDraft({ date: e.date, text: e.text || '' }); }}
                     style={{
                       display: 'flex', gap: 10, width: '100%', textAlign: 'left', font: 'inherit',
                       background: 'transparent', border: 'none', padding: '0 0 9px', cursor: 'pointer',
