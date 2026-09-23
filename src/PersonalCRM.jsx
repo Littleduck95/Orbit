@@ -4820,7 +4820,7 @@ function ExportView({ people, events, reminders, collections, onClose }) {
       parts.push(['catch-ups', Papa.unparse({
         fields: ['Person', 'Date', 'What came up'],
         data: rows.map((r) => [r.p.name, r.e.date, r.e.text || '']),
-      })]);
+      }, { escapeFormulae: FORMULA_START })]);
     }
     return parts;
   };

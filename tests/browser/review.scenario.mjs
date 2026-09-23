@@ -141,10 +141,10 @@ export default async function review({ newPage, check, shots }) {
     await done();
   }
 
-  // ---- the catch-up log export skips formula escaping ----
+  // ---- fixed (M4): the catch-up log export escapes formulas like every other file ----
   {
     const { page, open, done } = await newPage({
-      seed: { 'crm-people-v1': [person('i', 'Ivo Ito', { log: [{ date: '2026-09-01', text: '=HYPERLINK("http://x","y")' }], lastContact: '2026-09-01' })] },
+      seed: { 'crm-people-v1': [person('i', 'Ivo Ito', { log: [{ date: '2026-09-01', text: '=HYPERLINK("http://x","y")' }, { date: '2026-08-01', text: '-5' }], lastContact: '2026-09-01' })] },
     });
     await open();
     await page.getByRole('button', { name: 'More', exact: true }).click();
@@ -155,7 +155,8 @@ export default async function review({ newPage, check, shots }) {
     const p = path.join(shots, 'log.csv');
     await dl.saveAs(p);
     const text = fs.readFileSync(p, 'utf8');
-    check('CURRENT: a catch-up note starting "=" is exported as a live formula', text.includes(',"=HYPERLINK') && !text.includes("'=HYPERLINK"), text);
+    check('a catch-up note starting "=" is exported as text, not a live formula', text.includes(`,"'=HYPERLINK`) && !text.includes(',"=HYPERLINK'), text);
+    check('and a note that is just a signed number stays a number', text.includes('2026-08-01,-5'), text);
     await done();
   }
 }
