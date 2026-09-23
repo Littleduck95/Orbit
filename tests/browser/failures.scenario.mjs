@@ -69,14 +69,21 @@ export default async function failures({ newPage, check }) {
       };
     });
     await open();
-    check('the warning says the list will not be saved over', (await page.getByRole('status').filter({ hasText: 'could not be read' }).innerText())
-      .includes('There was no room to keep that copy, so your people will not be saved over'));
+    const banner = page.getByRole('status').filter({ hasText: 'could not be read' });
+    check('the warning says changes to that list are not being saved', (await banner.innerText())
+      .includes('There was no room to keep that copy, so to keep the original safe, changes to your people are not being saved.'));
     await page.getByRole('button', { name: 'Add someone' }).click();
     await page.getByLabel('Name', { exact: true }).fill('New Person');
     await page.getByRole('button', { name: 'Add to list' }).click();
     check('a change still shows but is not saved, and says why',
       await page.getByText('was not saved, so the unreadable copy described above is not lost').isVisible()
         && (await page.evaluate(() => localStorage.getItem('orbit:crm-people-v1'))) === RAW);
+    await Promise.all([page.waitForEvent('download'), banner.getByRole('button', { name: 'Download the original' }).click()]);
+    await page.getByRole('button', { name: 'Add someone' }).click();
+    await page.getByLabel('Name', { exact: true }).fill('Second Person');
+    await page.getByRole('button', { name: 'Add to list' }).click();
+    check('downloading the original does not by itself start saving over it (the hold lasts the visit)',
+      (await page.evaluate(() => localStorage.getItem('orbit:crm-people-v1'))) === RAW);
     await done();
   }
 

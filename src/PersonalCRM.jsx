@@ -5768,7 +5768,7 @@ export default function PersonalCRM() {
               <p style={{ margin: '0 0 8px' }}>
                 {`Some saved ${which} could not be read exactly as saved. What could be read is showing, `
                   + 'and the original has been set aside, not deleted.'}
-                {held ? ` There was no room to keep that copy, so your ${held} will not be saved over until you have downloaded it.` : ''}
+                {held ? ` There was no room to keep that copy, so to keep the original safe, changes to your ${held} are not being saved. Download it to keep a copy.` : ''}
               </p>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <Button style={small} onClick={() => downloadCsv('orbit-set-aside.json', JSON.stringify(setAsideText, null, 2), 'application/json')}>
