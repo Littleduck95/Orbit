@@ -787,7 +787,7 @@ function PersonForm({ initial, defaultCircle, inline, families, allGroups, compa
         </span>
       </Field>
 
-      <Field label="Dates to remember">
+      <Group label="Dates to remember">
         {dates.length === 0 && (
           <p style={{ margin: '0 0 8px', fontSize: 12.5, color: C.faint, lineHeight: 1.5 }}>
             Anniversaries, the day someone passed, the year they took up a sport. These
@@ -805,6 +805,7 @@ function PersonForm({ initial, defaultCircle, inline, families, allGroups, compa
               <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
                 <select
                   className="crm-select"
+                  aria-label="Kind of date"
                   style={{ ...inputStyle, width: 'auto', flex: '1 1 150px', minHeight: 38, fontSize: 14 }}
                   value={d.kind}
                   onChange={(e) => set({ kind: e.target.value })}
@@ -813,6 +814,7 @@ function PersonForm({ initial, defaultCircle, inline, families, allGroups, compa
                 </select>
                 <input
                   type="date"
+                  aria-label="Date"
                   style={{ ...inputStyle, width: 'auto', flex: '1 1 140px', minHeight: 38, fontSize: 14 }}
                   value={d.date || ''}
                   onChange={(e) => set({ date: e.target.value })}
@@ -845,7 +847,7 @@ function PersonForm({ initial, defaultCircle, inline, families, allGroups, compa
         <Button onClick={() => setDates([...dates, { kind: DATE_KINDS[0], label: '', date: '' }])}>
           Add a date
         </Button>
-      </Field>
+      </Group>
 
       <Field label="Hobbies and sports">
         <input style={inputStyle} value={hobbies} onChange={(e) => setHobbies(e.target.value)}
@@ -2867,7 +2869,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
         )}
       </Field>
 
-      <Field label="Who was there">
+      <Group label="Who was there">
         {people.length === 0 ? (
           <p style={{ margin: 0, fontSize: 13, color: C.faint }}>
             Nobody on your lists yet. Events work fine without people attached.
@@ -2876,7 +2878,8 @@ function EventForm({ initial, people, onSave, onCancel }) {
           <>
             {people.length > 10 && (
               <input style={{ ...inputStyle, marginBottom: 8, minHeight: 38, fontSize: 14 }}
-                value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter names" />
+                value={filter} onChange={(e) => setFilter(e.target.value)}
+                aria-label="Filter names" placeholder="Filter names" />
             )}
             <div style={{
               display: 'flex', flexWrap: 'wrap', gap: 6,
@@ -2905,7 +2908,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
             </div>
           </>
         )}
-      </Field>
+      </Group>
 
       <Field label="The details">
         <textarea

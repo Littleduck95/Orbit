@@ -16,11 +16,13 @@ export default async function events({ newPage, check }) {
   await page.waitForSelector('text=Could not reach either lookup service from here');
   check('place search reports it cannot reach its service', true);
   const dana = page.locator('button', { hasText: 'Dana Whitfield' });
-  check('CURRENT: the "Who was there" heading is the first chip\'s accessible name',
-    (await dana.evaluate((el) => el.labels?.[0]?.textContent || '')).startsWith('Who was there'));
+  check('the "Who was there" heading is not the first chip\'s name (fixed, M6)',
+    (await dana.evaluate((el) => el.labels?.length ?? 0)) === 0
+      && await page.getByRole('button', { name: 'Dana Whitfield', exact: true }).isVisible());
   await page.getByText('Who was there', { exact: true }).click();
-  check('CURRENT: clicking the "Who was there" heading picks the first person',
-    (await dana.evaluate((el) => getComputedStyle(el).backgroundColor)) !== 'rgba(0, 0, 0, 0)');
+  check('and clicking the heading picks nobody',
+    (await dana.evaluate((el) => getComputedStyle(el).backgroundColor)) === 'rgba(0, 0, 0, 0)');
+  await dana.click();
   await page.getByLabel('The details').fill('New job.');
   await page.getByRole('button', { name: 'Add to the timeline' }).click();
   let ev = await stored('crm-events-v1');

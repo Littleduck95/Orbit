@@ -60,8 +60,12 @@ export default async function people({ newPage, check, TODAY }) {
   // ---- adding someone ----
   await page.getByRole('button', { name: 'Add someone' }).click();
   await page.getByText('Dates to remember', { exact: true }).click();
-  check('CURRENT: clicking the "Dates to remember" heading adds a date row',
-    await page.getByRole('button', { name: 'Remove this date' }).count() === 1);
+  check('clicking the "Dates to remember" heading adds nothing (fixed, M6)',
+    await page.getByRole('button', { name: 'Remove this date' }).count() === 0);
+  await page.getByRole('button', { name: 'Add a date', exact: true }).click();
+  check('a date row\'s menu and date box have their own names',
+    await page.getByRole('combobox', { name: 'Kind of date' }).count() === 1
+      && await page.getByLabel('Date', { exact: true }).count() === 1);
   await page.getByRole('button', { name: 'Remove this date' }).click();
   await page.getByLabel('Name', { exact: true }).fill('Hal Jordan');
   await page.getByRole('button', { name: 'Add to list' }).click();

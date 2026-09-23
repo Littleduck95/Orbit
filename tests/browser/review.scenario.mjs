@@ -121,6 +121,22 @@ export default async function review({ newPage, check, shots }) {
     await done();
   }
 
+  // ---- fixed (M6): with many people, the name filter has its own name ----
+  {
+    const many = Array.from({ length: 11 }, (_, i) => person(`m${i}`, `Mia ${String.fromCharCode(65 + i)}`));
+    const { page, open, done } = await newPage({ seed: { 'crm-people-v1': many } });
+    await open();
+    await page.getByRole('button', { name: 'Events', exact: true }).click();
+    await page.getByRole('button', { name: 'Add an event' }).click();
+    const box = page.getByRole('textbox', { name: 'Filter names', exact: true });
+    check('the name filter is called "Filter names", not "Who was there"', await box.count() === 1);
+    await page.getByText('Who was there', { exact: true }).click();
+    check('and clicking the heading does not jump into it', !(await box.evaluate((el) => el === document.activeElement)));
+    await box.fill('Mia K');
+    check('it still filters', await page.getByRole('button', { name: /^Mia [A-K]$/ }).count() === 1);
+    await done();
+  }
+
   // ---- fixed (M3): restored events without ids are given ids ----
   {
     const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [person('h', 'Hana Hill')] } });
