@@ -111,6 +111,13 @@ export default async function people({ newPage, check, TODAY }) {
   await page.getByRole('button', { name: 'Tap again to remove' }).click();
   check('the second tap removes them', !(await stored('crm-people-v1')).some((p) => p.name === 'Hal J. Jordan'));
 
+  // ---- well-formed data is never set aside ----
+  await page.reload();
+  await page.waitForSelector('button:has-text("Recap")');
+  check('well-formed saved data raises no warning and makes no set-aside copy',
+    (await page.getByText('could not be read exactly as saved').count()) === 0
+      && !(await page.evaluate(() => Object.keys(localStorage).some((k) => k.endsWith('-set-aside')))));
+
   // ---- keyboard access ----
   await page.locator('.crm-person .crm-row', { hasText: 'Dee Ellis' }).focus().catch(() => {});
   const focusable = await page.locator('.crm-person .crm-row', { hasText: 'Dee Ellis' }).evaluate((el) => el.tabIndex >= 0);

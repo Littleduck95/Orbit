@@ -1941,6 +1941,36 @@ const cleanReminder = (r) => (isPlainObject(r) ? fixFields(r, REMINDER_FIXES) : 
 // rest. Anything that is not a list at all comes back empty.
 const cleanAll = (list, clean) => (Array.isArray(list) ? list.map(clean).filter(Boolean) : []);
 
+// Reads one saved list. damaged means the text could not be used exactly as
+// saved: it would not parse, was not a list, or had records dropped or (when
+// records are compared by identity) repaired. The caller then sets the
+// original aside before anything can save over it.
+const readSaved = (raw, cleanList, byIdentity) => {
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { return { list: [], damaged: true }; }
+  if (!Array.isArray(parsed)) return { list: [], damaged: true };
+  const list = cleanList(parsed);
+  const damaged = list.length !== parsed.length || (byIdentity && list.some((x, i) => x !== parsed[i]));
+  return { list, damaged };
+};
+
+// Keeps the original text of a damaged list under a side key, untouched. Each
+// distinct version is kept once, so reloading does not pile up copies.
+const asideKey = (key) => `${key}-set-aside`;
+const setAside = async (key, raw) => {
+  const prev = await window.storage.get(asideKey(key));
+  let kept = [];
+  if (prev?.value) {
+    try {
+      const p = JSON.parse(prev.value);
+      kept = Array.isArray(p) ? p : [prev.value];
+    } catch {
+      kept = [prev.value];
+    }
+  }
+  if (!kept.includes(raw)) await window.storage.set(asideKey(key), JSON.stringify([...kept, raw]));
+};
+
 /* ---------- csv ---------- */
 // Arrays are joined with ";" so they survive a comma-delimited file.
 const joinList = (a) => (a || []).join('; ');
@@ -2189,9 +2219,9 @@ const fromCsv = (cols, rows, make) => {
   return { out, skipped };
 };
 
-const downloadCsv = (name, text) => {
+const downloadCsv = (name, text, type = 'text/csv;charset=utf-8;') => {
   try {
-    const blob = new Blob([text], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob([text], { type });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -5079,6 +5109,12 @@ export default function PersonalCRM() {
   const [collectionDraft, setCollectionDraft] = useState(null);
   const [incoming, setIncoming] = useState(null);
   const listsLook = useRef({ q: '', kind: 'All', order: 'recent' });
+  // Saved lists that could not be read as they were: their original text,
+  // shown in a warning with a way to download it.
+  const [setAsideText, setSetAsideText] = useState(null);
+  // Lists whose original could not even be set aside (no room). These are
+  // never saved over for the rest of the visit.
+  const heldBack = useRef(new Set());
   const [menuOpen, setMenuOpen] = useState(false);
   const [year, setYear] = useState(new Date().getFullYear());
   const [backup, setBackup] = useState('');
@@ -5086,37 +5122,34 @@ export default function PersonalCRM() {
 
   useEffect(() => {
     (async () => {
-      try {
-        const r = await window.storage.get(STORE_KEY);
-        if (r?.value) {
-          const loaded = cleanAll(JSON.parse(r.value), cleanPerson).map((x) => {
-            if (x.addedOn) return x;
-            const dates = (x.log || []).map((e) => e.date).filter(Boolean).sort();
-            return { ...x, addedOn: dates[0] || null };
-          });
-          setPeople(loaded);
+      // Each list is read on its own. One that cannot be used exactly as it
+      // was saved is set aside first, and what could be read still loads.
+      const aside = {};
+      const load = async (key, cleanList, byIdentity, apply) => {
+        try {
+          const r = await window.storage.get(key);
+          if (!r?.value) return;
+          const { list, damaged } = readSaved(r.value, cleanList, byIdentity);
+          if (damaged) {
+            aside[key] = r.value;
+            try { await setAside(key, r.value); } catch { heldBack.current.add(key); }
+          }
+          apply(list);
+        } catch {
+          /* nothing saved yet, or storage is out of reach */
         }
-      } catch {
-        /* first run — nothing saved yet */
-      }
-      try {
-        const ev = await window.storage.get(EVENTS_KEY);
-        if (ev?.value) setEvents(cleanAll(JSON.parse(ev.value), cleanEvent));
-      } catch {
-        /* no events yet */
-      }
-      try {
-        const rm = await window.storage.get(REMINDERS_KEY);
-        if (rm?.value) setReminders(cleanAll(JSON.parse(rm.value), cleanReminder));
-      } catch {
-        /* no reminders yet */
-      }
-      try {
-        const cl = await window.storage.get(COLLECTIONS_KEY);
-        if (cl?.value) setCollections(cleanCollections(JSON.parse(cl.value)));
-      } catch {
-        /* no lists yet */
-      }
+      };
+      await load(STORE_KEY, (a) => cleanAll(a, cleanPerson), true, (list) => setPeople(list.map((x) => {
+        if (x.addedOn) return x;
+        const dates = (x.log || []).map((e) => e.date).filter(Boolean).sort();
+        return { ...x, addedOn: dates[0] || null };
+      })));
+      await load(EVENTS_KEY, (a) => cleanAll(a, cleanEvent), true, setEvents);
+      await load(REMINDERS_KEY, (a) => cleanAll(a, cleanReminder), true, setReminders);
+      // Lists are rebuilt by their own cleaner, so only a list that would not
+      // parse or lost records counts as damaged.
+      await load(COLLECTIONS_KEY, cleanCollections, false, setCollections);
+      if (Object.keys(aside).length) setSetAsideText(aside);
       try {
         const t = await window.storage.get(THEME_KEY);
         if (t?.value && THEMES[t.value]) { applyTheme(t.value); setTheme(t.value); }
@@ -5161,8 +5194,17 @@ export default function PersonalCRM() {
     return () => window.removeEventListener('hashchange', later);
   }, []);
 
+  // A list whose unreadable original could not be set aside is not saved
+  // over: the change shows, and the error says why it was not kept.
+  const holdBack = (key) => {
+    if (!heldBack.current.has(key)) return false;
+    setError('That change is showing here but was not saved, so the unreadable copy described above is not lost.');
+    return true;
+  };
+
   const persist = async (next) => {
     setPeople(next);
+    if (holdBack(STORE_KEY)) return false;
     try {
       await window.storage.set(STORE_KEY, JSON.stringify(next));
       setError('');
@@ -5212,6 +5254,7 @@ export default function PersonalCRM() {
 
   const persistEvents = async (next) => {
     setEvents(next);
+    if (holdBack(EVENTS_KEY)) return false;
     try {
       await window.storage.set(EVENTS_KEY, JSON.stringify(next));
       setError('');
@@ -5230,6 +5273,7 @@ export default function PersonalCRM() {
 
   const persistReminders = async (next) => {
     setReminders(next);
+    if (holdBack(REMINDERS_KEY)) return false;
     try {
       await window.storage.set(REMINDERS_KEY, JSON.stringify(next));
       setError('');
@@ -5254,6 +5298,7 @@ export default function PersonalCRM() {
 
   const persistCollections = async (next) => {
     setCollections(next);
+    if (holdBack(COLLECTIONS_KEY)) return false;
     try {
       await window.storage.set(COLLECTIONS_KEY, JSON.stringify(next));
       setError('');
@@ -5680,6 +5725,29 @@ export default function PersonalCRM() {
         {error && (
           <p style={{ margin: '12px 0 0', fontSize: 13, color: C.overdue }}>{error}</p>
         )}
+        {setAsideText && (() => {
+          const names = { [STORE_KEY]: 'people', [EVENTS_KEY]: 'events', [REMINDERS_KEY]: 'reminders', [COLLECTIONS_KEY]: 'lists' };
+          const which = Object.keys(setAsideText).map((k) => names[k]).join(', ');
+          const held = Object.keys(setAsideText).filter((k) => heldBack.current.has(k)).map((k) => names[k]).join(', ');
+          return (
+            <div role="status" style={{
+              margin: '12px 0 0', padding: '12px 14px', borderRadius: 10, fontSize: 13, lineHeight: 1.5,
+              color: C.ink, background: C.overdueSoft, border: `1px solid ${C.overdueBar}`,
+            }}>
+              <p style={{ margin: '0 0 8px' }}>
+                {`Some saved ${which} could not be read exactly as saved. What could be read is showing, `
+                  + 'and the original has been set aside, not deleted.'}
+                {held ? ` There was no room to keep that copy, so your ${held} will not be saved over until you have downloaded it.` : ''}
+              </p>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <Button style={small} onClick={() => downloadCsv('orbit-set-aside.json', JSON.stringify(setAsideText, null, 2), 'application/json')}>
+                  Download the original
+                </Button>
+                <Button style={small} onClick={() => setSetAsideText(null)}>OK</Button>
+              </div>
+            </div>
+          );
+        })()}
         {sharedWaiting && (
           <p role="status" style={{ margin: '12px 0 0', fontSize: 13, color: C.ink, display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
             {incoming.broken

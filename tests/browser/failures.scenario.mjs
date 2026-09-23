@@ -16,25 +16,67 @@ export default async function failures({ newPage, check }) {
     await done();
   }
 
-  // ---- stored people that cannot be parsed ----
+  // ---- fixed (H2): stored people that cannot be parsed are set aside, not lost ----
   {
-    const { page, open, done } = await newPage({ seed: { 'crm-people-v1': '{"this is": "cut off' } });
+    const RAW = '{"this is": "cut off';
+    const { page, open, done } = await newPage({ seed: { 'crm-people-v1': RAW, 'crm-events-v1': [{ id: 'e', title: 'Kept', date: '2026-01-01', people: [] }] } });
     await open();
-    check('CURRENT: unreadable stored people load as an empty list, with no warning',
-      await page.getByRole('heading', { name: 'No one here yet' }).isVisible());
+    const banner = page.getByRole('status').filter({ hasText: 'could not be read exactly as saved' });
+    check('unreadable people load as empty, with a warning naming them', await page.getByRole('heading', { name: 'No one here yet' }).isVisible()
+      && (await banner.innerText()).includes('Some saved people could not be read'));
+    const aside = await page.evaluate(() => localStorage.getItem('orbit:crm-people-v1-set-aside'));
+    check('the original text is set aside before anything can save over it', JSON.stringify(JSON.parse(aside)) === JSON.stringify([RAW]), aside);
+    check('other lists load as normal', await page.evaluate(() => JSON.parse(localStorage.getItem('orbit:crm-events-v1')).length) === 1
+      && !(await page.evaluate(() => Object.keys(localStorage).some((k) => k.startsWith('orbit:crm-events-v1-')))));
+    const [dl] = await Promise.all([page.waitForEvent('download'), banner.getByRole('button', { name: 'Download the original' }).click()]);
+    check('the original can be downloaded from the warning', JSON.parse(fs.readFileSync(await dl.path(), 'utf8'))['crm-people-v1'] === RAW);
+    await banner.getByRole('button', { name: 'OK' }).click();
+    check('the warning can be dismissed', (await banner.count()) === 0);
     await page.getByRole('button', { name: 'Add someone' }).click();
     await page.getByLabel('Name', { exact: true }).fill('New Person');
     await page.getByRole('button', { name: 'Add to list' }).click();
-    const raw = await page.evaluate(() => localStorage.getItem('orbit:crm-people-v1'));
-    check('CURRENT: the next save overwrites the unreadable data for good', raw.startsWith('[{') && raw.includes('New Person') && !raw.includes('cut off'));
+    const [main, kept] = await page.evaluate(() => [localStorage.getItem('orbit:crm-people-v1'), localStorage.getItem('orbit:crm-people-v1-set-aside')]);
+    check('saving afterwards works, and the set-aside original survives it', main.includes('New Person') && JSON.parse(kept)[0] === RAW);
+    await page.evaluate((raw) => localStorage.setItem('orbit:crm-people-v1', raw), RAW);
+    await page.reload();
+    await page.waitForSelector('button:has-text("Recap")');
+    await page.reload();
+    await page.waitForSelector('button:has-text("Recap")');
+    check('the same unreadable text is kept once, however often it loads',
+      JSON.parse(await page.evaluate(() => localStorage.getItem('orbit:crm-people-v1-set-aside'))).length === 1);
     await done();
   }
 
-  // ---- stored people that parse but are not a list ----
+  // ---- fixed (H2): a stored value that is not a list ----
   {
-    const { page, open, done } = await newPage({ seed: { 'crm-people-v1': { name: 'not an array' } } });
+    const { page, open, done } = await newPage({ seed: { 'crm-collections-v1': { name: 'not an array' } } });
     await open();
-    check('CURRENT: a stored value that is not a list also loads as empty', await page.getByRole('heading', { name: 'No one here yet' }).isVisible());
+    check('a saved value that is not a list is set aside with a warning too',
+      (await page.getByRole('status').filter({ hasText: 'Some saved lists could not be read' }).count()) === 1
+        && JSON.parse(await page.evaluate(() => localStorage.getItem('orbit:crm-collections-v1-set-aside')))[0] === '{"name":"not an array"}');
+    await done();
+  }
+
+  // ---- fixed (H2): with no room to keep the original, that list is not saved over ----
+  {
+    const RAW = '[{"name": "cut';
+    const { page, open, done } = await newPage({ seed: { 'crm-people-v1': RAW } });
+    await page.addInitScript(() => {
+      const real = Storage.prototype.setItem;
+      Storage.prototype.setItem = function setItem(k, v) {
+        if (String(k).endsWith('-set-aside')) throw new Error('QuotaExceededError');
+        return real.call(this, k, v);
+      };
+    });
+    await open();
+    check('the warning says the list will not be saved over', (await page.getByRole('status').filter({ hasText: 'could not be read' }).innerText())
+      .includes('There was no room to keep that copy, so your people will not be saved over'));
+    await page.getByRole('button', { name: 'Add someone' }).click();
+    await page.getByLabel('Name', { exact: true }).fill('New Person');
+    await page.getByRole('button', { name: 'Add to list' }).click();
+    check('a change still shows but is not saved, and says why',
+      await page.getByText('was not saved, so the unreadable copy described above is not lost').isVisible()
+        && (await page.evaluate(() => localStorage.getItem('orbit:crm-people-v1'))) === RAW);
     await done();
   }
 
@@ -91,6 +133,9 @@ export default async function failures({ newPage, check }) {
     await page.waitForSelector('button:has-text("Recap")');
     check('a saved person with a history that is not a list loads, with everyone else',
       (await page.locator('.crm-person').count()) === 2 && problems.length === 0, problems);
+    check('and since it had to be repaired, the original is set aside with a warning',
+      (await page.getByRole('status').filter({ hasText: 'Some saved people could not be read' }).count()) === 1
+        && JSON.parse(await page.evaluate(() => localStorage.getItem('orbit:crm-people-v1-set-aside')))[0].includes('"log":"oops"'));
     await done();
   }
 
