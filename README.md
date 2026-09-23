@@ -3,7 +3,8 @@
 A personal CRM for keeping up with the people you actually want to keep up with.
 Track who you care about, how often you mean to reach out, when you last did,
 and the events and dates that matter to them. Reminders cover the other half:
-the things that come round again whether or not anyone tells you.
+the things that come round again whether or not anyone tells you. Lists hold
+everything else worth keeping track of: shows, books, the collection.
 
 The whole app is one component: [`src/PersonalCRM.jsx`](src/PersonalCRM.jsx).
 Everything else in this repo is the shell needed to run it in a browser.
@@ -23,6 +24,17 @@ Then open http://localhost:5173.
 | `npm run build` | Production build into `dist/` |
 | `npm run preview` | Serve the built `dist/` locally |
 | `npm run lint` | ESLint over the project |
+| `npm test` | Logic and storage tests (Node's built-in runner, no extra installs) |
+| `npm run test:browser` | Drives the real app in Chromium; needs Playwright installed |
+
+The tests are characterization tests: they pin down what the app does today,
+with the clock, timezone and locale fixed so dates are repeatable. Checks whose
+names start `CURRENT:` record behaviour an audit flagged as questionable; if
+that behaviour is changed on purpose, the check changes in the same commit.
+`tests/app.mjs` compiles the real `src/PersonalCRM.jsx` with Vite's own
+transformer to reach its private helpers, without touching the source.
+Playwright is not a dependency of this project; the browser runner finds an
+installed copy, or says plainly that there is none.
 
 ## Layout
 
@@ -30,7 +42,9 @@ Then open http://localhost:5173.
 index.html            page shell, mounts #root
 src/main.jsx          entry point — installs the storage shim, renders the app
 src/storage.js        window.storage shim backed by localStorage
+src/Recovery.jsx      shown instead of a blank page if drawing ever fails
 src/PersonalCRM.jsx   the app
+tests/                characterization tests (logic, storage, browser)
 vite.config.js        build config
 eslint.config.js      lint config
 ```
@@ -71,12 +85,54 @@ The tab ships with a set of starter reminders at the intervals each job is
 usually given. They are suggestions, not defaults: picking one opens the form
 filled in, and nothing is saved until you say so.
 
+## Lists
+
+The Lists tab holds lists you make yourself: shows to watch, books to read,
+records, games, places, a collection you are building, gift ideas. Each list
+has a kind, which only supplies starting words. Everything it fills in can be
+changed on the list:
+
+- **Stages.** A list can track progress in up to three stages, named in your
+  own words: *Want to read / Reading / Read*, *Wanted / On the way / In the
+  collection*. Leave the middle one empty when there is no in-between (a film
+  is rarely half-watched), or switch stages off for a plain ranked list.
+  Stages are stored under fixed keys, so renaming them, changing the kind or
+  turning tracking off and back on never loses anyone's progress.
+- **The line under each title.** Author, where to watch it, the set it
+  belongs to. Leave it empty to skip it.
+
+Inside a list, type a title and press Enter to add it. Tap the circle beside an
+entry to move it to its next stage, or tap the entry for its rating, link,
+notes, and who recommended it. Recommendations show on that person's card. A
+list remembers how you last sorted it: your own order (with a Reorder mode that
+works from the keyboard), A to Z (which files *The Bear* under B, the way a
+shelf would), newest, highest rated, or by progress.
+
+**Sharing** never includes who recommended what. Notes, and the list's
+description, only go when you tick *Include my notes*. A list can be shared two
+ways:
+
+| How | What they get |
+| --- | --- |
+| Copy as text, Share…, or Email it | Plain text anyone can read, grouped by stage with ratings, or numbered in your order |
+| Copy Orbit link | Their own copy, starting fresh with no progress or ratings |
+
+An Orbit link carries the whole list inside it (`#share=…`), so there is no
+server to hold it and nothing expires. Opening it offers the list rather than
+adding it, and the link is removed from the address bar so a reload does not
+offer it twice. The link only opens where Orbit is hosted. Someone running
+their own copy can paste the link, or just the code at the end of it, under
+**Add a shared list**. Everything arriving this way is checked before it is
+kept: only `http` and `https` links survive, and text is trimmed to sensible
+lengths.
+
 ## What the app stores
 
-People, events, reminders, the chosen theme, and your name live under five keys
-(`crm-people-v1`, `crm-events-v1`, `crm-reminders-v1`, `crm-theme-v1`,
-`crm-owner-v1`). The app reads and writes them through an async
-`window.storage` object.
+People, events, reminders, lists, the chosen theme, and your name live under
+six keys (`crm-people-v1`, `crm-events-v1`, `crm-reminders-v1`,
+`crm-collections-v1`, `crm-theme-v1`, `crm-owner-v1`). Lists are called
+collections in the code, because "list" already means the people list there.
+The app reads and writes them through an async `window.storage` object.
 
 `src/storage.js` provides that object, backed by `localStorage` and namespaced
 under an `orbit:` prefix. Writes are allowed to fail loudly — the app already
@@ -86,11 +142,30 @@ quota, blocked site data).
 
 There is a **Back up** button in the app that exports everything as JSON, and a
 **Restore** button that reads it back. Use them; `localStorage` is per-browser
-and per-device. Older backups that predate reminders still restore — the app
-treats a missing `reminders` key as an empty list.
+and per-device. Older backups that predate reminders or lists still restore —
+the app treats a missing `reminders` or `collections` key as an empty list. A
+backup with lists but nobody in it restores too. Back up and Restore sit under
+the People tab and appear once anything at all is saved.
 
-Import and export cover reminders too. A reminder CSV is recognised by its
-`Next due` column, which is what tells it apart from an events sheet.
+Import and export cover reminders and lists too. A reminder CSV is recognised
+by its `Next due` column, which is what tells it apart from an events sheet. A
+lists CSV has one row per entry and is recognised by having both a `Title` and
+a `List` column but no `Name` column. The `Name` rule means a people sheet with
+a job-title column is still read as people. Importing it adds entries to a list
+of the same name if you already have one, reading their stages in that list's
+own words. Otherwise stages are read from the usual words (*Reading*,
+*Finished*, *yes*, *Not started*). A sheet with no `List kind` column gets its
+kind from the list's name, so a list called *Books* reads *Reading* as a stage.
+A plain list comes back plain. A new list made from a sheet has its kind's
+stage words, not any custom ones, so the JSON backup is the lossless copy. A
+list holds at most 2,000 entries, and the import screen says how many would not
+fit before anything is saved.
+
+Every CSV export guards against formula injection. A cell starting `=`, `+`,
+`-` or `@` would run as a formula in Excel or Sheets, and list titles can come
+from anyone who shares a list. Such cells get a leading `'`, and import takes it
+off again. Plain signed numbers are left alone, so a longitude of `-94.58`
+stays a number.
 
 ## Carried over from the app's original runtime
 

@@ -1,0 +1,178 @@
+// Behaviour found by the audit, reproduced in the real app. Every check here
+// is "CURRENT:": it records a bug as it behaves today, so that a fix changes
+// this file deliberately rather than by accident.
+import fs from 'node:fs';
+import path from 'node:path';
+
+const person = (id, name, over = {}) => ({ id, name, circle: 'friend', tier: 'friend', cadence: 30, log: [], ...over });
+
+export default async function review({ newPage, check, shots }) {
+  // ---- fixed (H3): the detail panel starts fresh for each person ----
+  {
+    const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [
+      person('a', 'Alice Ames', { log: [{ date: '2026-09-01', text: 'Alice note' }], lastContact: '2026-09-01' }),
+      person('b', 'Bob Byrne', { log: [{ date: '2026-08-01', text: 'Bob note' }], lastContact: '2026-08-01' }),
+    ] } });
+    await open();
+    await page.locator('.crm-person .crm-row', { hasText: 'Alice Ames' }).click();
+    await page.getByRole('button', { name: 'Remove', exact: true }).click();
+    await page.locator('.crm-person .crm-row', { hasText: 'Bob Byrne' }).click();
+    check('an armed Remove does not carry over to the next person opened',
+      await page.getByRole('button', { name: 'Remove', exact: true }).isVisible()
+        && !(await page.getByRole('button', { name: 'Tap again to remove' }).isVisible()));
+    await page.getByRole('button', { name: 'Remove', exact: true }).click();
+    check('so one tap on the next person only arms it', (await stored('crm-people-v1')).some((p) => p.id === 'b'));
+
+    await page.locator('.crm-person .crm-row', { hasText: 'Alice Ames' }).click();
+    await page.getByRole('button', { name: /Alice note/ }).click();
+    await page.getByPlaceholder('What came up?').fill('Typed for Alice');
+    await page.locator('.crm-person .crm-row', { hasText: 'Bob Byrne' }).click();
+    check('an open catch-up edit does not carry over either', (await page.getByPlaceholder('What came up?').count()) === 0);
+    const after = await stored('crm-people-v1');
+    check('and nothing typed for one person lands in another\'s history',
+      after.find((p) => p.id === 'b').log[0].text === 'Bob note' && after.find((p) => p.id === 'a').log[0].text === 'Alice note');
+    await done();
+  }
+
+  // ---- fixed (H4): editing someone with no reminder keeps it that way ----
+  {
+    const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [
+      person('c', 'Cleo Cruz', { cadence: 0, lastContact: '2026-09-20' }),
+      person('c2', 'Cy Cole', { cadence: '0', lastContact: '2026-09-20' }),
+      { id: 'c3', name: 'Cam Cho', circle: 'friend', tier: 'friend', log: [] },
+    ] } });
+    await open();
+    const cadenceAfterSave = async (name) => {
+      await page.getByRole('button', { name: /^Everyone/ }).click();
+      await page.locator('.crm-person .crm-row', { hasText: name }).click();
+      await page.getByRole('button', { name: 'Edit', exact: true }).click();
+      const shown = await page.getByLabel('Check in').inputValue();
+      await page.getByRole('button', { name: 'Save changes' }).click();
+      return [shown, (await stored('crm-people-v1')).find((p) => p.name === name).cadence];
+    };
+    const [shown, saved] = await cadenceAfterSave('Cleo Cruz');
+    check('the form shows "no reminder" for someone set to no reminder', shown === '0', shown);
+    check('saving without touching it keeps no reminder', saved === 0, saved);
+    check('a "0" stored as text is kept as no reminder too', JSON.stringify(await cadenceAfterSave('Cy Cole')) === '["0",0]');
+    check('a missing cadence still falls back to every few months', JSON.stringify(await cadenceAfterSave('Cam Cho')) === '["90",90]');
+    await done();
+  }
+
+  // ---- fixed (M1): an open catch-up edit follows its entry when the history changes ----
+  {
+    const log = [{ date: '2026-09-10', text: 'Lunch' }, { date: '2026-08-01', text: 'Hike' }];
+    const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [person('d', 'Dev Dunn', { log, lastContact: '2026-09-10' })] } });
+    await open();
+    await page.locator('.crm-person .crm-row', { hasText: 'Dev Dunn' }).click();
+    await page.getByRole('button', { name: /Hike/ }).click();
+    await page.getByPlaceholder('What came up?').fill('Hike, edited');
+    await page.getByRole('button', { name: 'Log a catch-up with Dev Dunn today' }).click();
+    check('the open edit keeps what was typed while the history shifts',
+      (await page.getByPlaceholder('What came up?').inputValue()) === 'Hike, edited');
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    let texts = (await stored('crm-people-v1'))[0].log.map((e) => e.text);
+    check('Save changes the entry that was opened, and no other', JSON.stringify(texts) === JSON.stringify(['', 'Lunch', 'Hike, edited']), texts);
+
+    await page.getByRole('button', { name: /Lunch/ }).click();
+    await page.getByRole('button', { name: 'Log a catch-up with Dev Dunn today' }).click();
+    await page.getByRole('button', { name: 'Delete', exact: true }).click();
+    texts = (await stored('crm-people-v1'))[0].log.map((e) => e.text);
+    check('Delete removes the entry that was opened, and no other', JSON.stringify(texts) === JSON.stringify(['', '', 'Hike, edited']), texts);
+    await done();
+  }
+
+  // ---- a last-contact date typed into the form is lost when the log changes ----
+  {
+    const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [person('e', 'Ema East', { lastContact: '2026-09-01' })] } });
+    await open();
+    await page.getByRole('button', { name: 'Log a catch-up with Ema East today' }).click();
+    await page.locator('.crm-person .crm-row', { hasText: 'Ema East' }).click();
+    await page.getByRole('button', { name: /Talked\./ }).click();
+    await page.getByRole('button', { name: 'Delete', exact: true }).click();
+    check('CURRENT: deleting the only log entry forgets a last-contact date that came from the form',
+      (await stored('crm-people-v1'))[0].lastContact === null);
+    await done();
+  }
+
+  // ---- search matches the word "undefined" on people missing a field ----
+  {
+    const { page, open, done } = await newPage({ seed: { 'crm-people-v1': [{ id: 'f', name: 'Fern Ford', circle: 'friend', cadence: 30, log: [] }] } });
+    await open();
+    await page.getByPlaceholder('Search everyone by name, note, or handle').fill('def');
+    check('CURRENT: "def" matches someone with no role or note, through the text "undefined"',
+      await page.getByRole('heading', { name: 'One person matches' }).isVisible());
+    await done();
+  }
+
+  // ---- fixed (M2): an event with a latitude but no longitude ----
+  {
+    const { page, open, stored, problems, done } = await newPage({
+      seed: { 'crm-events-v1': [{ id: 'g', title: 'Half pinned', date: '2026-05-01', lat: 39.1, lon: null, people: [] }] },
+    });
+    await open();
+    await page.getByRole('button', { name: 'Events', exact: true }).click();
+    await page.getByRole('button', { name: 'Edit', exact: true }).click();
+    check('editing an event with only a latitude opens, showing it as not pinned',
+      await page.getByText('Optional. Hit Find to drop a pin, or leave it as plain text.').isVisible() && problems.length === 0, problems);
+    await page.getByLabel('What happened').fill('Half pinned, edited');
+    await page.getByRole('button', { name: 'Save changes' }).click();
+    const ev = (await stored('crm-events-v1'))[0];
+    check('and saves, with the lone half cleared', ev.title === 'Half pinned, edited' && ev.lat === null && ev.lon === null, ev);
+    await done();
+  }
+
+  // ---- fixed (M6): with many people, the name filter has its own name ----
+  {
+    const many = Array.from({ length: 11 }, (_, i) => person(`m${i}`, `Mia ${String.fromCharCode(65 + i)}`));
+    const { page, open, done } = await newPage({ seed: { 'crm-people-v1': many } });
+    await open();
+    await page.getByRole('button', { name: 'Events', exact: true }).click();
+    await page.getByRole('button', { name: 'Add an event' }).click();
+    const box = page.getByRole('textbox', { name: 'Filter names', exact: true });
+    check('the name filter is called "Filter names", not "Who was there"', await box.count() === 1);
+    await page.getByText('Who was there', { exact: true }).click();
+    check('and clicking the heading does not jump into it', !(await box.evaluate((el) => el === document.activeElement)));
+    await box.fill('Mia K');
+    check('it still filters', await page.getByRole('button', { name: /^Mia [A-K]$/ }).count() === 1);
+    await done();
+  }
+
+  // ---- fixed (M3): restored events without ids are given ids ----
+  {
+    const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [person('h', 'Hana Hill')] } });
+    await open();
+    await page.getByRole('button', { name: 'Restore' }).click();
+    await page.getByPlaceholder('Paste here').fill(JSON.stringify({
+      people: [person('h', 'Hana Hill')],
+      events: [{ title: 'One', date: '2026-01-01' }, { title: 'Two', date: '2026-02-01' }, { id: 'keep', title: 'Three', date: '2026-03-01' }],
+    }));
+    await page.getByRole('button', { name: 'Replace my lists' }).click();
+    const ids = (await stored('crm-events-v1')).map((e) => e.id);
+    check('restored events without ids get distinct ones, and existing ids are kept',
+      ids.length === 3 && new Set(ids).size === 3 && ids[2] === 'keep' && ids.every((id) => typeof id === 'string' && id), ids);
+    await page.getByRole('button', { name: 'Events', exact: true }).click();
+    await page.getByRole('button', { name: 'Remove', exact: true }).first().click();
+    await page.getByRole('button', { name: 'Tap again to remove' }).click();
+    check('so removing one removes only that one', (await stored('crm-events-v1')).length === 2);
+    await done();
+  }
+
+  // ---- fixed (M4): the catch-up log export escapes formulas like every other file ----
+  {
+    const { page, open, done } = await newPage({
+      seed: { 'crm-people-v1': [person('i', 'Ivo Ito', { log: [{ date: '2026-09-01', text: '=HYPERLINK("http://x","y")' }, { date: '2026-08-01', text: '-5' }], lastContact: '2026-09-01' })] },
+    });
+    await open();
+    await page.getByRole('button', { name: 'More', exact: true }).click();
+    await page.getByRole('button', { name: 'Export', exact: true }).click();
+    for (const label of [/^People/, /^Events/, /^Reminders/, /^Lists/]) await page.getByLabel(label).uncheck();
+    await page.getByLabel(/^Catch-up log/).check();
+    const [dl] = await Promise.all([page.waitForEvent('download'), page.getByRole('button', { name: 'Export CSV' }).click()]);
+    const p = path.join(shots, 'log.csv');
+    await dl.saveAs(p);
+    const text = fs.readFileSync(p, 'utf8');
+    check('a catch-up note starting "=" is exported as text, not a live formula', text.includes(`,"'=HYPERLINK`) && !text.includes(',"=HYPERLINK'), text);
+    check('and a note that is just a signed number stays a number', text.includes('2026-08-01,-5'), text);
+    await done();
+  }
+}
