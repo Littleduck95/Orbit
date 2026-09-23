@@ -42,6 +42,10 @@ const only = process.argv.slice(2);
 const files = fs.readdirSync(here).filter((f) => f.endsWith('.scenario.mjs'))
   .filter((f) => only.length === 0 || only.some((o) => f.includes(o))).sort();
 
+// These drive Orbit as it saves in the browser, with no account. An empty
+// value outranks .env, which switches sign-in off (see src/supabase.js).
+process.env.VITE_SUPABASE_URL = '';
+process.env.VITE_SUPABASE_PUBLISHABLE_KEY = '';
 const server = await createServer({ root, logLevel: 'error', server: { port: 0, strictPort: false } });
 await server.listen();
 const url = server.resolvedUrls.local[0];

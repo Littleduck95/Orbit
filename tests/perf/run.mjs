@@ -80,6 +80,10 @@ const SIZES = {
 
 // ---- build and serve ----
 const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-perf-'));
+// These drive Orbit as it saves in the browser, with no account. An empty
+// value outranks .env, which switches sign-in off (see src/supabase.js).
+process.env.VITE_SUPABASE_URL = '';
+process.env.VITE_SUPABASE_PUBLISHABLE_KEY = '';
 await build({ root, logLevel: 'error', build: { outDir, emptyOutDir: true, minify: !PROFILE } });
 const server = await preview({ root, logLevel: 'error', build: { outDir }, preview: { port: 0 } });
 const url = server.resolvedUrls.local[0];
