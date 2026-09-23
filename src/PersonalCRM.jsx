@@ -1844,6 +1844,103 @@ const readShared = (text) => {
   }
 };
 
+/* ---------- repairing saved data ---------- */
+// Saved data and backups are only as well-formed as whatever wrote them: an
+// older version, a hand edit, another tool. One field of the wrong type (a
+// history that is not a list, a note that is an object) used to take the
+// whole app down, and after a reload the loader gave up on every record.
+//
+// These make each record safe to draw without second-guessing anything that
+// is already right. A record that needs nothing comes back as the very same
+// object. Otherwise only the bad fields are replaced, with the empty value
+// the app already reads as "nothing here". Falsy values are left alone; the
+// app handles those everywhere.
+
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// Text the app draws or parses. A number becomes its digits; anything else
+// that is not text becomes empty.
+const fixText = (v) => (v == null || typeof v === 'string' ? v : typeof v === 'number' ? String(v) : '');
+// The same, for fields every record has to have.
+const fixNeeded = (v) => fixText(v) ?? '';
+const fixNumber = (v) => (v == null || typeof v === 'number' ? v : null);
+const fixTextList = (v) => {
+  if (!v) return v;
+  if (!Array.isArray(v)) return [];
+  if (v.every((x) => typeof x === 'string')) return v;
+  return v.filter((x) => typeof x === 'string' || typeof x === 'number').map(String);
+};
+
+// Replaces only the fields whose fix changes them, on a copy made the first
+// time one does.
+const fixFields = (rec, fixes) => {
+  let out = rec;
+  fixes.forEach(([k, fix]) => {
+    const v = fix(rec[k]);
+    if (!Object.is(v, rec[k])) {
+      if (out === rec) out = { ...rec };
+      out[k] = v;
+    }
+  });
+  return out;
+};
+
+// A list of entries (a catch-up history, dates to remember): anything that is
+// not an entry is dropped, and each entry's own fields are fixed.
+const fixEntries = (fixes) => (v) => {
+  if (!v) return v;
+  if (!Array.isArray(v)) return [];
+  let changed = false;
+  const out = [];
+  v.forEach((e) => {
+    if (!isPlainObject(e)) { changed = true; return; }
+    const f = fixFields(e, fixes);
+    if (f !== e) changed = true;
+    out.push(f);
+  });
+  return changed ? out : v;
+};
+
+const fixObject = (inner, empty) => (v) => {
+  if (!v) return v;
+  if (!isPlainObject(v)) return empty();
+  return inner ? inner(v) : v;
+};
+
+const PERSON_FIXES = [
+  ['name', fixNeeded],
+  ...['role', 'company', 'hobbies', 'email', 'phone', 'address', 'note', 'relation',
+    'birthday', 'lastContact', 'addedOn', 'ageAsOf'].map((k) => [k, fixText]),
+  ...['aka', 'kids', 'families', 'groups'].map((k) => [k, fixTextList]),
+  ['log', fixEntries([['date', fixText], ['text', fixText]])],
+  ['dates', fixEntries([['kind', fixText], ['label', fixText], ['date', fixText]])],
+  ['socials', fixObject((s) => fixFields(s, Object.keys(s).map((k) => [k, fixText])), () => ({}))],
+  ['partner', fixObject((pt) => fixFields(pt, [['name', fixText], ['status', fixText]]), () => null)],
+];
+
+const EVENT_FIXES = [
+  ['title', fixNeeded], ['date', fixNeeded],
+  ...['endDate', 'kind', 'place', 'note', 'addedOn'].map((k) => [k, fixText]),
+  ['people', fixTextList],
+  ['lat', fixNumber], ['lon', fixNumber],
+];
+
+const REMINDER_FIXES = [
+  ['title', fixNeeded], ['next', fixNeeded],
+  ...['kind', 'note', 'lastDone', 'addedOn'].map((k) => [k, fixText]),
+  ['people', fixTextList],
+  ['history', fixEntries([['date', fixText]])],
+  ['every', fixObject(null, () => null)],
+];
+
+const cleanPerson = (p) => (isPlainObject(p) ? fixFields(p, PERSON_FIXES) : null);
+const cleanEvent = (e) => (isPlainObject(e) ? fixFields(e, EVENT_FIXES) : null);
+const cleanReminder = (r) => (isPlainObject(r) ? fixFields(r, REMINDER_FIXES) : null);
+
+// A whole saved list, record by record: one bad record no longer costs the
+// rest. Anything that is not a list at all comes back empty.
+const cleanAll = (list, clean) => (Array.isArray(list) ? list.map(clean).filter(Boolean) : []);
+
 /* ---------- csv ---------- */
 // Arrays are joined with ";" so they survive a comma-delimited file.
 const joinList = (a) => (a || []).join('; ');
@@ -4992,7 +5089,7 @@ export default function PersonalCRM() {
       try {
         const r = await window.storage.get(STORE_KEY);
         if (r?.value) {
-          const loaded = JSON.parse(r.value).map((x) => {
+          const loaded = cleanAll(JSON.parse(r.value), cleanPerson).map((x) => {
             if (x.addedOn) return x;
             const dates = (x.log || []).map((e) => e.date).filter(Boolean).sort();
             return { ...x, addedOn: dates[0] || null };
@@ -5004,13 +5101,13 @@ export default function PersonalCRM() {
       }
       try {
         const ev = await window.storage.get(EVENTS_KEY);
-        if (ev?.value) setEvents(JSON.parse(ev.value));
+        if (ev?.value) setEvents(cleanAll(JSON.parse(ev.value), cleanEvent));
       } catch {
         /* no events yet */
       }
       try {
         const rm = await window.storage.get(REMINDERS_KEY);
-        if (rm?.value) setReminders(JSON.parse(rm.value));
+        if (rm?.value) setReminders(cleanAll(JSON.parse(rm.value), cleanReminder));
       } catch {
         /* no reminders yet */
       }
@@ -5208,12 +5305,13 @@ export default function PersonalCRM() {
       const rawReminders = Array.isArray(parsed) ? [] : parsed.reminders || [];
       const rawCollections = Array.isArray(parsed) ? [] : parsed.collections || [];
       if (!Array.isArray(rawPeople)) throw new Error('not a backup');
-      const clean = rawPeople.filter((r) => r && typeof r.name === 'string' && r.name.trim());
+      // The same records are kept as ever; each is then repaired, so one
+      // field of the wrong shape cannot take the app down.
+      const clean = cleanAll(rawPeople.filter((r) => r && typeof r.name === 'string' && r.name.trim()), cleanPerson);
       parts = {
         people: clean.map((r) => ({ ...r, id: r.id || uid() })),
-        events: (Array.isArray(rawEvents) ? rawEvents : []).filter((e) => e && e.title && e.date),
-        reminders: (Array.isArray(rawReminders) ? rawReminders : [])
-          .filter((r) => r && r.title && r.next)
+        events: cleanAll((Array.isArray(rawEvents) ? rawEvents : []).filter((e) => e && e.title && e.date), cleanEvent),
+        reminders: cleanAll((Array.isArray(rawReminders) ? rawReminders : []).filter((r) => r && r.title && r.next), cleanReminder)
           .map((r) => ({ ...r, id: r.id || uid() })),
         collections: cleanCollections(rawCollections),
       };

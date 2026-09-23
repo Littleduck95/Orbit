@@ -430,3 +430,87 @@ describe('lists', () => {
     assert.equal(A.importOverflow([full], more, 'replace'), 0);
   });
 });
+
+describe('repairing saved data', () => {
+  const fullPerson = {
+    id: 'p1', addedOn: '2026-01-02', name: 'Dana', circle: 'work', tier: 'friend', role: 'Ops', company: 'Ardent',
+    hobbies: 'x', aka: ['Dee'], kids: ['Ellie (7)'], email: 'd@e.co', paused: false, families: ['Boyer family'], relation: 'Sister',
+    groups: ['Climbing'], partner: { name: 'Sam', status: 'Married' }, cadence: 0, birthday: '1990-03-05', age: null, ageAsOf: null,
+    dates: [{ kind: 'Other', label: 'Piano', date: '2020-01-01' }], phone: '816', address: '1 Elm', socials: { instagram: 'dana' },
+    note: 'n', lastContact: '2026-09-01', log: [{ date: '2026-09-01', text: 'Lunch' }], vip: true, child: false,
+  };
+  const fullEvent = { id: 'e1', addedOn: '2026-01-01', date: '2026-06-03', endDate: null, title: 'Trip', kind: 'Trip', note: '', people: ['p1'], place: 'Denver', lat: 39.7, lon: -104.9 };
+  const fullReminder = { id: 'r1', addedOn: '2026-01-01', title: 'Card', kind: 'Money', every: { unit: 'month', n: 1, dom: 15 }, anchor: 'date',
+    next: '2026-10-15', lead: 3, note: '', people: ['p1'], history: [{ date: '2026-09-15' }], lastDone: '2026-09-15', paused: false, done: false };
+
+  it('hands back well-formed records as the very same object', () => {
+    for (const [clean, rec] of [[A.cleanPerson, fullPerson], [A.cleanEvent, fullEvent], [A.cleanReminder, fullReminder]]) {
+      assert.equal(clean(rec), rec);
+    }
+    const minimal = { id: 'a', name: 'Minimal' };
+    assert.equal(A.cleanPerson(minimal), minimal, 'missing optional fields are not added');
+    const falsy = { id: 'b', name: 'F', log: null, families: '', socials: null, partner: null, birthday: null, lastContact: null };
+    assert.equal(A.cleanPerson(falsy), falsy, 'empty values the app already handles are left alone');
+  });
+
+  it('repairs only the fields of the wrong shape', () => {
+    const bad = { ...fullPerson, log: 'oops', families: 'Boyer', aka: ['ok', 7, { x: 1 }], note: { t: 1 }, birthday: 19900305,
+      socials: { instagram: 42, x: {} }, partner: 'Sam', dates: [null, { kind: {}, date: '2020-01-01' }, 'x'] };
+    const out = A.cleanPerson(bad);
+    assert.notEqual(out, bad);
+    assert.deepEqual(out.log, []);
+    assert.deepEqual(out.families, []);
+    assert.deepEqual(out.aka, ['ok', '7']);
+    assert.equal(out.note, '');
+    assert.equal(out.birthday, '19900305');
+    assert.deepEqual(out.socials, { instagram: '42', x: '' });
+    assert.equal(out.partner, null);
+    assert.deepEqual(out.dates, [{ kind: '', date: '2020-01-01' }]);
+    for (const k of ['id', 'name', 'company', 'cadence', 'vip', 'groups', 'kids', 'email']) assert.deepEqual(out[k], bad[k], k);
+    assert.equal(bad.log, 'oops', 'the input is not modified');
+    assert.equal(A.cleanPerson({ id: 'n' }).name, '', 'a person with no name gets an empty one');
+    assert.deepEqual(A.cleanEvent({ ...fullEvent, lat: '39.7', people: 'x', title: 5 }),
+      { ...fullEvent, lat: null, people: [], title: '5' });
+    assert.deepEqual(A.cleanReminder({ ...fullReminder, every: 'monthly', history: [3, { date: {} }] }),
+      { ...fullReminder, every: null, history: [{ date: '' }] });
+  });
+
+  it('keeps every record of a list it can use, dropping only what is not a record', () => {
+    assert.deepEqual(A.cleanAll([fullPerson, null, 'x', 3, [], fullPerson], A.cleanPerson), [fullPerson, fullPerson]);
+    assert.deepEqual(A.cleanAll({ not: 'a list' }, A.cleanPerson), []);
+    assert.deepEqual(A.cleanAll(undefined, A.cleanEvent), []);
+  });
+
+  it('never throws, always yields drawable shapes, and never touches other fields (fuzzed)', () => {
+    let seed = 7;
+    const rnd = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; };
+    // Values JSON can hold (these only ever see parsed JSON), plus NaN, which a
+    // CSV import can leave in memory.
+    const junk = () => [undefined, null, '', 0, 1, -3.5, NaN, true, false, 'text', '2026-01-01', [], ['a', 1, null, {}],
+      {}, { date: 5 }, { a: [1] }][Math.floor(rnd() * 16)];
+    const people = ['name', 'role', 'company', 'hobbies', 'email', 'phone', 'address', 'note', 'relation', 'birthday',
+      'lastContact', 'addedOn', 'ageAsOf', 'aka', 'kids', 'families', 'groups', 'log', 'dates', 'socials', 'partner'];
+    const drawable = (v) => v == null || typeof v === 'string' || v === false || v === 0 || Number.isNaN(v);
+    for (let i = 0; i < 3000; i += 1) {
+      const rec = { id: `z${i}`, extra: { keep: i }, cadence: junk() };
+      people.forEach((k) => { if (rnd() < 0.7) rec[k] = junk(); });
+      const out = A.cleanPerson(rec);
+      assert.equal(out.extra, rec.extra, 'fields outside the fix list are untouched');
+      assert.equal(out.cadence, rec.cadence);
+      for (const k of ['role', 'company', 'hobbies', 'email', 'phone', 'address', 'note', 'relation', 'birthday', 'lastContact', 'addedOn', 'ageAsOf']) {
+        assert.ok(drawable(out[k]), `${k}: ${String(out[k])}`);
+      }
+      assert.equal(typeof out.name, 'string');
+      for (const k of ['aka', 'kids', 'families', 'groups']) assert.ok(!out[k] || (Array.isArray(out[k]) && out[k].every((x) => typeof x === 'string')), k);
+      for (const k of ['log', 'dates']) assert.ok(!out[k] || (Array.isArray(out[k]) && out[k].every((e) => e && typeof e === 'object' && drawable(e.date))), k);
+      assert.ok(!out.socials || Object.values(out.socials).every((v) => drawable(v)));
+      assert.ok(!out.partner || (typeof out.partner === 'object' && drawable(out.partner.name)));
+      assert.equal(A.cleanPerson(out), out, 'repairing twice changes nothing');
+      // And the code that used to crash on these shapes now runs.
+      A.withLog(out, out.log || []);
+      A.buildUpcoming([out], [], []);
+      A.buildRecap([out], 2026);
+      A.status(out);
+    }
+  });
+});
