@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 // What happens when things go wrong: a browser that refuses to save, stored
 // data that cannot be read, and a backup with the wrong shape inside it.
 // Most checks here are "CURRENT:" — they record risks the audit flagged.
@@ -91,5 +92,33 @@ export default async function failures({ newPage, check }) {
     check('a saved person with a history that is not a list loads, with everyone else',
       (await page.locator('.crm-person').count()) === 2 && problems.length === 0, problems);
     await done();
+  }
+
+  // ---- H1: any other crash shows a way out, with the data intact ----
+  {
+    const people = [{ id: 'a', name: 'Ann Boyer', circle: 'friend', tier: 'friend', cadence: 30, birthday: '1990-10-02', log: [] }];
+    const { page, open, done } = await newPage({ seed: { 'crm-people-v1': people, 'crm-theme-v1': 'orbit' } });
+    await open();
+    const before = await page.evaluate(() => ({ ...localStorage }));
+    // Break something the app calls while drawing, then make it redraw.
+    await page.evaluate(() => { Date.prototype.getFullYear = () => { throw new Error('planted crash'); }; });
+    await page.getByRole('button', { name: 'Mark Ann Boyer as a VIP' }).click();
+    await page.waitForSelector('text=Orbit hit a problem showing your data');
+    check('a crash shows the recovery screen instead of a blank page',
+      await page.getByRole('alert').isVisible() && await page.getByText('Nothing you saved has been deleted.').isVisible());
+    check('it says what went wrong, folded away', (await page.locator('details pre').textContent()).includes('planted crash')
+      && !(await page.locator('details').evaluate((d) => d.open)));
+    const [dl] = await Promise.all([page.waitForEvent('download'), page.getByRole('button', { name: 'Download a copy' }).click()]);
+    const copy = JSON.parse(fs.readFileSync(await dl.path(), 'utf8'));
+    const after = await page.evaluate(() => ({ ...localStorage }));
+    check('the copy holds every saved value exactly as stored', Object.keys(copy).length > 0
+      && Object.entries(copy).every(([k, v]) => after[`orbit:${k}`] === v) && copy['crm-theme-v1'] === 'orbit');
+    check('the recovery screen changes nothing that was saved, beyond the tap that crashed',
+      Object.keys(after).sort().join() === Object.keys(before).sort().join()
+        && JSON.parse(after['orbit:crm-people-v1'])[0].vip === true);
+    await page.getByRole('button', { name: 'Try again' }).click();
+    await page.waitForSelector('button:has-text("Recap")');
+    check('Try again reloads into a working app', (await page.locator('.crm-person').count()) === 1);
+    await done({ allow: /planted crash|error occurred in the|above error occurred|React will try to recreate/ });
   }
 }

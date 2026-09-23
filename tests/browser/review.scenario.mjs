@@ -106,9 +106,9 @@ export default async function review({ newPage, check, shots }) {
     await page.getByRole('button', { name: 'Events', exact: true }).click();
     await page.getByRole('button', { name: 'Edit', exact: true }).click();
     await page.waitForTimeout(300);
-    check('CURRENT: editing an event with a latitude but no longitude blanks the app',
-      (await page.locator('#root').innerHTML()) === '' && problems.some((p) => /toFixed/.test(p)), problems);
-    await done({ allow: /toFixed|error occurred in the|above error occurred/ });
+    check('CURRENT: editing an event with a latitude but no longitude crashes (the recovery screen now catches it)',
+      await page.getByText('Orbit hit a problem showing your data').isVisible() && problems.some((p) => /toFixed/.test(p)), problems);
+    await done({ allow: /toFixed|error occurred in the|above error occurred|React will try to recreate/ });
   }
 
   // ---- restored events without ids ----

@@ -42,6 +42,7 @@ installed copy, or says plainly that there is none.
 index.html            page shell, mounts #root
 src/main.jsx          entry point — installs the storage shim, renders the app
 src/storage.js        window.storage shim backed by localStorage
+src/Recovery.jsx      shown instead of a blank page if drawing ever fails
 src/PersonalCRM.jsx   the app
 tests/                characterization tests (logic, storage, browser)
 vite.config.js        build config
