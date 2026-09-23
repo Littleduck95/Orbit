@@ -34,3 +34,7 @@ create policy "orbit_data: remove own" on public.orbit_data
 -- Signed-out visitors get nothing at all, not even an empty table.
 revoke all on public.orbit_data from anon;
 grant select, insert, update, delete on public.orbit_data to authenticated;
+
+-- Tell the API about the table now. Without this it can briefly answer
+-- "Could not find the table 'public.orbit_data' in the schema cache".
+notify pgrst, 'reload schema';
