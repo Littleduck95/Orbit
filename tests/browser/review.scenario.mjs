@@ -104,18 +104,21 @@ export default async function review({ newPage, check, shots }) {
     await done();
   }
 
-  // ---- an event with a latitude but no longitude ----
+  // ---- fixed (M2): an event with a latitude but no longitude ----
   {
-    const { page, open, problems, done } = await newPage({
+    const { page, open, stored, problems, done } = await newPage({
       seed: { 'crm-events-v1': [{ id: 'g', title: 'Half pinned', date: '2026-05-01', lat: 39.1, lon: null, people: [] }] },
     });
     await open();
     await page.getByRole('button', { name: 'Events', exact: true }).click();
     await page.getByRole('button', { name: 'Edit', exact: true }).click();
-    await page.waitForTimeout(300);
-    check('CURRENT: editing an event with a latitude but no longitude crashes (the recovery screen now catches it)',
-      await page.getByText('Orbit hit a problem showing your data').isVisible() && problems.some((p) => /toFixed/.test(p)), problems);
-    await done({ allow: /toFixed|error occurred in the|above error occurred|React will try to recreate/ });
+    check('editing an event with only a latitude opens, showing it as not pinned',
+      await page.getByText('Optional. Hit Find to drop a pin, or leave it as plain text.').isVisible() && problems.length === 0, problems);
+    await page.getByLabel('What happened').fill('Half pinned, edited');
+    await page.getByRole('button', { name: 'Save changes' }).click();
+    const ev = (await stored('crm-events-v1'))[0];
+    check('and saves, with the lone half cleared', ev.title === 'Half pinned, edited' && ev.lat === null && ev.lon === null, ev);
+    await done();
   }
 
   // ---- restored events without ids ----

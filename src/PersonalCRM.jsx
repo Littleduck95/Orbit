@@ -2707,7 +2707,10 @@ function EventForm({ initial, people, onSave, onCancel }) {
   const [who, setWho] = useState(initial?.people || []);
   const [place, setPlace] = useState(initial?.place || '');
   const [coords, setCoords] = useState(
-    initial?.lat != null ? { lat: initial.lat, lon: initial.lon } : null);
+    // A pin needs both halves. One on its own (a sheet with only a latitude
+    // column) counts as no pin, rather than being drawn and crashing on the
+    // missing half.
+    typeof initial?.lat === 'number' && typeof initial?.lon === 'number' ? { lat: initial.lat, lon: initial.lon } : null);
   const [looking, setLooking] = useState('');
   const [hits, setHits] = useState([]);
   const [manual, setManual] = useState(false);
