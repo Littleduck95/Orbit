@@ -140,8 +140,29 @@ const elapsed = (d) => {
   return `${y} years`;
 };
 
-const prettyDate = (s) =>
-  parseDate(s).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+// toLocaleDateString builds a new formatter on every call, which is slow enough
+// to matter across a few hundred events, so each one here is built once, on
+// first use (building the first costs ~10ms, so not at load). They format in
+// UTC a date made from the local calendar day, which shows the same day
+// toLocaleDateString would, even if the computer's timezone changes while the
+// app is open.
+const DAY_OPTIONS = {
+  full: { month: 'short', day: 'numeric', year: 'numeric' },
+  monthDay: { month: 'short', day: 'numeric' },
+  birthday: { month: 'long', day: 'numeric' },
+};
+const dayFormats = {};
+
+const formatDay = (d, format) => {
+  if (Number.isNaN(d.getTime())) return 'Invalid Date';
+  if (!dayFormats[format]) dayFormats[format] = new Intl.DateTimeFormat(undefined, { ...DAY_OPTIONS[format], timeZone: 'UTC' });
+  // setUTCFullYear, not Date.UTC, which would read years 0-99 as 1900-1999.
+  const utc = new Date(Date.UTC(2000, 0, 1, 12));
+  utc.setUTCFullYear(d.getFullYear(), d.getMonth(), d.getDate());
+  return dayFormats[format].format(utc);
+};
+
+const prettyDate = (s) => formatDay(parseDate(s), 'full');
 
 // Calendar years, not days/365 — averaging makes exactly two years floor to one.
 const yearsSince = (d) => {
@@ -185,8 +206,7 @@ const ageOf = (p) => {
   return null;
 };
 
-const prettyBirthday = (s) =>
-  parseDate(s).toLocaleDateString(undefined, { month: 'long', day: 'numeric' });
+const prettyBirthday = (s) => formatDay(parseDate(s), 'birthday');
 
 const daysToBirthday = (s) => {
   if (!s) return null;
@@ -2685,16 +2705,14 @@ const eventWhen = (e) => {
   const a = parseDate(e.date);
   const b = parseDate(end);
   const days = Math.round((b - a) / 86400000) + 1;
-  const md = { month: 'short', day: 'numeric' };
-  const full = { month: 'short', day: 'numeric', year: 'numeric' };
 
   let text;
   if (a.getFullYear() !== b.getFullYear()) {
-    text = `${a.toLocaleDateString(undefined, full)} – ${b.toLocaleDateString(undefined, full)}`;
+    text = `${formatDay(a, 'full')} – ${formatDay(b, 'full')}`;
   } else if (a.getMonth() === b.getMonth()) {
-    text = `${a.toLocaleDateString(undefined, md)}–${b.getDate()}, ${a.getFullYear()}`;
+    text = `${formatDay(a, 'monthDay')}–${b.getDate()}, ${a.getFullYear()}`;
   } else {
-    text = `${a.toLocaleDateString(undefined, md)} – ${b.toLocaleDateString(undefined, md)}, ${a.getFullYear()}`;
+    text = `${formatDay(a, 'monthDay')} – ${formatDay(b, 'monthDay')}, ${a.getFullYear()}`;
   }
   return { text, days };
 };
@@ -2933,6 +2951,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
 function EventCard({ e, people, onPerson, onEdit, onRemove }) {
   const [confirm, setConfirm] = useState(false);
   const attended = (e.people || []).map((id) => people.find((x) => x.id === id)).filter(Boolean);
+  const when = eventWhen(e);
 
   return (
     <div style={{ display: 'flex', gap: 13 }}>
@@ -2943,9 +2962,9 @@ function EventCard({ e, people, onPerson, onEdit, onRemove }) {
 
       <div style={{ flex: 1, minWidth: 0, paddingBottom: 22 }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 9, flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 12.5, color: C.faint }}>{eventWhen(e).text}</span>
-          {eventWhen(e).days > 1 && (
-            <span style={{ fontSize: 12, color: C.faint }}>{eventWhen(e).days} days</span>
+          <span style={{ fontSize: 12.5, color: C.faint }}>{when.text}</span>
+          {when.days > 1 && (
+            <span style={{ fontSize: 12, color: C.faint }}>{when.days} days</span>
           )}
           {e.kind && (
             <span style={{
