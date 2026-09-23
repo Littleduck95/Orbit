@@ -7,17 +7,30 @@ import path from 'node:path';
 const person = (id, name, over = {}) => ({ id, name, circle: 'friend', tier: 'friend', cadence: 30, log: [], ...over });
 
 export default async function review({ newPage, check, shots }) {
-  // ---- the detail panel keeps one person's half-finished actions for the next ----
+  // ---- fixed (H3): the detail panel starts fresh for each person ----
   {
-    const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [person('a', 'Alice Ames'), person('b', 'Bob Byrne')] } });
+    const { page, open, stored, done } = await newPage({ seed: { 'crm-people-v1': [
+      person('a', 'Alice Ames', { log: [{ date: '2026-09-01', text: 'Alice note' }], lastContact: '2026-09-01' }),
+      person('b', 'Bob Byrne', { log: [{ date: '2026-08-01', text: 'Bob note' }], lastContact: '2026-08-01' }),
+    ] } });
     await open();
     await page.locator('.crm-person .crm-row', { hasText: 'Alice Ames' }).click();
     await page.getByRole('button', { name: 'Remove', exact: true }).click();
     await page.locator('.crm-person .crm-row', { hasText: 'Bob Byrne' }).click();
-    const armed = await page.getByRole('button', { name: 'Tap again to remove' }).isVisible();
-    check('CURRENT: arming Remove on one person leaves it armed on the next person opened', armed);
-    await page.getByRole('button', { name: 'Tap again to remove' }).click();
-    check('CURRENT: so a single tap then removes the second person', !(await stored('crm-people-v1')).some((p) => p.id === 'b'));
+    check('an armed Remove does not carry over to the next person opened',
+      await page.getByRole('button', { name: 'Remove', exact: true }).isVisible()
+        && !(await page.getByRole('button', { name: 'Tap again to remove' }).isVisible()));
+    await page.getByRole('button', { name: 'Remove', exact: true }).click();
+    check('so one tap on the next person only arms it', (await stored('crm-people-v1')).some((p) => p.id === 'b'));
+
+    await page.locator('.crm-person .crm-row', { hasText: 'Alice Ames' }).click();
+    await page.getByRole('button', { name: /Alice note/ }).click();
+    await page.getByPlaceholder('What came up?').fill('Typed for Alice');
+    await page.locator('.crm-person .crm-row', { hasText: 'Bob Byrne' }).click();
+    check('an open catch-up edit does not carry over either', (await page.getByPlaceholder('What came up?').count()) === 0);
+    const after = await stored('crm-people-v1');
+    check('and nothing typed for one person lands in another\'s history',
+      after.find((p) => p.id === 'b').log[0].text === 'Bob note' && after.find((p) => p.id === 'a').log[0].text === 'Alice note');
     await done();
   }
 

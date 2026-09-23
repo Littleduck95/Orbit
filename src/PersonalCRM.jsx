@@ -5900,7 +5900,11 @@ export default function PersonalCRM() {
           )}
 
           {!adding && !editing && selectedPerson && (
+            // Keyed on the person, so a half-finished action (an armed
+            // Remove, an open catch-up edit) never carries over to whoever
+            // is opened next.
             <PersonDetail
+              key={selectedPerson.id}
               p={selectedPerson}
               myEvents={events
                 .filter((e) => (e.people || []).includes(selectedPerson.id))
