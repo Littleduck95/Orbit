@@ -1,5 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, memo } from 'react';
 import Papa from 'papaparse';
+import { KINDS, deviceTimeZone, pushSupport } from './notifications.js';
 import {
   MIN_PASSWORD, PROFILE_FIELDS, SOCIAL_KEYS, VISIBILITY, birthdayProblem, cleanUsername, displayNameProblem, emailProblem,
   passwordProblem, seenAs, usernameProblem, visibilityOf,
@@ -6085,7 +6086,182 @@ function FriendsView({ account, startWith, onStarted, onSaveToPeople, onCount, o
   );
 }
 
-function SettingsView({ account, onClose }) {
+/* ---------- settings: preferences ---------- */
+const START_KEY = 'crm-start-v1';
+const START_VIEWS = [['list', 'People'], ['events', 'Events'], ['reminders', 'Reminders'], ['collections', 'Lists'], ['map', 'Map'], ['recap', 'Recap']];
+const hourLabel = (h) => `${h % 12 === 0 ? 12 : h % 12}${h < 12 ? 'am' : 'pm'}`;
+const HOURS = Array.from({ length: 24 }, (_, h) => [h, hourLabel(h)]);
+const BIRTHDAY_LEADS = [[0, 'On the day'], [1, 'The day before'], [3, '3 days before'], [7, 'A week before'], [14, 'Two weeks before']];
+
+const PUSH_WHY = {
+  unset: 'Push is not set up for Orbit yet.',
+  unsupported: 'This browser cannot get push notifications. Try Chrome, Edge, Firefox or Safari.',
+  install: 'On iPhone and iPad, add Orbit to your Home Screen first: tap Share, then Add to Home Screen, and open Orbit from there.',
+  denied: 'Notifications are blocked for Orbit in this browser. Allow them in the browser’s site settings, then come back.',
+};
+
+function PreferencesSettings({ account, theme, onTheme, start, onStart }) {
+  const api = account?.notifications;
+  const [prefs, setPrefs] = useState(null);
+  const [device, setDevice] = useState(null);
+  const [support] = useState(() => pushSupport());
+  const [busy, setBusy] = useState('');
+  const [problem, setProblem] = useState('');
+  const [said, setSaid] = useState('');
+  const here = deviceTimeZone();
+
+  useEffect(() => {
+    if (!api) return undefined;
+    let live = true;
+    api.load().then((p) => { if (live) setPrefs(p); }, (err) => { if (live) { setPrefs(false); setProblem(err.message); } });
+    api.deviceOn().then((on) => { if (live) setDevice(on); }, () => { if (live) setDevice(false); });
+    return () => { live = false; };
+  }, [api]);
+
+  const set = (k, v) => { setPrefs({ ...prefs, [k]: v }); setSaid(''); };
+  const doing = async (what, fn, done) => {
+    setBusy(what);
+    setProblem('');
+    setSaid('');
+    try {
+      await fn();
+      if (done) setSaid(done);
+    } catch (err) {
+      setProblem(err?.message || 'That did not work. Try again.');
+    } finally {
+      setBusy('');
+    }
+  };
+  const save = (next = prefs, done = 'Saved.') => doing('save', () => api.save(next), done);
+
+  const site = (
+    <div style={settingsCard()}>
+      <p style={settingsHead}>This site</p>
+      <Group label="Theme">
+        <div style={{ display: 'flex', gap: 8 }}>
+          {[['daylight', 'Daylight'], ['orbit', 'Orbit']].map(([v, l]) => (
+            <button key={v} className="crm-btn" aria-pressed={theme === v} onClick={() => onTheme(v)} style={segment(theme === v)}>{l}</button>
+          ))}
+        </div>
+      </Group>
+      <Field label="Open Orbit on">
+        <select className="crm-select" value={start} onChange={(e) => onStart(e.target.value)} style={{ ...inputStyle, minHeight: 38, fontSize: 14 }}>
+          {START_VIEWS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+        </select>
+      </Field>
+    </div>
+  );
+  if (!api) return site;
+
+  const notes = (
+    <>
+      {problem && <p role="alert" style={{ margin: '10px 0 0', fontSize: 13, color: C.overdue, lineHeight: 1.5 }}>{problem}</p>}
+      <p aria-live="polite" style={{ margin: said ? '10px 0 0' : 0, fontSize: 13, color: C.calmText, lineHeight: 1.5 }}>{said}</p>
+    </>
+  );
+  if (prefs === null) return <>{site}<p style={{ fontSize: 13.5, color: C.muted }}>Loading your notification settings…</p></>;
+  if (prefs === false) return <>{site}<div style={settingsCard()}><p style={settingsHead}>Notifications</p>{notes}</div></>;
+
+  const sel = (label, value, options, onChange) => (
+    <select className="crm-select" aria-label={label} value={value ?? ''} onChange={(e) => onChange(e.target.value)}
+      style={{ ...inputStyle, width: 'auto', minHeight: 36, padding: '5px 30px 5px 10px', fontSize: 13.5 }}>
+      {options.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+    </select>
+  );
+  const quietOn = prefs.quiet_start != null && prefs.quiet_end != null;
+
+  return (
+    <div>
+      {site}
+      <div style={settingsCard()}>
+        <p style={settingsHead}>Notifications</p>
+
+        <p style={{ margin: '0 0 6px', fontSize: 14, fontWeight: 600, color: C.ink }}>Push on this device</p>
+        {!support.ok ? (
+          <p style={{ margin: '0 0 12px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>{PUSH_WHY[support.why]}</p>
+        ) : (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+            <span style={{ fontSize: 13, color: device ? C.calmText : C.muted }}>{device === null ? 'Checking…' : device ? 'On for this device.' : 'Off for this device.'}</span>
+            {device ? (
+              <>
+                <Button style={small} onClick={() => doing('test', async () => { await api.test(); }, 'Sent. It should appear in a moment.')}>
+                  {busy === 'test' ? 'Sending…' : 'Send a test'}
+                </Button>
+                <Button style={small} onClick={() => doing('off', async () => { await api.disableDevice(); setDevice(false); }, 'Push is off for this device.')}>Turn off</Button>
+              </>
+            ) : (
+              <Button kind="solid" style={small} onClick={() => doing('on', async () => {
+                await api.enableDevice();
+                setDevice(true);
+                const next = { ...prefs, push: true, time_zone: prefs.time_zone === 'UTC' ? here : prefs.time_zone };
+                setPrefs(next);
+                await api.save(next);
+              }, 'Push is on for this device.')}>{busy === 'on' ? 'Turning on…' : 'Turn on'}</Button>
+            )}
+          </div>
+        )}
+        {device !== null && (
+          <Check on={prefs.push} onChange={(v) => set('push', v)} label="Send push notifications"
+            hint="To every device where you turned them on. Off pauses them everywhere." />
+        )}
+
+        <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12, marginTop: 4 }}>
+          <Check on={prefs.email} onChange={(v) => set('email', v)} label={`Email me a digest at ${account.email}`}
+            hint="A list of what is coming up. Only sent when there is something in it." />
+          {prefs.email && (
+            <div style={{ margin: '-4px 0 12px 26px' }}>
+              {sel('How often', prefs.email_every, [['daily', 'Every day'], ['weekly', 'Every Monday, for the week ahead']], (v) => set('email_every', v))}
+            </div>
+          )}
+        </div>
+
+        <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12, marginTop: 4 }}>
+          <p style={{ margin: '0 0 10px', fontSize: 14, fontWeight: 600, color: C.ink }}>What to hear about</p>
+          {KINDS.map(([k, label, hint]) => (
+            <div key={k}>
+              <Check on={prefs.kinds[k] !== false} onChange={(v) => set('kinds', { ...prefs.kinds, [k]: v })} label={label} hint={hint} />
+              {k === 'birthdays' && prefs.kinds.birthdays !== false && (
+                <div style={{ margin: '-4px 0 12px 26px' }}>
+                  {sel('When to hear about birthdays', prefs.birthday_days, BIRTHDAY_LEADS, (v) => set('birthday_days', Number(v)))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12, marginTop: 4 }}>
+          <p style={{ margin: '0 0 10px', fontSize: 14, fontWeight: 600, color: C.ink }}>When</p>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', fontSize: 13.5, color: C.ink, marginBottom: 10 }}>
+            Each day at {sel('Time of day', prefs.send_hour, HOURS, (v) => set('send_hour', Number(v)))}
+          </div>
+          <Check on={quietOn} onChange={(v) => setPrefs({ ...prefs, quiet_start: v ? 22 : null, quiet_end: v ? 7 : null })}
+            label="Quiet hours" hint="No friend request pushes in this window; they wait until it ends." />
+          {quietOn && (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', margin: '-4px 0 12px 26px', fontSize: 13, color: C.muted }}>
+              From {sel('Quiet from', prefs.quiet_start, HOURS, (v) => set('quiet_start', Number(v)))}
+              to {sel('Quiet until', prefs.quiet_end, HOURS, (v) => set('quiet_end', Number(v)))}
+            </div>
+          )}
+          <p style={{ margin: 0, fontSize: 12.5, color: C.faint, lineHeight: 1.5 }}>
+            Times are in {prefs.time_zone}.{' '}
+            {prefs.time_zone !== here && (
+              <button className="crm-btn" onClick={() => set('time_zone', here)} style={{
+                font: 'inherit', color: C.muted, background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textDecoration: 'underline',
+              }}>Use {here}, where this device is</button>
+            )}
+          </p>
+        </div>
+
+        <div style={{ marginTop: 14 }}>
+          <Button kind="solid" onClick={busy ? undefined : () => save()}>{busy === 'save' ? 'Saving…' : 'Save'}</Button>
+        </div>
+        {notes}
+      </div>
+    </div>
+  );
+}
+
+function SettingsView({ account, theme, onTheme, start, onStart, onClose }) {
   const [tab, setTab] = useState('account');
   return (
     <div style={{ maxWidth: 620 }}>
@@ -6095,16 +6271,19 @@ function SettingsView({ account, onClose }) {
       </div>
       {account && (
         <div role="group" aria-label="Settings section" style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
-          {[['account', 'Account'], ['profile', 'Profile']].map(([v, l]) => (
+          {[['account', 'Account'], ['profile', 'Profile'], ['prefs', 'Preferences']].map(([v, l]) => (
             <button key={v} className="crm-btn" aria-pressed={tab === v} onClick={() => setTab(v)} style={filterChip(tab === v)}>{l}</button>
           ))}
         </div>
       )}
-      {account ? (tab === 'profile' ? <ProfileSettings account={account} /> : <AccountSettings account={account} />) : (
+      {!account && (
         <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
           This copy of Orbit has no accounts switched on, so everything is saved in this browser only.
         </p>
       )}
+      {account && tab === 'account' && <AccountSettings account={account} />}
+      {account && tab === 'profile' && <ProfileSettings account={account} />}
+      {(!account || tab === 'prefs') && <PreferencesSettings account={account} theme={theme} onTheme={onTheme} start={start} onStart={onStart} />}
     </div>
   );
 }
@@ -6457,6 +6636,8 @@ export default function PersonalCRM({ account = null } = {}) {
   const [owner, setOwner] = useState('');
   const [namingOwner, setNamingOwner] = useState(false);
   const [view, setView] = useState('list');
+  // Where Orbit opens, as chosen in Settings.
+  const [startView, setStartView] = useState('list');
   const [events, setEvents] = useState([]);
   const [eventDraft, setEventDraft] = useState(null);
   const [reminders, setReminders] = useState([]);
@@ -6525,6 +6706,16 @@ export default function PersonalCRM({ account = null } = {}) {
         if (o?.value) setOwner(o.value);
       } catch {
         /* first run — nothing saved yet */
+      }
+      try {
+        const st = await window.storage.get(START_KEY);
+        if (st?.value && START_VIEWS.some(([v]) => v === st.value)) {
+          setStartView(st.value);
+          // Only if nothing else (a shared link, a friend code) has opened a screen.
+          setView((v) => (v === 'list' ? st.value : v));
+        }
+      } catch {
+        /* People, as always */
       }
       setLoading(false);
     })();
@@ -6829,6 +7020,11 @@ export default function PersonalCRM({ account = null } = {}) {
     applyTheme(name);
     setTheme(name);
     try { await window.storage.set(THEME_KEY, name); } catch { /* not fatal */ }
+  };
+
+  const pickStart = async (v) => {
+    setStartView(v);
+    try { await window.storage.set(START_KEY, v); } catch { /* not fatal */ }
   };
 
   const saveOwner = async (v) => {
@@ -7326,7 +7522,8 @@ export default function PersonalCRM({ account = null } = {}) {
 
         {view === 'settings' && (
           <div className="crm-full">
-            <SettingsView account={account} onClose={() => setView('list')} />
+            <SettingsView account={account} theme={theme} onTheme={pickTheme} start={startView} onStart={pickStart}
+              onClose={() => setView('list')} />
           </div>
         )}
 

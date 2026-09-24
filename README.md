@@ -28,6 +28,7 @@ Then open http://localhost:5173.
 | `npm run test:browser` | Drives the real app in Chromium; needs Playwright installed |
 | `npm run test:account` | Drives sign-in in Chromium against a stand-in for Supabase; needs Playwright |
 | `npm run test:db` | Runs `supabase/schema.sql` on a throwaway PostgreSQL and checks its security rules; needs PostgreSQL installed |
+| `npm run test:notify` | Tests the notify function under Deno (fetched by npx), including a real encrypted push |
 
 The tests are characterization tests: they pin down what the app does today,
 with the clock, timezone and locale fixed so dates are repeatable. Checks whose
@@ -233,6 +234,33 @@ The database decides what each viewer receives: profiles are only read
 through functions that apply those settings, and friendships and blocks are
 only changed through functions that check who is asking.
 
+### Preferences and notifications
+
+**Settings → Preferences** holds the theme, which tab Orbit opens on, and
+notifications:
+
+- **Push**, per device: **Turn on** asks the browser's permission and signs
+  this device up; **Send a test** checks it end to end. iPhones and iPads only
+  allow push once Orbit is on the Home Screen (Share → Add to Home Screen),
+  and the screen says so. A manifest and icons make Orbit installable, and a
+  service worker (`public/sw.js`) shows pushes while Orbit is closed. It
+  caches nothing.
+- **Email digest**, daily or on Mondays for the week ahead, only when there
+  is something in it.
+- **What**: birthdays (on the day, or up to two weeks before), reminders (when
+  they come into view and when due), check-ins falling overdue, events (the
+  day before and the day of), and friend requests.
+- **When**: an hour of the day in the person's own time zone, and quiet hours
+  that hold friend request pushes until they end.
+
+The sending is done by `supabase/functions/notify`, a Supabase Edge Function
+called hourly by a scheduled job (`supabase/notifications-cron.sql`). For each
+person whose hour it is, it reads their saved Orbit, works out what is due,
+sends one push to each of their devices and or one email, and logs each item
+so it never goes twice. Devices the push service reports gone are dropped.
+`npm run test:notify` runs its tests under Deno, including a real encrypted
+push to a stand-in push service, decrypted as a device would.
+
 ### Setting up the Supabase project
 
 Done once, in the [Supabase dashboard](https://supabase.com/dashboard):
@@ -248,7 +276,8 @@ Done once, in the [Supabase dashboard](https://supabase.com/dashboard):
 3. **Email links** work out of the box. Supabase's built-in email is heavily
    rate-limited (a few emails an hour) and meant for trying things out; for
    real use, add an SMTP provider under Authentication → Emails → SMTP Settings.
-4. **Google.** In [Google Cloud Console](https://console.cloud.google.com/)
+4. **Notifications.** See *Setting up notifications* below.
+5. **Google.** In [Google Cloud Console](https://console.cloud.google.com/)
    → APIs & Services: set up the OAuth consent screen, then Credentials →
    Create credentials → OAuth client ID → *Web application*. Under *Authorized
    redirect URIs* add
@@ -322,3 +351,23 @@ harmless and left alone so the file stays as it was written:
 - A `useMemo` is flagged for not listing `ofCircle` in its deps. `ofCircle`
   only closes over `people`, which *is* in the dep array, so the memo is
   correct as written.
+
+### Setting up notifications
+
+1. Run `supabase/schema.sql` again (it adds the notification tables), and
+   `supabase/check.sql` to confirm every line says OK.
+2. Edge Functions → Deploy a new function → Via Editor. Name it `notify`,
+   paste `supabase/functions/notify/index.ts`, and deploy. In its settings,
+   turn **off** "Enforce JWT verification": the hourly job signs its calls
+   with CRON_SECRET, and test pushes check the signed-in person themselves.
+3. Edge Functions → Secrets: add `VAPID_PUBLIC_KEY` (the same value as
+   `VITE_VAPID_PUBLIC_KEY` in `.env`), `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`
+   (`mailto:` and your email) and `CRON_SECRET` (long random text). The
+   private key never goes in the repo. A new pair can be made with
+   `npx web-push generate-vapid-keys`; the public half then replaces the one
+   in `.env`, and everyone turns push on again.
+4. SQL Editor: run `supabase/notifications-cron.sql` with `CRON_SECRET`
+   replaced by the same value.
+5. For email: make a [Resend](https://resend.com) account and add secrets
+   `RESEND_API_KEY` and `EMAIL_FROM`. Until a domain you own is verified with
+   Resend, it only delivers to the address you signed up to Resend with.
