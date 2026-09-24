@@ -1,5 +1,8 @@
 import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, memo } from 'react';
 import Papa from 'papaparse';
+import {
+  MIN_PASSWORD, birthdayProblem, cleanUsername, displayNameProblem, emailProblem, passwordProblem, usernameProblem,
+} from './accountApi.js';
 
 /* ---------- palette ---------- */
 const THEMES = {
@@ -5524,6 +5527,172 @@ function MapView({ events, people }) {
   );
 }
 
+/* ---------- settings ---------- */
+const settingsCard = () => ({
+  background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '15px 15px 14px', marginBottom: 16,
+});
+const settingsHead = { margin: '0 0 10px', fontSize: 12, fontWeight: 600, color: C.faint, textTransform: 'uppercase', letterSpacing: '0.06em' };
+const settingsRow = { display: 'flex', gap: 12, alignItems: 'baseline', padding: '7px 0', borderBottom: `1px solid ${C.line}`, fontSize: 14 };
+
+// One detail of the account, with its own Change button that opens a small
+// form in place. Only one opens at a time.
+function AccountRow({ label, value, open, onOpen, children, action = 'Change' }) {
+  return (
+    <div style={{ ...settingsRow, flexWrap: 'wrap', borderBottomColor: C.line }}>
+      <span style={{ width: 110, flexShrink: 0, color: C.faint, fontSize: 13 }}>{label}</span>
+      <span style={{ flex: '1 1 160px', minWidth: 0, color: C.ink, overflowWrap: 'anywhere' }}>{value}</span>
+      {onOpen && !open && (
+        <button className="crm-btn" onClick={onOpen} aria-label={action === 'Change' ? `Change ${label.toLowerCase()}` : action} style={{
+          font: 'inherit', fontSize: 13, fontWeight: 600, color: C.muted, background: 'transparent',
+          border: 'none', padding: 0, cursor: 'pointer', textDecoration: 'underline',
+        }}>{action}</button>
+      )}
+      {open && <div style={{ flexBasis: '100%', paddingTop: 8 }}>{children}</div>}
+    </div>
+  );
+}
+
+function AccountSettings({ account }) {
+  const pr = account.profile;
+  const [open, setOpen] = useState('');
+  const [draft, setDraft] = useState({});
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState('');
+  const [said, setSaid] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState('');
+  const start = (key, value) => { setOpen(key); setDraft({ [key]: value }); setProblem(''); setSaid(''); };
+  const close = () => { setOpen(''); setProblem(''); };
+  const run = async (fn, done) => {
+    setBusy(true);
+    setProblem('');
+    try {
+      await fn();
+      setSaid(done);
+      setOpen('');
+    } catch (err) {
+      setProblem(err?.message || 'That did not save. Try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const saveProfile = (key, check, field) => {
+    const v = draft[key];
+    const wrong = check(v);
+    if (wrong) { setProblem(wrong); return; }
+    run(async () => {
+      if (key === 'username' && cleanUsername(v) !== pr.username && !(await account.checkUsername(v))) {
+        throw new Error('That username is taken.');
+      }
+      await account.updateProfile({ [field]: v });
+    }, 'Saved.');
+  };
+  const actions = (onSave, label = 'Save') => (
+    <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+      <Button kind="solid" onClick={busy ? undefined : onSave} style={small}>{busy ? 'Saving…' : label}</Button>
+      <Button onClick={close} style={small}>Cancel</Button>
+    </div>
+  );
+  const text = (key, props = {}) => (
+    <input aria-label={props.label} style={{ ...inputStyle, minHeight: 38 }} value={draft[key] ?? ''}
+      onChange={(e) => setDraft({ ...draft, [key]: e.target.value })} {...props.input} />
+  );
+  const password = account.providers.includes('email');
+  const google = account.providers.includes('google');
+  const wantDelete = pr?.username || 'delete';
+
+  return (
+    <div>
+      <div style={settingsCard()}>
+        <p style={settingsHead}>Your account</p>
+        {!pr && (
+          <p style={{ margin: '0 0 10px', fontSize: 13, color: C.soonText, lineHeight: 1.5 }}>
+            Your username, name and birthday are not set up on the server yet, so only your email shows here.
+          </p>
+        )}
+        {pr && (
+          <>
+            <AccountRow label="Name" value={pr.display_name} open={open === 'name'} onOpen={() => start('name', pr.display_name)}>
+              {text('name', { label: 'Your name', input: { maxLength: 60, autoComplete: 'name' } })}
+              <span style={hintStyle()}>What friends see.</span>
+              {actions(() => saveProfile('name', displayNameProblem, 'displayName'))}
+            </AccountRow>
+            <AccountRow label="Username" value={`@${pr.username}`} open={open === 'username'} onOpen={() => start('username', pr.username)}>
+              {text('username', { label: 'Username', input: { autoCapitalize: 'none', spellCheck: false, maxLength: 21 } })}
+              <span style={hintStyle()}>How friends find you. Letters, numbers, dots and underscores; your old one becomes free for anyone.</span>
+              {actions(() => saveProfile('username', usernameProblem, 'username'))}
+            </AccountRow>
+            <AccountRow label="Birthday" value={`${prettyDate(pr.birthday)} · only you`} open={open === 'birthday'} onOpen={() => start('birthday', pr.birthday)}>
+              {text('birthday', { label: 'Birthday', input: { type: 'date', min: '1900-01-01' } })}
+              {actions(() => saveProfile('birthday', (v) => birthdayProblem(v), 'birthday'))}
+            </AccountRow>
+          </>
+        )}
+        <AccountRow label="Email" value={`${account.email} · only you`} open={open === 'email'}
+          onOpen={password || !google ? () => start('email', account.email) : null}>
+          {text('email', { label: 'New email', input: { type: 'email', inputMode: 'email', autoComplete: 'email' } })}
+          <span style={hintStyle()}>We send a link to the new address (and a note to the old one). The change happens when you open it.</span>
+          {actions(() => {
+            const wrong = emailProblem(draft.email);
+            if (wrong) { setProblem(wrong); return; }
+            run(() => account.changeEmail(draft.email), `Check ${draft.email.trim()} for a link to confirm the change.`);
+          }, 'Send the link')}
+        </AccountRow>
+        <AccountRow label="Password" value={password ? '••••••••' : 'Not set'} open={open === 'password'}
+          action={password ? 'Change' : 'Set a password'} onOpen={() => start('password', '')}>
+          <input aria-label="New password" type="password" autoComplete="new-password" style={{ ...inputStyle, minHeight: 38 }}
+            value={draft.password ?? ''} onChange={(e) => setDraft({ password: e.target.value })} />
+          <span style={hintStyle()}>At least {MIN_PASSWORD} characters.</span>
+          {actions(() => {
+            const wrong = passwordProblem(draft.password);
+            if (wrong) { setProblem(wrong); return; }
+            run(() => account.changePassword(draft.password), 'Your password is saved.');
+          })}
+        </AccountRow>
+        <AccountRow label="Signs in with" value={[password && 'Email', google && 'Google'].filter(Boolean).join(' and ') || 'Email link'} />
+        {problem && <p role="alert" style={{ margin: '10px 0 0', fontSize: 13, color: C.overdue, lineHeight: 1.5 }}>{problem}</p>}
+        <p aria-live="polite" style={{ margin: said ? '10px 0 0' : 0, fontSize: 13, color: C.calmText, lineHeight: 1.5 }}>{said}</p>
+        <div style={{ marginTop: 14 }}>
+          <Button onClick={account.signOut}>Sign out</Button>
+        </div>
+      </div>
+
+      <div style={settingsCard()}>
+        <p style={settingsHead}>Delete account</p>
+        <p style={{ margin: '0 0 10px', fontSize: 13.5, color: C.muted, lineHeight: 1.5 }}>
+          This removes your account and everything saved in it, on every device, for good. Back up first if you
+          might want any of it.
+        </p>
+        <label style={{ display: 'block', fontSize: 13, color: C.muted, marginBottom: 6 }}>
+          Type <strong style={{ color: C.ink }}>{wantDelete}</strong> to confirm
+          <input style={{ ...inputStyle, minHeight: 38, marginTop: 6 }} value={confirmDelete} autoCapitalize="none"
+            onChange={(e) => setConfirmDelete(e.target.value)} />
+        </label>
+        <Button kind="danger" style={{ border: `1px solid ${C.overdue}`, opacity: confirmDelete.trim().toLowerCase() === wantDelete ? 1 : 0.5 }}
+          onClick={() => {
+            if (confirmDelete.trim().toLowerCase() !== wantDelete) { setProblem(`Type ${wantDelete} first.`); return; }
+            run(() => account.deleteAccount(), '');
+          }}>Delete my account</Button>
+      </div>
+    </div>
+  );
+}
+
+function SettingsView({ account, onClose }) {
+  return (
+    <div style={{ maxWidth: 620 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+        <h1 style={{ margin: 0, fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Settings</h1>
+        <Button onClick={onClose} style={{ marginLeft: 'auto' }}>Done</Button>
+      </div>
+      {account ? <AccountSettings account={account} /> : (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
+          This copy of Orbit has no accounts switched on, so everything is saved in this browser only.
+        </p>
+      )}
+    </div>
+  );
+}
+
 /* ---------- import / export screens ---------- */
 const COL_GROUPS = [
   ['contact', 'Contact details'],
@@ -6477,7 +6646,7 @@ export default function PersonalCRM({ account = null } = {}) {
                       boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
                     }}
                   >
-                    {[['import', 'Import'], ['export', 'Export']].map(([v, l], i) => (
+                    {[['settings', 'Settings'], ['import', 'Import'], ['export', 'Export']].map(([v, l], i) => (
                       <button
                         key={v}
                         className="crm-btn"
@@ -6498,7 +6667,7 @@ export default function PersonalCRM({ account = null } = {}) {
                         <p style={{
                           margin: 0, padding: '9px 13px 0', fontSize: 12, color: C.muted,
                           maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                        }} title={account.email}>{account.email || 'Signed in'}</p>
+                        }} title={account.email}>{account.profile ? `@${account.profile.username}` : account.email || 'Signed in'}</p>
                         <button
                           className="crm-btn"
                           onClick={() => { setMenuOpen(false); account.signOut(); }}
@@ -6683,6 +6852,12 @@ export default function PersonalCRM({ account = null } = {}) {
                 onDropShared={() => setIncoming(null)}
               />
             )}
+          </div>
+        )}
+
+        {view === 'settings' && (
+          <div className="crm-full">
+            <SettingsView account={account} onClose={() => setView('list')} />
           </div>
         )}
 
@@ -6936,7 +7111,7 @@ export default function PersonalCRM({ account = null } = {}) {
               onEdit={() => setEditing(selectedPerson.id)}
               onRemove={() => remove(selectedPerson.id)}
               onTag={(kind, value) => { setTagFilter({ kind, value }); setQ(''); setOpenId(null); }}
-              owner={owner}
+              owner={owner || account?.profile?.display_name || ''}
               onClearVia={() => clearVia(selectedPerson.id)}
               onClose={() => setOpenId(null)}
             />
