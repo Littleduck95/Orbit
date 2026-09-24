@@ -152,29 +152,54 @@ describe('merging a backup by id', () => {
 
 describe('sharing a trip', () => {
   const t = trip({ endDate: '2025-05-10', rating: 4, excerpt: 'Nata.', notes: 'Private.', companions: ['dana'], photoIds: ['p1'], tags: ['food'] });
+  const link = async (opts) => `https://orbit.example/#share=${await A.encodeShare(await A.tripSharePayload(t, opts))}`;
 
-  it('round-trips through a link, without who went or the photos', () => {
-    const got = A.readSharedTrip(`https://orbit.example/#trip=${A.tripShareCode(t, { notes: false, by: 'Chris' })}`);
-    assert.equal(got.by, 'Chris');
+  it('round-trips through a link, without who went or the photos', async () => {
+    const got = await A.readAnyShare(await link({ notes: false, by: 'Chris' }));
+    assert.deepEqual([got.type, got.by, got.on], ['trip', 'Chris', '2026-09-22']);
     assert.deepEqual(
       [got.trip.title, got.trip.stops, got.trip.startDate, got.trip.endDate, got.trip.rating, got.trip.excerpt, got.trip.tags],
       [t.title, t.stops, t.startDate, t.endDate, t.rating, t.excerpt, t.tags],
     );
-    assert.deepEqual([got.trip.companions, got.trip.photoIds, got.trip.notes], [[], [], '']);
+    assert.deepEqual([got.trip.companions, got.trip.photoIds, got.trip.notes, got.photos], [[], [], '', []]);
     assert.notEqual(got.trip.id, t.id, 'always a new trip');
   });
 
-  it('carries notes only when asked', () => {
-    assert.equal(A.readSharedTrip(A.tripShareCode(t, { notes: true })).trip.notes, 'Private.');
+  it('carries notes only when asked', async () => {
+    assert.equal((await A.readAnyShare(await link({ notes: true }))).trip.notes, 'Private.');
   });
 
-  it('is not confused with a shared list, either way round', () => {
-    const tripCode = A.tripShareCode(t, { notes: false });
-    assert.equal(A.readShared(tripCode), null);
-    assert.equal(A.readShared(`#trip=${tripCode}`), null);
-    const listCode = A.shareCode({ name: 'Books', kind: 'Books', track: true, items: [{ title: 'Dune' }] }, { notes: false });
-    assert.equal(A.readSharedTrip(listCode), null);
-    assert.equal(A.readSharedTrip('#trip=nonsense!!'), null);
+  it('is told apart from people and lists by the same reader', async () => {
+    const person = await A.readAnyShare(await A.encodeShare(A.sharePeoplePayload([{ n: 'Dana' }], {})));
+    assert.equal(person.type, 'people');
+    const list = await A.readAnyShare(`#share=${A.shareCode({ name: 'Books', kind: 'Books', track: true, items: [{ title: 'Dune' }] }, { notes: false })}`);
+    assert.equal(list.type, 'list');
+  });
+
+  it('carries photos in the file, as JPEGs', async () => {
+    const jpeg = (n, v) => new Blob([new Uint8Array(n).fill(v)], { type: 'image/jpeg' });
+    const text = A.shareFileText(await A.tripSharePayload(t, {
+      notes: false, photos: [{ blob: jpeg(3000, 1), thumb: jpeg(300, 2), width: 1600, height: 900 }, { blob: jpeg(10, 3) }],
+    }));
+    assert.equal(JSON.parse(text).orbit, 'share');
+    const got = await A.readAnyShare(text);
+    assert.deepEqual(got.photos.map((p) => [p.blob.size, p.thumb?.size ?? null, p.width, p.height]), [[3000, 300, 1600, 900], [10, null, null, null]]);
+    assert.equal(got.photos[0].blob.type, 'image/jpeg');
+    assert.deepEqual([...new Uint8Array(await got.photos[1].blob.arrayBuffer())], Array(10).fill(3));
+  });
+
+  it('drops photos that are not photos, and any past 30', async () => {
+    const base = JSON.parse(A.shareFileText(await A.tripSharePayload(t, { notes: false })));
+    const got = await A.readAnyShare(JSON.stringify({
+      ...base, ph: [{ d: 'not base64!' }, { d: 42 }, 'x', ...Array.from({ length: 40 }, () => ({ d: 'AAAA' }))],
+    }));
+    assert.equal(got.photos.length, 27, 'the first 30 entries, less the three that were not photos');
+  });
+
+  it('refuses a trip with nothing to it', async () => {
+    const base = JSON.parse(A.shareFileText(await A.tripSharePayload(t, { notes: false })));
+    assert.equal(await A.readAnyShare(JSON.stringify({ ...base, trip: { ...base.trip, s: [] } })), null);
+    assert.equal(await A.readAnyShare(JSON.stringify({ ...base, trip: 'x' })), null);
   });
 
   it('writes a plain-text copy without people', () => {
@@ -214,13 +239,9 @@ describe('backup and trip files', () => {
     assert.deepEqual(photos, []);
   });
 
-  it('tells a backup and a shared trip apart', async () => {
-    const shared = await A.packZip(A.tripPackage(trip({ photoIds: ['p1'] }), { notes: false, by: 'Chris' }), load);
-    await assert.rejects(A.readBackupFile(shared), /shared trip, not a backup/);
-    const got = await A.readTripFile(shared);
-    assert.deepEqual([got.by, got.trip.title, got.trip.companions, got.photos.length], ['Chris', 'Lisbon', [], 1]);
-    const backup = await A.packZip({ kind: 'orbit-backup', people: [{ name: 'x' }], photos: [] }, load);
-    await assert.rejects(A.readTripFile(backup), /full Orbit backup/);
+  it('tells a backup from something shared', async () => {
+    const shared = A.shareFileText(await A.tripSharePayload(trip(), { notes: false }));
+    await assert.rejects(A.readBackupFile(new Blob([shared])), /shared with you, not a backup/);
   });
 
   it('turns away files that are not Orbit files', async () => {

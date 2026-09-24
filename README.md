@@ -4,10 +4,12 @@ A personal CRM for keeping up with the people you actually want to keep up with.
 Track who you care about, how often you mean to reach out, when you last did,
 and the events and dates that matter to them. Reminders cover the other half:
 the things that come round again whether or not anyone tells you. Lists hold
-everything else worth keeping track of: shows, books, the collection.
+everything else worth keeping track of: shows, books, the collection. Trips
+are the places you have been, on a map, with photos.
 
-The whole app is one component: [`src/PersonalCRM.jsx`](src/PersonalCRM.jsx).
-Everything else in this repo is the shell needed to run it in a browser.
+The app itself is one component: [`src/PersonalCRM.jsx`](src/PersonalCRM.jsx).
+Everything else in this repo is the shell needed to run it in a browser, the
+account behind it, and a few modules it loads.
 
 ## Running it
 
@@ -52,6 +54,9 @@ supabase/schema.sql   the table and its access rules, run once in Supabase
 .env                  which Supabase project to use (public values)
 src/Recovery.jsx      shown instead of a blank page if drawing ever fails
 src/PersonalCRM.jsx   the app
+src/photoStore.js     trip photos in IndexedDB, and preparing uploads
+src/TripMap.jsx       the Leaflet maps, loaded only when a map is shown
+src/mapConfig.js      map tiles and place search: one entry each
 tests/                characterization tests (logic, storage, account, browser)
 vite.config.js        build config
 eslint.config.js      lint config
@@ -165,6 +170,75 @@ card can carry a small "From Brock · date" note, which can be taken off.
 Both ends go through one whitelist of fields, so a share can never carry more
 than the picker offered, and a hand-edited one cannot slip anything else in.
 Lists shared with the older links still open as before.
+
+## Trips
+
+The Trips tab keeps the places you have been: a title, one or more stops, the
+dates, a rating out of five, a short highlight, longer notes, who went with
+you, tags, and up to 30 photos. It shows them on a map or as a list, newest
+first, and filters by year, rating, companion and tag.
+
+**The map** is [Leaflet](https://leafletjs.com) with OpenStreetMap tiles and
+no API key. There is a pin for every stop, coloured by rating with the rating
+written on it, and nearby pins gather into numbered circles. Tapping a pin
+opens the trip's title, dates, stars, highlight and first photo. The map frames
+every trip shown, and with none it shows the world and an offer to add one.
+
+**Adding a stop** works three ways: search by name, tap the map to drop a
+pin and name it, or type the coordinates. Search uses
+[Nominatim](https://nominatim.org), OpenStreetMap's free place search. Its
+policy allows one request a second, so every search in the app waits its
+turn, typing is given a pause before anything is sent, and answers are
+remembered for the visit. The event form's Find button uses the same search.
+
+**Photos** are redrawn on a canvas before they are kept: at most 1600 pixels
+on the long edge, as JPEG at 0.8 quality, with a separate thumbnail of about
+300 pixels for grids, cards and popups. Redrawing leaves out everything the
+camera wrote into the file, including where the photo was taken, which is on
+purpose. A file the browser cannot open (HEIC, outside Safari) gets a message
+saying to use JPEG or PNG. The first photo is the cover; any can be made the
+cover instead.
+
+Deleting a trip asks first, then deletes its photos with it. Photos added to
+a form that is then cancelled are deleted again. Photos taken off a trip are
+only deleted once the trip is saved. On load, photos no trip refers to and
+older than a day are tidied away, but only when the saved trips read cleanly.
+
+**People.** A person's card lists the trips they went on, under *Trips
+together*, each linking to the trip.
+
+**Pinned events.** The old Map tab listed events that had a place pinned. The
+first time Trips opens with such events, it offers to turn them into trips.
+The events stay on the timeline, and each trip remembers which event it came
+from, so none is offered twice. A start screen saved as the Map opens on Trips.
+
+**Sending a copy** works the way it does for a person (see [Sharing
+people](#sharing-people)): a link, a QR code of it, or an `.orbit` file, with
+a *From* name, and the same preview before anything is added. The share
+carries the places, dates, rating, highlight and tags. Who went with you never
+goes, and notes only go when ticked. *Include photos* (off by default) adds
+the photos, which only fit in the file, so the link and QR code are put away
+while it is ticked. It arrives by opening the link, or under Import or *Add a
+shared trip*, and is always added as a new trip, never over one already here.
+*Copy as text* is there for someone without Orbit.
+
+## The backup file
+
+**Backup file** (in the ⋮ menu, beside Back up under People, and in Settings)
+saves everything in one `.zip`: `orbit.json` with every record, and each
+photo beside it as a JPEG. It gives the size before making the file. Restoring
+it merges rather than replaces. Records are matched by id, anything missing is
+added, trips and lists are updated when the file's copy is newer, and restoring
+the same file twice adds nothing. It is in the ⋮ menu even when nothing is
+saved, which is the case after clearing site data. A pasted-style JSON backup
+saved as a file restores too, without photos.
+
+Trip records are saved like everything else, so with an account they follow
+the person to every device. **Photos do not**: they stay in the browser that
+added them, and the backup file is the only other copy. The Trips tab says
+so, once, in words that fit whether or not an account is in use, and suggests
+a backup file now and then. The backup screen says when the last one was made,
+and Settings says roughly how much of this browser's storage Orbit is using.
 
 ## Accounts
 
@@ -288,9 +362,13 @@ Done once, in the [Supabase dashboard](https://supabase.com/dashboard):
 
 ## What the app stores
 
-People, events, reminders, lists, the chosen theme, and your name live under
-six keys (`crm-people-v1`, `crm-events-v1`, `crm-reminders-v1`,
-`crm-collections-v1`, `crm-theme-v1`, `crm-owner-v1`). Lists are called
+People, events, reminders, lists, trips, the chosen theme, and your name live
+under seven keys (`crm-people-v1`, `crm-events-v1`, `crm-reminders-v1`,
+`crm-collections-v1`, `crm-trips-v1`, `crm-theme-v1`, `crm-owner-v1`). Three
+more remember small things: that the Trips notice was read
+(`crm-trips-notice-v1`), that the pinned-events offer was answered
+(`crm-trips-events-offer-v1`), and when the last backup file was made
+(`crm-backup-file-v1`). Lists are called
 collections in the code, because "list" already means the people list there.
 The app reads and writes them through an async `window.storage` object.
 
@@ -301,8 +379,20 @@ catches a rejected write and tells you the change did not save, which is the
 honest outcome when the browser refuses to persist (private mode, exhausted
 quota, blocked site data).
 
-There is a **Back up** button in the app that exports everything as JSON, and a
-**Restore** button that reads it back. Without accounts, use them;
+Trip photos never go through `window.storage`, so they are never in
+`localStorage` and never in the account. They are Blobs in IndexedDB, in a
+database called `orbit-photos` with a `photos` store (full size) and a
+`thumbs` store, both keyed by photo id. Only `src/photoStore.js` touches it.
+Its exports (`save`, `get`, `getThumbnail`, `delete`, `listForTrip`, and a few
+more) are the whole interface, so moving photos to cloud storage later (to a
+Supabase Storage bucket, say) means reimplementing that one file. The first
+photo saved on each visit asks the browser to keep Orbit's data
+(`navigator.storage.persist()`), which makes it less likely to be cleared when
+space runs short.
+
+There is a **Back up** button in the app that exports every record as JSON (trip
+records included, photos not), and a **Restore** button that reads it back. A
+pasted backup from before trips existed leaves trips as they are. Without accounts, use them;
 `localStorage` is per-browser and per-device. Older backups that predate reminders or lists still restore —
 the app treats a missing `reminders` or `collections` key as an empty list. A
 backup with lists but nobody in it restores too. Back up and Restore sit under
@@ -328,19 +418,19 @@ from anyone who shares a list. Such cells get a leading `'`, and import takes it
 off again. Plain signed numbers are left alone, so a longitude of `-94.58`
 stays a number.
 
-## Carried over from the app's original runtime
+## Maps, place search, and cost
 
-`src/PersonalCRM.jsx` was written against a host runtime that provided some
-things a plain browser does not, so one seam remains:
+Map tiles come from `tile.openstreetmap.org` and place search from
+`nominatim.openstreetmap.org`. Both are free and keyless, and both ask for
+light use: fine for one person's Orbit, but not for an app with many users.
+Each is one entry in [`src/mapConfig.js`](src/mapConfig.js). Moving to a
+commercial provider (MapTiler, Stadia Maps, LocationIQ, Geoapify all have
+free tiers and cheap paid plans) means changing that entry and adding the
+provider's key, restricted to the site's domain.
 
-**Place search on the Map tab.** Geocoding calls `api.anthropic.com` directly
-with no API key, which worked because the original host injected credentials.
-Here the request fails and the app falls back to its `offline` state: place
-search reports it cannot reach the service, and the rest of the Map tab keeps
-working. Wiring this up means routing the call through a small backend that
-holds a key, or swapping in a geocoding service.
-
-Nothing else in the app is affected.
+When either service cannot be reached, the app says so and keeps working:
+place search points to the other two ways of adding a stop, and a map that
+cannot load offers to try again.
 
 ## Known lint warnings
 

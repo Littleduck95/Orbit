@@ -250,23 +250,31 @@ export default async function trips({ newPage, check, tab, shots }) {
   await page.getByRole('button', { name: /A week in Portugal/ }).click();
   check('and links to the trip', await page.getByRole('heading', { name: 'A week in Portugal' }).isVisible());
 
-  // ---- share without photos: a link ----
+  // ---- share without photos: a link, like a person's card ----
   await page.getByRole('button', { name: 'Send a copy' }).click();
-  await page.getByRole('button', { name: 'Copy Orbit link' }).click();
+  await page.getByLabel('From').fill('Chris');
+  await page.getByRole('button', { name: 'QR code' }).click();
+  const qrCode = page.getByRole('img', { name: 'QR code for the trip A week in Portugal' });
+  await qrCode.waitFor({ timeout: 5000 }).catch(() => {});
+  check('a trip can go as a QR code', await qrCode.isVisible(), await page.locator('.crm-open').last().textContent());
+  await page.getByRole('button', { name: 'Copy link' }).click();
   const link = await page.evaluate(() => navigator.clipboard.readText());
-  check('the link carries the trip, never who went', link.includes('#trip=') && !link.includes('dana'));
+  check('the link is the same kind a person share uses', /#share=z[A-Za-z0-9_-]+$/.test(link), link);
 
-  // ---- share with photos: a file ----
+  // ---- share with photos: an .orbit file ----
   await page.getByLabel(/^Include photos/).check();
-  await page.getByText(/About .* with three photos/).waitFor();
-  await page.getByRole('button', { name: 'Make the file' }).click();
+  check('with photos, there is no link to copy', await page.getByRole('button', { name: 'Copy link' }).count() === 0);
+  await page.getByText(/about [\d.]+ (KB|MB) with these/).waitFor();
   const [sharedDl] = await Promise.all([
     page.waitForEvent('download'),
-    page.getByRole('button', { name: 'Download the file' }).click(),
+    page.getByRole('button', { name: 'Save as file' }).click(),
   ]);
   const sharedFile = path.join(shots, sharedDl.suggestedFilename());
   await sharedDl.saveAs(sharedFile);
-  check('the shared file is named after the trip', sharedDl.suggestedFilename() === 'a-week-in-portugal.orbit-trip.zip');
+  check('the shared file is an .orbit file named after the trip', sharedDl.suggestedFilename() === 'a-week-in-portugal.orbit');
+  const sharedJson = JSON.parse(fs.readFileSync(sharedFile, 'utf8'));
+  check('the file holds the trip and its photos, never who went',
+    sharedJson.orbit === 'share' && sharedJson.t === 'trip' && sharedJson.ph.length === 3 && !JSON.stringify(sharedJson).includes('dana'));
 
   // ---- backup file ----
   await page.getByRole('button', { name: 'More' }).click();
@@ -294,8 +302,8 @@ export default async function trips({ newPage, check, tab, shots }) {
   // ---- a fresh browser: the link ----
   const b = await newPage();
   await b.page.goto(link);
-  await b.page.getByText('shared a trip with you').waitFor();
-  check('a trip link offers the trip', await b.page.getByText('A week in Portugal').first().isVisible());
+  await b.page.getByText('Chris shared a trip with you').waitFor();
+  check('a trip link offers the trip, saying who sent it', await b.page.getByText('A week in Portugal').first().isVisible());
   check('the link is taken out of the address bar', !(await b.page.evaluate(() => window.location.hash)));
   await b.page.getByRole('button', { name: 'Add it to my trips' }).click();
   await b.page.getByRole('heading', { name: 'A week in Portugal' }).waitFor();
@@ -305,7 +313,8 @@ export default async function trips({ newPage, check, tab, shots }) {
   // ---- the same browser: the file, with photos ----
   await b.page.getByRole('button', { name: '← All trips' }).click();
   await b.page.getByRole('button', { name: 'Add a shared trip' }).click();
-  await b.page.locator('input[type=file][accept^=".zip"]').setInputFiles(sharedFile);
+  await b.page.getByLabel('Shared file').setInputFiles(sharedFile);
+  await b.page.getByText('three photos').first().waitFor();
   await b.page.getByRole('button', { name: 'Add it to my trips' }).click();
   await b.page.getByRole('heading', { name: /A week in Portugal \(from/ }).waitFor();
   check('taking the same trip twice keeps both, told apart', (await b.stored('crm-trips-v1')).length === 2);

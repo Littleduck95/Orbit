@@ -2476,7 +2476,8 @@ const readAnyShare = async (text) => {
   if (s.startsWith('{')) {
     try {
       const o = JSON.parse(s);
-      return o?.orbit === 'share' ? readPeopleShare(o) : null;
+      if (o?.orbit !== 'share') return null;
+      return o.t === 'trip' ? readTripShare(o) : readPeopleShare(o);
     } catch {
       return null;
     }
@@ -2488,7 +2489,8 @@ const readAnyShare = async (text) => {
     return list ? { type: 'list', ...list } : null;
   }
   try {
-    return readPeopleShare(JSON.parse(new TextDecoder().decode(await squeeze(codeToBytes(m[1].slice(1)), 'out'))));
+    const o = JSON.parse(new TextDecoder().decode(await squeeze(codeToBytes(m[1].slice(1)), 'out')));
+    return o?.t === 'trip' ? readTripShare(o) : readPeopleShare(o);
   } catch {
     return null;
   }
@@ -3642,23 +3644,50 @@ const eventToTrip = (e) => cleanTrip({
 });
 
 /* ---------- trips: sharing ---------- */
-// Like a shared list, a trip without photos travels inside the link. It
-// carries the trip, never who went: that is yours, and their ids mean nothing
-// on anyone else's Orbit. Notes only go when you say so.
-const TRIP_SHARE_PREFIX = 'trip=';
+// A trip is sent the way a person is (see "sharing a copy"): a compressed
+// link, a QR code of it, or an .orbit file, all opening to a preview before
+// anything is added. It carries the trip, never who went: that is yours, and
+// their ids mean nothing on anyone else's Orbit. Notes only go when ticked.
+// Photos only fit in the file, as JPEGs written out in base64.
+const SHARE_PHOTO_CAP = 8 * 1024 * 1024;
 
-const tripShareCode = (t, { notes, by }) => toCode({
-  v: 1,
-  k: 'trip',
-  t: t.title,
-  s: t.stops.map((x) => [x.name, x.displayAddress, x.lat, x.lng]),
-  a: t.startDate,
-  ...(t.endDate ? { b: t.endDate } : {}),
-  ...(t.rating ? { r: t.rating } : {}),
-  ...(t.excerpt ? { x: t.excerpt } : {}),
-  ...(notes && t.notes ? { n: t.notes } : {}),
-  ...(t.tags.length ? { g: t.tags } : {}),
-  ...(by ? { by } : {}),
+const bytesToB64 = (bytes) => {
+  const parts = [];
+  for (let i = 0; i < bytes.length; i += 0x8000) parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+  return btoa(parts.join(''));
+};
+const b64ToBlob = (s) => {
+  if (typeof s !== 'string' || !s || s.length > SHARE_PHOTO_CAP * 1.4 || !/^[A-Za-z0-9+/]+=*$/.test(s)) return null;
+  try {
+    return new Blob([Uint8Array.from(atob(s), (ch) => ch.charCodeAt(0))], { type: 'image/jpeg' });
+  } catch {
+    return null;
+  }
+};
+
+// photos: [{ blob, thumb, width, height }] to include, already read.
+const tripSharePayload = async (t, { notes, by, photos = [], on = todayStr() }) => ({
+  v: 2,
+  t: 'trip',
+  ...(by ? { by: clip(by, 60) } : {}),
+  on,
+  trip: {
+    ti: t.title,
+    s: t.stops.map((x) => [x.name, x.displayAddress, x.lat, x.lng]),
+    a: t.startDate,
+    ...(t.endDate ? { b: t.endDate } : {}),
+    ...(t.rating ? { r: t.rating } : {}),
+    ...(t.excerpt ? { x: t.excerpt } : {}),
+    ...(notes && t.notes ? { n: t.notes } : {}),
+    ...(t.tags.length ? { g: t.tags } : {}),
+  },
+  ...(photos.length ? {
+    ph: await Promise.all(photos.map(async (p) => ({
+      d: bytesToB64(new Uint8Array(await p.blob.arrayBuffer())),
+      ...(p.thumb ? { th: bytesToB64(new Uint8Array(await p.thumb.arrayBuffer())) } : {}),
+      ...(p.width ? { w: p.width, h: p.height } : {}),
+    }))),
+  } : {}),
 });
 
 // A trip arriving from someone else: always a new one, never tied to anyone here.
@@ -3667,23 +3696,22 @@ const sharedTrip = (raw) => {
   return t ? { ...t, companions: [], photoIds: [] } : null;
 };
 
-// Accepts the whole link or just the code after it.
-const readSharedTrip = (text) => {
-  const s = String(text || '').trim();
-  const m = s.match(/(?:^|[#&?])trip=([A-Za-z0-9_-]+)/) || s.match(/^([A-Za-z0-9_-]{16,})$/);
-  if (!m) return null;
-  try {
-    const o = fromCode(m[1]);
-    if (!isPlainObject(o) || o.v !== 1 || o.k !== 'trip' || !Array.isArray(o.s)) return null;
-    const trip = sharedTrip({
-      title: o.t,
-      stops: o.s.filter(Array.isArray).map((x) => ({ name: x[0], displayAddress: x[1], lat: x[2], lng: x[3] })),
-      startDate: o.a, endDate: o.b, rating: o.r, excerpt: o.x, notes: o.n, tags: o.g,
-    });
-    return trip ? { trip, by: clip(o.by, 60), photos: [] } : null;
-  } catch {
-    return null;
-  }
+const readTripShare = (o) => {
+  if (!isPlainObject(o) || o.v !== 2 || o.t !== 'trip' || !isPlainObject(o.trip)) return null;
+  const r = o.trip;
+  const trip = sharedTrip({
+    title: r.ti,
+    stops: (Array.isArray(r.s) ? r.s : []).filter(Array.isArray).map((x) => ({ name: x[0], displayAddress: x[1], lat: x[2], lng: x[3] })),
+    startDate: r.a, endDate: r.b, rating: r.r, excerpt: r.x, notes: r.n, tags: r.g,
+  });
+  if (!trip) return null;
+  const photos = (Array.isArray(o.ph) ? o.ph : []).slice(0, PHOTO_CAP).filter(isPlainObject).map((p) => {
+    const blob = b64ToBlob(p.d);
+    if (!blob) return null;
+    const w = Number.isInteger(p.w) && p.w > 0 ? p.w : null;
+    return { blob, thumb: b64ToBlob(p.th), width: w, height: w && Number.isInteger(p.h) ? p.h : null };
+  }).filter(Boolean);
+  return { type: 'trip', by: clip(o.by, 60), on: isDay(o.on) ? o.on : null, trip, photos };
 };
 
 const tripText = (t, { notes }) => {
@@ -3800,8 +3828,8 @@ const readBackupFile = async (file) => {
   } catch {
     throw new Error('That file could not be read as an Orbit backup. Pick the .zip Orbit saved, as it was downloaded.');
   }
-  if (got.manifest?.kind === 'orbit-trip') {
-    throw new Error('That is a shared trip, not a backup. Add it from Trips, under Add a shared trip.');
+  if (got.manifest?.orbit === 'share') {
+    throw new Error('That is something shared with you, not a backup. Open it from Import, under Open something shared with you.');
   }
   let parts;
   try {
@@ -3812,34 +3840,6 @@ const readBackupFile = async (file) => {
   if (Object.values(parts).every((x) => x.length === 0)) throw new Error('That backup has nothing in it.');
   return { parts, photos: got.photos };
 };
-
-// A shared trip file. Returns { trip, by, photos } or throws a showable Error.
-const readTripFile = async (file) => {
-  let got;
-  try {
-    got = await unpackFile(new Uint8Array(await file.arrayBuffer()));
-  } catch {
-    throw new Error('That file could not be read as a shared trip.');
-  }
-  if (got.manifest?.kind !== 'orbit-trip') {
-    throw new Error(got.manifest?.kind === 'orbit-backup'
-      ? 'That is a full Orbit backup, not a shared trip. Restore it from Import instead.'
-      : 'That file could not be read as a shared trip.');
-  }
-  const trip = sharedTrip(got.manifest.trip);
-  if (!trip) throw new Error('That shared trip is missing its title, place or date.');
-  return { trip, by: clip(got.manifest.by, 60), photos: got.photos.slice(0, PHOTO_CAP) };
-};
-
-const tripPackage = (t, { notes, by }) => ({
-  kind: 'orbit-trip',
-  version: 1,
-  ...(by ? { by } : {}),
-  trip: { ...t, notes: notes ? t.notes : '', companions: [], fromEvent: undefined },
-  photos: t.photoIds.map((id) => ({ id })),
-});
-
-const fileSafe = (s) => (s || 'trip').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40).toLowerCase() || 'trip';
 
 const downloadBlob = (name, blob) => {
   try {
@@ -6785,29 +6785,36 @@ function TripForm({ initial, people, onSave, onCancel }) {
 }
 
 /* ---------- trips: one trip ---------- */
-const TripSharePanel = memo(function TripSharePanel({ trip, people, owner }) {
+// Sent the same ways as a person's card (see PersonShare): a link, a QR code
+// of it, or an .orbit file. Photos only fit in the file.
+const TripSharePanel = memo(function TripSharePanel({ trip, owner }) {
   const [notes, setNotes] = useState(false);
   const [withPhotos, setWithPhotos] = useState(false);
-  const [to, setTo] = useState('');
+  const [by, setBy] = useState(owner || '');
   const [said, setSaid] = useState('');
   const [fallback, setFallback] = useState('');
+  const [qr, setQr] = useState(false);
   const [size, setSize] = useState(null);
-  const [making, setMaking] = useState(null);
-  const [file, setFile] = useState(null);
+  const [making, setMaking] = useState(false);
   const count = trip.photoIds.length;
 
+  // The link is tied to the choices it was made from. Until the new one is
+  // ready nothing can be sent, so notes just unticked can never go out in a
+  // link made a moment before.
+  const opts = useMemo(() => ({ notes, by: by.trim() }), [notes, by]);
+  const [made, setMade] = useState({ trip: null, opts: null, code: '' });
+  useEffect(() => {
+    let live = true;
+    tripSharePayload(trip, opts).then(encodeShare)
+      .then((code) => { if (live) setMade({ trip, opts, code }); }, () => { if (live) setMade({ trip, opts, code: '' }); });
+    return () => { live = false; };
+  }, [trip, opts]);
+  const ready = made.trip === trip && made.opts === opts && Boolean(made.code);
+  const link = ready ? shareLink(made.code) : '';
+  const tooLong = link.length > SHARE_LINK_CAP;
   const text = useMemo(() => tripText(trip, { notes }), [trip, notes]);
-  const link = useMemo(
-    () => `${window.location.origin}${window.location.pathname}#${TRIP_SHARE_PREFIX}${tripShareCode(trip, { notes, by: owner })}`,
-    [trip, notes, owner]);
-  const mailable = useMemo(() => people.filter((p) => (p.email || '').includes('@'))
-    .sort((a, b) => SHELF.compare(a.name, b.name)), [people]);
-  const who = mailable.find((p) => p.id === to) || mailable[0] || null;
-  const mail = who ? `mailto:${who.email}?subject=${encodeURIComponent(trip.title)}&body=${encodeURIComponent(text)}` : '';
-  const canShare = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
-
-  // A file made for one set of choices is not the file for another.
-  useEffect(() => { setFile(null); }, [notes, withPhotos, trip]);
+  const canSheet = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
+  const fileName = `${fileSlug(trip.title)}.orbit`;
 
   useEffect(() => {
     if (!withPhotos || size !== null) return undefined;
@@ -6815,7 +6822,8 @@ const TripSharePanel = memo(function TripSharePanel({ trip, people, owner }) {
     photoStore.listAll()
       .then((all) => {
         const mine = new Set(trip.photoIds);
-        if (live) setSize(all.filter((p) => mine.has(p.id)).reduce((n, p) => n + p.size + p.thumbSize, 0));
+        // Base64 writes every three bytes as four characters.
+        if (live) setSize(Math.round(all.filter((p) => mine.has(p.id)).reduce((n, p) => n + p.size + p.thumbSize, 0) * 1.34));
       })
       .catch(() => { if (live) setSize(0); });
     return () => { live = false; };
@@ -6824,40 +6832,42 @@ const TripSharePanel = memo(function TripSharePanel({ trip, people, owner }) {
   const copy = async (value, what) => {
     try {
       await navigator.clipboard.writeText(value);
-      setSaid(`${what} is copied. Paste it wherever you like.`);
+      setSaid(`${what} is copied. Send it however you like.`);
       setFallback('');
     } catch {
       setSaid('Copying was blocked here. Select the text below and copy it yourself.');
       setFallback(value);
     }
   };
-
   const sheet = async () => {
     try {
-      await navigator.share({ title: trip.title, text });
+      await navigator.share({ title: trip.title, text: `${opts.by || 'Someone'} shared a trip from Orbit: ${trip.title}.`, url: link });
     } catch (e) {
-      if (e?.name !== 'AbortError') copy(text, 'The trip');
+      if (e?.name !== 'AbortError') copy(link, 'The link');
     }
   };
 
-  const make = async () => {
+  const makeFile = async () => {
+    const photos = withPhotos
+      ? (await Promise.all(trip.photoIds.map((id) => photoStore.getRecord(id).catch(() => null)))).filter(Boolean)
+      : [];
+    const payload = await tripSharePayload(trip, { ...opts, photos });
+    return new File([shareFileText(payload)], fileName, { type: 'application/json' });
+  };
+
+  const saveFile = async (tryShare) => {
     setSaid('');
-    setMaking({ done: 0, total: withPhotos ? count : 0 });
+    setMaking(true);
+    let file;
     try {
-      const pkg = tripPackage(trip, { notes, by: owner });
-      if (!withPhotos) pkg.photos = [];
-      const blob = await packZip(pkg, (id) => photoStore.getRecord(id), (done, total) => setMaking({ done, total }));
-      setFile(new File([blob], `${fileSafe(trip.title)}.orbit-trip.zip`, { type: 'application/zip' }));
+      file = await makeFile();
     } catch {
+      setMaking(false);
       setSaid('The file could not be made. Try again.');
-    } finally {
-      setMaking(null);
+      return;
     }
-  };
-
-  const sendFile = async () => {
-    if (!file) return;
-    if (navigator.canShare?.({ files: [file] })) {
+    setMaking(false);
+    if (tryShare && navigator.canShare?.({ files: [file] })) {
       try {
         await navigator.share({ files: [file], title: trip.title });
         return;
@@ -6865,90 +6875,79 @@ const TripSharePanel = memo(function TripSharePanel({ trip, people, owner }) {
         if (e?.name === 'AbortError') return;
       }
     }
-    if (downloadBlob(file.name, file)) setSaid(`Saved ${file.name}. Send it however you like.`);
-    else setSaid('The download was blocked here.');
-  };
-
-  const saveFile = () => {
-    if (file && downloadBlob(file.name, file)) setSaid(`Saved ${file.name}. Send it however you like.`);
+    setSaid(downloadBlob(file.name, file)
+      ? `Saved ${file.name}. They open it from Import in their Orbit.`
+      : 'This browser would not save the file.');
   };
 
   return (
     <div className="crm-open" style={{
-      background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12,
-      padding: '15px 15px 12px', margin: '16px 0 0',
+      background: C.paper, border: `1px solid ${C.line}`, borderRadius: 12, padding: '14px 14px 12px', margin: '16px 0 0',
     }}>
-      <p style={{ margin: '0 0 11px', fontSize: 13, fontWeight: 600, color: C.ink }}>Send a copy of this trip</p>
-      <Check on={notes} onChange={setNotes} label="Include my notes"
-        hint="The highlight always goes. Who went with you always stays with you." />
+      <p style={{ margin: '0 0 3px', fontSize: 14, fontWeight: 600, color: C.ink }}>Send a copy of this trip</p>
+      <p style={{ margin: '0 0 13px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+        They get their own copy to keep and change. Places, dates, rating, highlight and tags always go.
+        Who went with you never does.
+      </p>
+      <Check on={notes} onChange={setNotes} label="Include my notes" hint="Anyone with the link can read them." />
       {count > 0 && (
         <Check on={withPhotos} onChange={setWithPhotos} label={`Include photos (${count})`}
-          hint="Photos make the copy a file to send rather than a link." />
+          hint={withPhotos
+            ? `Photos only travel in a file${size ? `, about ${approxBytes(size)} with these` : ''}.`
+            : 'Off keeps the copy small. Photos only travel in a file.'} />
       )}
 
-      {!withPhotos ? (
-        <>
-          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginTop: 4 }}>
-            <Button kind="solid" onClick={() => copy(text, 'The trip')} style={small}>Copy as text</Button>
-            {canShare && <Button onClick={sheet} style={small}>Share…</Button>}
-          </div>
+      <Field label="From">
+        <input style={{ ...inputStyle, minHeight: 38 }} value={by} maxLength={60} onChange={(e) => setBy(e.target.value)}
+          placeholder="Your name, so they know who sent it" />
+      </Field>
 
-          {who && (
-            <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
-              <select className="crm-select" aria-label="Who to email it to" value={who.id} onChange={(e) => setTo(e.target.value)}
-                style={{ ...inputStyle, width: 'auto', flex: '1 1 170px', minHeight: 36, padding: '6px 11px', fontSize: 13 }}>
-                {mailable.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </select>
-              <a href={mail} className="crm-btn" style={{
-                fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.01em', color: C.ink, textDecoration: 'none',
-                padding: '7px 11px', borderRadius: 7, border: `1px solid ${C.line}`, whiteSpace: 'nowrap',
-              }}>Email it to {who.name.split(' ')[0]}</a>
-            </div>
-          )}
-
-          <div style={{ borderTop: `1px solid ${C.line}`, marginTop: 14, paddingTop: 12 }}>
-            <p style={{ margin: '0 0 9px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
-              Sending it to someone else who uses Orbit? A link gives them their own copy of the trip,
-              without photos. They open it, or paste it under Add a shared trip.
-              {owner ? ` It tells them it is from ${owner}.` : ''}
-            </p>
-            <Button onClick={() => copy(link, 'The link')} style={small}>Copy Orbit link</Button>
-            {link.length > 4000 && (
-              <span style={hintStyle()}>
-                This is a long one. Some messaging apps trim long links, so if it arrives broken, send
-                the text instead.
-              </span>
-            )}
-          </div>
-        </>
+      {withPhotos ? (
+        <p style={{ margin: '0 0 10px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+          A link or QR code cannot carry photos, so this one goes as a file.
+        </p>
+      ) : tooLong ? (
+        <p style={{ margin: '0 0 10px', fontSize: 12.5, color: C.soonText, lineHeight: 1.5 }}>
+          This is too long for a link that arrives in one piece. Save it as a file instead.
+        </p>
       ) : (
-        <div style={{ marginTop: 4 }}>
-          <p style={{ margin: '0 0 10px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
-            {size === null ? 'Working out the size…' : `About ${approxBytes(size + 4000)} with ${countThings(count, 'photo', 'photos').toLowerCase()}. `}
-            They add it in Orbit under Trips, Add a shared trip.
-          </p>
-          {making ? (
-            <div role="status">
-              <progress value={making.done} max={making.total || 1} aria-label="Making the file" style={{ width: '100%', accentColor: C.accentDeep }} />
-              <span style={hintStyle()}>{`Packing photo ${Math.min(making.done + 1, making.total)} of ${making.total}…`}</span>
-            </div>
-          ) : file ? (
-            <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
-              {canShare && <Button kind="solid" onClick={sendFile} style={small}>Share the file…</Button>}
-              <Button kind={canShare ? 'quiet' : 'solid'} onClick={saveFile} style={small}>Download the file</Button>
-            </div>
+        <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginBottom: 8 }}>
+          {canSheet && <Button kind="solid" onClick={() => ready && sheet()} style={small}>{ready ? 'Share…' : 'Getting it ready…'}</Button>}
+          <Button kind={canSheet ? 'quiet' : 'solid'} onClick={() => ready && copy(link, 'The link')} style={small}>Copy link</Button>
+          <Button onClick={() => ready && setQr(!qr)} style={small}>{qr ? 'Hide QR code' : 'QR code'}</Button>
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+        {withPhotos && canSheet && (
+          <Button kind="solid" onClick={() => saveFile(true)} style={small} disabled={making}>Share the file…</Button>
+        )}
+        <Button kind={withPhotos && !canSheet ? 'solid' : 'quiet'} onClick={() => saveFile(false)} style={small} disabled={making}>
+          {making ? 'Making the file…' : 'Save as file'}
+        </Button>
+        {!withPhotos && <Button onClick={() => copy(text, 'The trip')} style={small}>Copy as text</Button>}
+      </div>
+
+      {qr && ready && !tooLong && !withPhotos && (
+        <div style={{ marginTop: 12 }}>
+          {link.length > SHARE_QR_CAP ? (
+            <p style={{ fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+              Too much for a QR code a phone can read. Untick the notes, or send the link.
+            </p>
           ) : (
-            <Button kind="solid" onClick={make} style={small}>Make the file</Button>
+            <>
+              <QrCode text={link} label={`QR code for the trip ${trip.title}`} />
+              <p style={{ margin: '8px 0 0', fontSize: 12, color: C.faint, lineHeight: 1.5 }}>
+                They point their phone’s camera at it and open the link.
+              </p>
+            </>
           )}
         </div>
       )}
 
-      <p aria-live="polite" style={{ margin: said ? '12px 0 0' : 0, fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
-        {said}
-      </p>
+      <p aria-live="polite" style={{ margin: said ? '10px 0 0' : 0, fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>{said}</p>
       {fallback && (
         <textarea readOnly aria-label="Text to copy" onFocus={(e) => e.target.select()} value={fallback}
-          style={{ ...inputStyle, marginTop: 8, minHeight: 120, fontSize: 12, lineHeight: 1.45, resize: 'vertical' }} />
+          style={{ ...inputStyle, marginTop: 8, minHeight: 90, fontSize: 12, lineHeight: 1.45, resize: 'vertical' }} />
       )}
     </div>
   );
@@ -7052,7 +7051,7 @@ function TripDetail({ trip, people, owner, onEdit, onRemove, onBack, onPerson })
         </div>
       )}
 
-      {sharing && <TripSharePanel trip={trip} people={people} owner={owner} />}
+      {sharing && <TripSharePanel trip={trip} owner={owner} />}
 
       {viewing !== null && (
         <Lightbox ids={trip.photoIds} start={viewing} title={trip.title} onClose={() => setViewing(null)} />
@@ -7194,34 +7193,10 @@ function EventsOffer({ events, onConvert, onDismiss }) {
   );
 }
 
-function AddSharedTrip({ onGot }) {
+// The same box Import has, since a trip arrives the same ways anything
+// shared does. Whatever is opened goes where its kind belongs.
+function AddSharedTrip({ onOpen }) {
   const [open, setOpen] = useState(false);
-  const [paste, setPaste] = useState('');
-  const [problem, setProblem] = useState('');
-  const id = useId();
-
-  const takePaste = () => {
-    const got = readSharedTrip(paste);
-    if (!got) {
-      setProblem('That does not look like a shared trip. Paste the whole link, or the code at the end of it.');
-      return;
-    }
-    onGot(got);
-    setPaste('');
-    setOpen(false);
-    setProblem('');
-  };
-
-  const takeFile = async (file) => {
-    setProblem('');
-    try {
-      onGot(await readTripFile(file));
-      setOpen(false);
-    } catch (e) {
-      setProblem(e.message);
-    }
-  };
-
   if (!open) {
     return (
       <button className="crm-btn" onClick={() => setOpen(true)} style={{ ...textButton(), fontSize: 13, color: C.muted }}>
@@ -7230,30 +7205,16 @@ function AddSharedTrip({ onGot }) {
     );
   }
   return (
-    <div className="crm-open" style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 14, maxWidth: 560 }}>
-      <label htmlFor={`${id}p`} style={labelText()}>Paste a trip link</label>
-      <textarea id={`${id}p`} value={paste} onChange={(e) => setPaste(e.target.value)} placeholder="https://…#trip=…"
-        style={{ ...inputStyle, minHeight: 64, fontSize: 13, resize: 'vertical' }} />
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
-        <Button kind="solid" onClick={takePaste} style={small}>Look at it</Button>
-        <label className="crm-file crm-btn" style={{
-          ...small, display: 'inline-flex', alignItems: 'center', position: 'relative', fontWeight: 600,
-          borderRadius: 7, border: `1px solid ${C.line}`, color: C.ink, cursor: 'pointer',
-        }}>
-          <input type="file" accept=".zip,application/zip" className="crm-sr"
-            onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) takeFile(f); }} />
-          Or open a trip file
-        </label>
-        <Button onClick={() => { setOpen(false); setProblem(''); }} style={small}>Cancel</Button>
-      </div>
-      {problem && <p role="alert" style={{ margin: '9px 0 0', fontSize: 13, color: C.overdue, lineHeight: 1.5 }}>{problem}</p>}
+    <div className="crm-open" style={{ maxWidth: 560 }}>
+      <OpenShared onOpen={(got) => { setOpen(false); onOpen(got); }} />
+      <Button onClick={() => setOpen(false)} style={{ ...small, marginTop: -8 }}>Cancel</Button>
     </div>
   );
 }
 
 function TripsView({
   trips, people, look, incoming, offer, notice,
-  onOpen, onNew, onTakeShared, onGotShared, onDropShared, onConvert, onDismissOffer, onDismissNotice, onBackup,
+  onOpen, onNew, onTakeShared, onOpenShared, onDropShared, onConvert, onDismissOffer, onDismissNotice, onBackup, signedIn,
 }) {
   const [mode, setMode] = useState(look.current.mode);
   const [f, setF] = useState(look.current.filter);
@@ -7300,9 +7261,12 @@ function TripsView({
           background: C.surface, border: `1px solid ${C.soonBar}`, borderRadius: 12, padding: '13px 15px', margin: '0 0 16px',
         }}>
           <p style={{ margin: '0 0 10px', fontSize: 13.5, color: C.ink, lineHeight: 1.55 }}>
-            Trips and their photos are kept in this browser, on this device only. Nothing is uploaded, so
-            clearing this site&apos;s data, or losing the device, loses them. Download a backup file every so
-            often and keep it somewhere safe.
+            {signedIn
+              ? 'Trips are saved to your account, but their photos are kept in this browser, on this device only. '
+                + 'Photos are not uploaded, so clearing this site\'s data, or losing the device, loses them. '
+              : 'Trips and their photos are kept in this browser, on this device only. Nothing is uploaded, so '
+                + 'clearing this site\'s data, or losing the device, loses them. '}
+            Download a backup file every so often and keep it somewhere safe.
           </p>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <Button kind="solid" onClick={onBackup} style={small}>Back up now</Button>
@@ -7402,7 +7366,7 @@ function TripsView({
       )}
 
       <div style={{ marginTop: 22 }}>
-        <AddSharedTrip onGot={onGotShared} />
+        <AddSharedTrip onOpen={onOpenShared} />
       </div>
     </div>
   );
@@ -7411,7 +7375,7 @@ function TripsView({
 /* ---------- backup file ---------- */
 // The one copy that holds everything, photos included. The pasted backup
 // under People still works, but has no room for photos.
-function BackupView({ people, events, reminders, collections, trips, lastBackup, onDownloaded, onRestore, onClose }) {
+function BackupView({ people, events, reminders, collections, trips, lastBackup, signedIn, onDownloaded, onRestore, onClose }) {
   const [plan, setPlan] = useState(null);
   const [stage, setStage] = useState('');
   const [progress, setProgress] = useState(null);
@@ -7486,8 +7450,10 @@ function BackupView({ people, events, reminders, collections, trips, lastBackup,
         <Button onClick={onClose} style={{ marginLeft: 'auto' }}>Done</Button>
       </div>
       <p style={{ margin: '0 0 20px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
-        Everything Orbit keeps, photos included, in one file. Orbit only lives in this browser, so this
-        file is the copy that survives losing it.
+        Everything Orbit keeps, photos included, in one file.
+        {signedIn
+          ? ' Your account keeps everything but trip photos, which stay on this device; this file is the copy of them that survives losing it.'
+          : ' Orbit only lives in this browser, so this file is the copy that survives losing it.'}
       </p>
 
       <div style={box}>
@@ -8116,7 +8082,7 @@ function FriendsView({ account, startWith, onStarted, onSaveToPeople, onCount, o
 
 /* ---------- settings: preferences ---------- */
 const START_KEY = 'crm-start-v1';
-const START_VIEWS = [['list', 'People'], ['events', 'Events'], ['reminders', 'Reminders'], ['collections', 'Lists'], ['map', 'Map'], ['recap', 'Recap']];
+const START_VIEWS = [['list', 'People'], ['events', 'Events'], ['reminders', 'Reminders'], ['collections', 'Lists'], ['trips', 'Trips'], ['recap', 'Recap']];
 const hourLabel = (h) => `${h % 12 === 0 ? 12 : h % 12}${h < 12 ? 'am' : 'pm'}`;
 const HOURS = Array.from({ length: 24 }, (_, h) => [h, hourLabel(h)]);
 const BIRTHDAY_LEADS = [[0, 'On the day'], [1, 'The day before'], [3, '3 days before'], [7, 'A week before'], [14, 'Two weeks before']];
@@ -8289,7 +8255,32 @@ function PreferencesSettings({ account, theme, onTheme, start, onStart }) {
   );
 }
 
-function SettingsView({ account, theme, onTheme, start, onStart, onClose }) {
+// How much of this browser's storage Orbit is using. Trip photos are most of
+// it, and they only live here, so the way to a backup file is beside it.
+function StorageSettings({ onBackup }) {
+  const [usage, setUsage] = useState(undefined);
+  const [photos, setPhotos] = useState(null);
+  useEffect(() => {
+    let live = true;
+    photoStore.estimate().then((u) => { if (live) setUsage(u); });
+    photoStore.listAll().then((all) => { if (live) setPhotos(all.length); }, () => { if (live) setPhotos(null); });
+    return () => { live = false; };
+  }, []);
+  return (
+    <div style={{ borderTop: `1px solid ${C.line}`, marginTop: 20, paddingTop: 16 }}>
+      <p style={{ margin: '0 0 6px', fontSize: 14, fontWeight: 600, color: C.ink }}>Storage on this device</p>
+      <p style={{ margin: '0 0 12px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+        {usage === undefined ? 'Checking…'
+          : usage ? `Orbit is using about ${approxBytes(usage.usage)} of this browser's storage${usage.quota ? `, out of roughly ${approxBytes(usage.quota)} it allows` : ''}.`
+          : 'This browser does not say how much space Orbit is using.'}
+        {photos ? ` Most of that is ${countThings(photos, 'trip photo', 'trip photos').toLowerCase()}, which are only kept here.` : ''}
+      </p>
+      <Button onClick={onBackup} style={small}>Backup file</Button>
+    </div>
+  );
+}
+
+function SettingsView({ account, theme, onTheme, start, onStart, onBackup, onClose }) {
   const [tab, setTab] = useState('account');
   return (
     <div style={{ maxWidth: 620 }}>
@@ -8312,6 +8303,7 @@ function SettingsView({ account, theme, onTheme, start, onStart, onClose }) {
       {account && tab === 'account' && <AccountSettings account={account} />}
       {account && tab === 'profile' && <ProfileSettings account={account} />}
       {(!account || tab === 'prefs') && <PreferencesSettings account={account} theme={theme} onTheme={onTheme} start={start} onStart={onStart} />}
+      {(!account || tab === 'prefs') && <StorageSettings onBackup={onBackup} />}
     </div>
   );
 }
@@ -8693,7 +8685,6 @@ export default function PersonalCRM({ account = null } = {}) {
   const [tripNoticeSeen, setTripNoticeSeen] = useState(true);
   const [tripOfferDone, setTripOfferDone] = useState(true);
   const [lastBackup, setLastBackup] = useState('');
-  const [storageUse, setStorageUse] = useState(null);
   // Saved lists that could not be read as they were: their original text,
   // shown in a warning with a way to download it.
   const [setAsideText, setSetAsideText] = useState(null);
@@ -8773,10 +8764,12 @@ export default function PersonalCRM({ account = null } = {}) {
       }
       try {
         const st = await window.storage.get(START_KEY);
-        if (st?.value && START_VIEWS.some(([v]) => v === st.value)) {
-          setStartView(st.value);
+        // The Map tab became Trips; a start saved as the map opens there.
+        const start = st?.value === 'map' ? 'trips' : st?.value;
+        if (start && START_VIEWS.some(([v]) => v === start)) {
+          setStartView(start);
           // Only if nothing else (a shared link, a friend code) has opened a screen.
-          setView((v) => (v === 'list' ? st.value : v));
+          setView((v) => (v === 'list' ? start : v));
         }
       } catch {
         /* People, as always */
@@ -8810,16 +8803,14 @@ export default function PersonalCRM({ account = null } = {}) {
         setView('friends');
         return;
       }
-      if (hash.startsWith(`#${TRIP_SHARE_PREFIX}`)) {
-        const got = readSharedTrip(hash);
-        window.history.replaceState(null, '', window.location.pathname + window.location.search);
-        setIncomingTrip(got || { broken: true });
-        if (arriving) setView('trips');
-        return;
-      }
       if (!hash.startsWith(`#${SHARE_PREFIX}`)) return;
       window.history.replaceState(null, '', window.location.pathname + window.location.search);
       const got = await readAnyShare(hash);
+      if (got?.type === 'trip') {
+        setIncomingTrip(got);
+        if (arriving) setView('trips');
+        return;
+      }
       // A link that will not read is reported where its kind would have
       // gone: newer shares on the Receive screen, lists with the lists.
       if (got?.type === 'people' || (!got && hash.startsWith(`#${SHARE_PREFIX}${SHARE_V2}`))) {
@@ -8869,6 +8860,7 @@ export default function PersonalCRM({ account = null } = {}) {
   // Something shared, opened from Import: people go to the Receive screen,
   // a list to the lists, the same as arriving by link.
   const openShare = (got) => {
+    if (got.type === 'trip') { setIncomingTrip(got); setView('trips'); setTripOpen(null); setTripDraft(null); return; }
     if (got.type === 'list') { setIncoming(got); setView('collections'); setCollectionOpen(null); setCollectionDraft(null); return; }
     setReceived(got);
     setView('receive');
@@ -9315,14 +9307,6 @@ export default function PersonalCRM({ account = null } = {}) {
     ? sortTrips(trips.filter((t) => t.companions.includes(selectedTripsId)))
     : []), [trips, selectedTripsId]);
 
-  // How much of the browser's storage Orbit is using, for the settings at
-  // the foot of the People list. Checked again whenever trips change.
-  useEffect(() => {
-    if (view !== 'list') return undefined;
-    let live = true;
-    photoStore.estimate().then((u) => { if (live) setStorageUse(u); });
-    return () => { live = false; };
-  }, [view, trips]);
 
   const list = filtering
     ? everyone.filter((p) =>
@@ -9788,7 +9772,7 @@ export default function PersonalCRM({ account = null } = {}) {
         {view === 'settings' && (
           <div className="crm-full">
             <SettingsView account={account} theme={theme} onTheme={pickTheme} start={startView} onStart={pickStart}
-              onClose={() => setView('list')} />
+              onBackup={() => setView('backup')} onClose={() => setView('list')} />
           </div>
         )}
 
@@ -9864,7 +9848,8 @@ export default function PersonalCRM({ account = null } = {}) {
                 onOpen={openTripById}
                 onNew={() => { setTripDraft({ trip: null }); window.scrollTo(0, 0); }}
                 onTakeShared={takeSharedTrip}
-                onGotShared={setIncomingTrip}
+                onOpenShared={openShare}
+                signedIn={Boolean(account)}
                 onDropShared={() => setIncomingTrip(null)}
                 onConvert={convertEvents}
                 onDismissOffer={dismissTripOffer}
@@ -9884,6 +9869,7 @@ export default function PersonalCRM({ account = null } = {}) {
               collections={collections}
               trips={trips}
               lastBackup={lastBackup}
+              signedIn={Boolean(account)}
               onDownloaded={backedUp}
               onRestore={restoreFile}
               onClose={() => setView('list')}
@@ -9993,7 +9979,6 @@ export default function PersonalCRM({ account = null } = {}) {
             <p style={{ fontSize: 12, color: C.faint, margin: '0 0 10px', lineHeight: 1.5 }}>
               Saved locally, in this browser on this device. Only you can see it. It will not
               follow you to another browser or computer — back up before you switch.
-              {storageUse ? ` Orbit is using about ${approxBytes(storageUse.usage)} of this browser's storage.` : ''}
             </p>
 
             <p style={{ fontSize: 12, color: C.faint, margin: '0 0 7px' }}>Theme</p>
