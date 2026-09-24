@@ -12,7 +12,8 @@
     "test": "node --test tests/*.test.mjs",
     "test:browser": "node tests/browser/run.mjs",
     "test:account": "node tests/account/run.mjs",
-    "test:db": "node tests/db/run.mjs"
+    "test:db": "node tests/db/run.mjs",
+    "test:notify": "NODE_TLS_REJECT_UNAUTHORIZED=0 NO_PROXY=127.0.0.1 no_proxy=127.0.0.1 npx --yes deno@2 test --no-lock --node-modules-dir=none --allow-net --allow-env --allow-read --allow-write --allow-run=openssl --allow-sys tests/notify/"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.1",

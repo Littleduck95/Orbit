@@ -413,6 +413,101 @@ grant execute on function public.block_user(uuid) to authenticated;
 grant execute on function public.unblock_user(uuid) to authenticated;
 grant execute on function public.my_blocks() to authenticated;
 
+-- ---------------------------------------------------------------------------
+-- Notifications: what each person wants to hear about, when, and where
+-- (push on the devices they turned it on for, and or an email). The sending
+-- itself is done by the notify function (supabase/functions/notify), which
+-- reads these with the service key; people only ever reach their own rows.
+
+create table if not exists public.notification_prefs (
+  user_id       uuid        primary key default auth.uid() references auth.users (id) on delete cascade,
+  push          boolean     not null default false,
+  email         boolean     not null default false,
+  email_every   text        not null default 'daily' check (email_every in ('daily', 'weekly')),
+  send_hour     smallint    not null default 9 check (send_hour between 0 and 23),
+  time_zone     text        not null default 'UTC' check (char_length(time_zone) between 1 and 64),
+  quiet_start   smallint    check (quiet_start between 0 and 23),
+  quiet_end     smallint    check (quiet_end between 0 and 23),
+  kinds         jsonb       not null default '{"birthdays": true, "reminders": true, "checkins": true, "events": true, "friend_requests": true}'::jsonb
+                            check (jsonb_typeof(kinds) = 'object'),
+  birthday_days smallint    not null default 1 check (birthday_days between 0 and 14),
+  updated_at    timestamptz not null default now()
+);
+
+-- One row per device that turned push on. The endpoint is the address the
+-- browser's push service gave that device.
+create table if not exists public.push_subscriptions (
+  endpoint   text        primary key check (endpoint ~ '^https://' and char_length(endpoint) <= 1000),
+  user_id    uuid        not null default auth.uid() references auth.users (id) on delete cascade,
+  p256dh     text        not null check (char_length(p256dh) <= 200),
+  auth       text        not null check (char_length(auth) <= 100),
+  device     text        not null default '' check (char_length(device) <= 200),
+  created_at timestamptz not null default now()
+);
+create index if not exists push_subscriptions_user on public.push_subscriptions (user_id);
+
+-- What has been sent, so nothing is sent twice. Only the notify function
+-- reads or writes it.
+create table if not exists public.notification_log (
+  user_id uuid        not null references auth.users (id) on delete cascade,
+  channel text        not null check (channel in ('push', 'email')),
+  ref     text        not null,
+  sent_at timestamptz not null default now(),
+  primary key (user_id, channel, ref)
+);
+
+alter table public.notification_prefs enable row level security;
+alter table public.push_subscriptions enable row level security;
+alter table public.notification_log enable row level security;
+
+drop policy if exists "notification_prefs: read own"   on public.notification_prefs;
+drop policy if exists "notification_prefs: add own"    on public.notification_prefs;
+drop policy if exists "notification_prefs: change own" on public.notification_prefs;
+create policy "notification_prefs: read own" on public.notification_prefs
+  for select to authenticated using ((select auth.uid()) = user_id);
+create policy "notification_prefs: add own" on public.notification_prefs
+  for insert to authenticated with check ((select auth.uid()) = user_id);
+create policy "notification_prefs: change own" on public.notification_prefs
+  for update to authenticated using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);
+
+drop policy if exists "push_subscriptions: read own"   on public.push_subscriptions;
+drop policy if exists "push_subscriptions: add own"    on public.push_subscriptions;
+drop policy if exists "push_subscriptions: change own" on public.push_subscriptions;
+drop policy if exists "push_subscriptions: remove own" on public.push_subscriptions;
+create policy "push_subscriptions: read own" on public.push_subscriptions
+  for select to authenticated using ((select auth.uid()) = user_id);
+create policy "push_subscriptions: add own" on public.push_subscriptions
+  for insert to authenticated with check ((select auth.uid()) = user_id);
+create policy "push_subscriptions: change own" on public.push_subscriptions
+  for update to authenticated using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);
+create policy "push_subscriptions: remove own" on public.push_subscriptions
+  for delete to authenticated using ((select auth.uid()) = user_id);
+
+revoke all on public.notification_prefs from anon;
+revoke all on public.push_subscriptions from anon;
+revoke all on public.notification_log from anon, authenticated;
+grant select, insert, update on public.notification_prefs to authenticated;
+grant select, insert, update, delete on public.push_subscriptions to authenticated;
+
+-- Only the known kinds, each on or off.
+create or replace function public.clean_notification_prefs() returns trigger
+language plpgsql set search_path = '' as $$
+declare
+  k text;
+  out jsonb := '{}'::jsonb;
+begin
+  foreach k in array array['birthdays', 'reminders', 'checkins', 'events', 'friend_requests'] loop
+    out := out || jsonb_build_object(k, coalesce(case when jsonb_typeof(new.kinds -> k) = 'boolean' then (new.kinds -> k)::boolean end, true));
+  end loop;
+  new.kinds := out;
+  new.updated_at := now();
+  return new;
+end $$;
+
+drop trigger if exists notification_prefs_clean on public.notification_prefs;
+create trigger notification_prefs_clean before insert or update on public.notification_prefs
+  for each row execute function public.clean_notification_prefs();
+
 -- Tell the API about the table now. Without this it can briefly answer
 -- "Could not find the table 'public.orbit_data' in the schema cache".
 notify pgrst, 'reload schema';

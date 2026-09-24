@@ -149,6 +149,20 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
       if (fn === 'unblock_user') { db.blocked = db.blocked.filter((x) => x.id !== a.other); return reply(null); }
       if (fn === 'my_blocks') return reply(db.blocked.map(({ id, username, display_name }) => ({ id, username, display_name })));
     }
+    if (u.pathname === '/rest/v1/notification_prefs') {
+      if (req.method() === 'GET') return r.fulfill({ status: 200, headers, body: JSON.stringify(db.prefs ? [db.prefs] : []) });
+      db.prefs = JSON.parse(req.postData());
+      return r.fulfill({ status: 201, headers, body: '' });
+    }
+    if (u.pathname === '/rest/v1/push_subscriptions') {
+      if (req.method() === 'POST') { db.subs = [...(db.subs || []), JSON.parse(req.postData())]; return r.fulfill({ status: 201, headers, body: '' }); }
+      if (req.method() === 'DELETE') { db.subsDeleted = u.searchParams.get('endpoint'); db.subs = []; return r.fulfill({ status: 204, headers }); }
+      return r.fulfill({ status: 200, headers, body: JSON.stringify(db.subs || []) });
+    }
+    if (u.pathname === '/functions/v1/notify') {
+      db.notifyCalls = [...(db.notifyCalls || []), { auth: req.headers().authorization, body: JSON.parse(req.postData() || '{}') }];
+      return r.fulfill({ status: 200, headers, body: JSON.stringify({ sent: (db.subs || []).length }) });
+    }
     if (u.pathname === '/rest/v1/rpc/delete_my_account') {
       db.deleted = true;
       db.rows.delete(USER.id);
@@ -657,6 +671,129 @@ const scenarios = {
       && db.profile.visibility?.phone === 'friends' && db.profile.visibility?.bio === 'everyone' && db.profile.searchable === false, db.profile);
     check('no page errors', problems.length === 0, problems);
     await close();
+  },
+
+  async 'preferences and notifications'() {
+    const FULL = { ...PROFILE, pronouns: '', bio: '', location: '', phone: '', contact_email: '', website: '', socials: {}, visibility: {}, searchable: true };
+    const { page, db, mine, problems, close } = await newPage({ signedIn: true, profile: FULL, rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } } });
+    // A push service is out of reach here, so the browser's own sign-up for
+    // push is stood in for: it hands back a device address and keys, as
+    // Chrome's does, and everything around it is real.
+    // Headless Chromium always says notifications are denied, so the
+    // permission prompt is stood in for too: undecided, then allowed.
+    await page.addInitScript(() => {
+      let perm = 'default';
+      window.Notification = class Notification {
+        static get permission() { return perm; }
+        static async requestPermission() { perm = 'granted'; window.__asked = true; return perm; }
+      };
+      let sub = null;
+      const make = () => ({
+        endpoint: 'https://push.example/device-1',
+        toJSON: () => ({ endpoint: 'https://push.example/device-1', keys: { p256dh: 'BPUBKEY', auth: 'AUTHSECRET' } }),
+        unsubscribe: async () => { sub = null; return true; },
+      });
+      PushManager.prototype.subscribe = async function subscribe(opts) {
+        window.__pushOpts = { userVisibleOnly: opts.userVisibleOnly, keyLength: opts.applicationServerKey.length };
+        sub = make();
+        return sub;
+      };
+      PushManager.prototype.getSubscription = async () => sub;
+    });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    await page.getByRole('button', { name: /^More/ }).click();
+    await page.getByRole('button', { name: 'Settings' }).click();
+    await page.getByRole('button', { name: 'Preferences' }).click();
+    check('shows push as off for this device', await shown(page.getByText('Off for this device.')));
+
+    await page.getByRole('button', { name: 'Turn on', exact: true }).click();
+    check('turning it on asks the browser\'s permission and says so', await shown(page.getByText('Push is on for this device.'))
+      && await page.evaluate(() => window.__asked === true));
+    check('signs up with the site\'s public key, for visible notifications only', await page.evaluate(() => window.__pushOpts?.userVisibleOnly === true && window.__pushOpts?.keyLength === 65));
+    const sub = db.subs?.[0];
+    check('saves the device', sub?.endpoint === 'https://push.example/device-1' && sub?.p256dh === 'BPUBKEY' && sub?.auth === 'AUTHSECRET'
+      && sub?.user_id === USER.id && /on /.test(sub?.device || ''), sub);
+    check('and turns push on in their settings, in this device\'s time zone', db.prefs?.push === true && db.prefs?.time_zone === 'America/Chicago', db.prefs);
+
+    await page.getByRole('button', { name: 'Send a test' }).click();
+    check('a test goes to the notify function as the signed-in person', await shown(page.getByText('Sent. It should appear in a moment.'))
+      && db.notifyCalls?.[0]?.body?.action === 'test' && db.notifyCalls[0].auth === 'Bearer test-access', db.notifyCalls);
+
+    await page.getByRole('checkbox', { name: /Email me a digest/ }).check();
+    await page.getByLabel('How often').selectOption('weekly');
+    await page.getByRole('checkbox', { name: /^Check-ins/ }).uncheck();
+    await page.getByLabel('When to hear about birthdays').selectOption('7');
+    await page.getByLabel('Time of day').selectOption('8');
+    await page.getByLabel('Quiet from').selectOption('21');
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await shown(page.getByText('Saved.'));
+    const pr = db.prefs;
+    check('saves what, when and how', pr.email === true && pr.email_every === 'weekly' && pr.kinds.checkins === false && pr.kinds.birthdays === true
+      && pr.birthday_days === 7 && pr.send_hour === 8 && pr.quiet_start === 21 && pr.quiet_end === 7, pr);
+
+    await page.getByRole('button', { name: 'Turn off' }).click();
+    check('turning it off forgets the device', await shown(page.getByText('Push is off for this device.')) && db.subsDeleted === 'eq.https://push.example/device-1', db.subsDeleted);
+
+    await page.getByRole('button', { name: 'Orbit', exact: true }).click();
+    await page.getByLabel('Open Orbit on').selectOption('reminders');
+    await page.waitForTimeout(300);
+    check('the theme and where Orbit opens are kept', mine().get('crm-theme-v1') === 'orbit' && mine().get('crm-start-v1') === 'reminders');
+    await page.reload();
+    check('and Orbit opens there next time', await shown(page.getByRole('heading', { name: 'Nothing to remember yet' })));
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
+  async 'push on an iPhone outside the Home Screen'() {
+    const FULL = { ...PROFILE, visibility: {}, socials: {} };
+    const { page, close } = await newPage({ signedIn: true, profile: FULL, rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } } });
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'userAgent', { get: () => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1' });
+    });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    await page.getByRole('button', { name: /^More/ }).click();
+    await page.getByRole('button', { name: 'Settings' }).click();
+    await page.getByRole('button', { name: 'Preferences' }).click();
+    check('explains adding Orbit to the Home Screen first', await shown(page.getByText('add Orbit to your Home Screen first', { exact: false }))
+      && !(await page.getByRole('button', { name: 'Turn on', exact: true }).count()));
+    await close();
+  },
+
+  async 'a push arriving at the service worker'() {
+    // The headless shell cannot show notifications, so this uses the full
+    // Chromium Playwright ships, and delivers a push through its DevTools.
+    const full = await pw.chromium.launch({ channel: 'chromium' }).catch(() => null);
+    if (!full) { check('full Chromium is available for this check', false); return; }
+    try {
+      const ctx = await full.newContext();
+      await ctx.grantPermissions(['notifications'], { origin: new URL(url).origin });
+      const page = await ctx.newPage();
+      await page.route('https://fonts.googleapis.com/**', (r) => r.abort());
+      await page.route(`${SB}/**`, (r) => r.abort());
+      await page.goto(url);
+      await page.evaluate(async () => { await navigator.serviceWorker.register('/sw.js'); await navigator.serviceWorker.ready; });
+      const cdp = await ctx.newCDPSession(page);
+      const regs = [];
+      cdp.on('ServiceWorker.workerRegistrationUpdated', (e) => regs.push(...e.registrations));
+      await cdp.send('ServiceWorker.enable');
+      await page.waitForTimeout(500);
+      const push = (data) => cdp.send('ServiceWorker.deliverPushMessage', { origin: new URL(url).origin, registrationId: regs.find((r) => !r.isDeleted).registrationId, data });
+      const shown = () => page.evaluate(async () => (await (await navigator.serviceWorker.ready).getNotifications())
+        .map((n) => ({ title: n.title, body: n.body, tag: n.tag, icon: n.icon, url: n.data?.url })));
+      await push(JSON.stringify({ title: 'Orbit: 2 things coming up', body: "Dana's birthday is tomorrow", tag: 'orbit-digest', url: 'https://elsewhere.example/' }));
+      await page.waitForTimeout(800);
+      const [n] = await shown();
+      check('a push is shown as a notification', n?.title === 'Orbit: 2 things coming up' && n?.body === "Dana's birthday is tomorrow", n);
+      check('with Orbit\'s icon', n?.icon === `${url}icon-192.png`, n?.icon);
+      check('and tapping it only ever opens Orbit, whatever the push says', n?.url === url, n?.url);
+      await push('not json at all');
+      await page.waitForTimeout(800);
+      check('a push that is not JSON still shows, as text', (await shown()).some((x) => x.title === 'Orbit' && x.body === 'not json at all'));
+    } finally {
+      await full.close();
+    }
   },
 };
 

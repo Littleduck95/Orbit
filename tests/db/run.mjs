@@ -80,13 +80,13 @@ try {
   };
   const before = report();
   check('the setup check runs on an empty database and reports everything missing',
-    before.length === 15 && before.every(([, st]) => st.startsWith('MISSING')), before);
+    before.length === 18 && before.every(([, st]) => st.startsWith('MISSING')), before);
   // Part 1 alone, as it was merged, before friends existed.
   const partOne = schema.slice(0, schema.indexOf('-- Profiles as others see them.'));
   if (partOne.length < schema.length) {
     psql(`${partOne}\n`);
     const mid = report();
-    check('after part 1 only, it reports part 1 OK and part 2 missing',
+    check('after part 1 only, it reports part 1 OK and the rest missing',
       mid.slice(0, 8).every(([, st]) => st === 'OK') && mid.slice(8).every(([, st]) => st.startsWith('MISSING')), mid);
   }
   const first = psql(schema);
@@ -94,7 +94,7 @@ try {
   const again = psql(schema);
   check('and runs again without harm, as its header promises', again.ok, again.err);
   const after = report();
-  check('after the whole schema, the setup check says OK to everything', after.length === 15 && after.every(([, st]) => st === 'OK'), after);
+  check('after the whole schema, the setup check says OK to everything', after.length === 18 && after.every(([, st]) => st === 'OK'), after);
 
   // ---- signing up ----
   check('a password sign-up makes the profile in the same step',
@@ -219,6 +219,28 @@ try {
   check('nor can another profile be read around its settings', peek.ok && peek.out.split('\n').pop() !== '816-555-0100', peek.out);
   const inner = as(D, `select public.profile_for(p, '${B}') from public.profiles p;`);
   check('and the function that decides what shows cannot be called with someone else as the viewer', !inner.ok, inner.err);
+
+  // ---- notifications ----
+  check('a person saves their notification settings', as(B, `insert into public.notification_prefs (user_id, push, send_hour, time_zone, kinds)
+    values ('${B}', true, 8, 'America/Chicago', '{"birthdays": false, "junk": true, "events": "yes"}'::jsonb);`).ok);
+  check('only the known kinds are kept, each on or off', psql(`select kinds::text from public.notification_prefs where user_id = '${B}'`).out
+    === '{"events": true, "checkins": true, "birthdays": false, "reminders": true, "friend_requests": true}');
+  const hour = as(B, `update public.notification_prefs set send_hour = 25 where user_id = '${B}';`);
+  check('a send hour must be a real hour', !hour.ok);
+  check('nobody reads someone else\'s settings', as(D, 'select count(*) from public.notification_prefs;').out.split('\n').pop() === '0');
+  const forgePrefs = as(D, `insert into public.notification_prefs (user_id, email) values ('${B}', true);`);
+  check('nor makes them', !forgePrefs.ok && /row-level security/.test(forgePrefs.err), forgePrefs.err);
+  check('a device turns push on', as(B, `insert into public.push_subscriptions (endpoint, p256dh, auth) values ('https://push.example/abc', 'key', 'secret');`).ok
+    && psql(`select user_id from public.push_subscriptions`).out === B);
+  const httpSub = as(B, `insert into public.push_subscriptions (endpoint, p256dh, auth) values ('http://push.example/x', 'k', 's');`);
+  check('a push address must be https', !httpSub.ok);
+  check('nobody sees someone else\'s devices', as(D, 'select count(*) from public.push_subscriptions;').out.split('\n').pop() === '0');
+  const stealSub = as(D, `update public.push_subscriptions set user_id = '${D}' where endpoint = 'https://push.example/abc';`);
+  check('nor takes them over', stealSub.ok && psql(`select user_id from public.push_subscriptions`).out === B);
+  const readLog = as(B, 'select * from public.notification_log;');
+  check('the sent log is not for reading', !readLog.ok && /permission denied/.test(readLog.err), readLog.err);
+  check('turning push off removes the device', as(B, "delete from public.push_subscriptions where endpoint = 'https://push.example/abc';").ok
+    && psql('select count(*) from public.push_subscriptions').out === '0');
 
   // ---- deleting an account ----
   const anonDel = as('anon', 'select public.delete_my_account();');

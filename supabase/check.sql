@@ -28,6 +28,12 @@ from (values
                                                 and to_regprocedure('public.my_friends()') is not null),
   (15, 'Part 2: block and unblock',            to_regprocedure('public.block_user(uuid)') is not null
                                                 and to_regprocedure('public.unblock_user(uuid)') is not null
-                                                and to_regprocedure('public.my_blocks()') is not null)
+                                                and to_regprocedure('public.my_blocks()') is not null),
+  (16, 'Part 3: notification settings',        to_regclass('public.notification_prefs') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.notification_prefs')), false)),
+  (17, 'Part 3: devices with push on',         to_regclass('public.push_subscriptions') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.push_subscriptions')), false)),
+  (18, 'Part 3: what has been sent',           to_regclass('public.notification_log') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.notification_log')), false))
 ) as t(n, item, ok)
 order by n;

@@ -6,6 +6,7 @@ import {
   changeEmail, deleteAccount, friendsApi, loadProfile, setPassword, updateProfile, usernameAvailable,
 } from './accountApi.js';
 import { NewPassword, ProfileSetup, Screen, SignIn, css, returnTo } from './SignIn.jsx';
+import { notificationsApi } from './notifications.js';
 
 /*
  * Stands in front of the app when Orbit has a Supabase project (see .env).
@@ -214,6 +215,7 @@ export default function Account({ client, children }) {
           signOut,
           checkUsername: (name) => usernameAvailable(client, name),
           friends: friendsApi(client),
+          notifications: notificationsApi(client, userId, `${import.meta.env.VITE_SUPABASE_URL}/functions/v1`),
           // The link a friend's QR code opens: this page, with their username.
           addLink: profile ? `${returnTo()}#add=${profile.username}` : '',
           updateProfile: async (changes) => {
