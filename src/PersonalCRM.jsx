@@ -1,7 +1,8 @@
 import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, memo } from 'react';
 import Papa from 'papaparse';
 import {
-  MIN_PASSWORD, birthdayProblem, cleanUsername, displayNameProblem, emailProblem, passwordProblem, usernameProblem,
+  MIN_PASSWORD, PROFILE_FIELDS, SOCIAL_KEYS, VISIBILITY, birthdayProblem, cleanUsername, displayNameProblem, emailProblem,
+  passwordProblem, seenAs, usernameProblem, visibilityOf,
 } from './accountApi.js';
 
 /* ---------- palette ---------- */
@@ -5528,6 +5529,7 @@ function MapView({ events, people }) {
 }
 
 /* ---------- settings ---------- */
+
 const settingsCard = () => ({
   background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '15px 15px 14px', marginBottom: 16,
 });
@@ -5677,14 +5679,428 @@ function AccountSettings({ account }) {
   );
 }
 
+/* ---------- friends: how a profile looks ---------- */
+// A link to someone's social profile from the handle they gave. The handle
+// is someone else's text, so it only ever goes into the path of a known site.
+const socialHref = (key, value) => {
+  const v = String(value || '').trim();
+  if (key === 'linkedin' && /^https?:\/\//i.test(v)) return safeLink(v);
+  const h = encodeURIComponent(handle(v));
+  return {
+    instagram: `https://instagram.com/${h}`, x: `https://x.com/${h}`, tiktok: `https://tiktok.com/@${h}`,
+    snapchat: `https://snapchat.com/add/${h}`, linkedin: `https://linkedin.com/in/${h}`,
+  }[key] || '';
+};
+
+// One profile, showing whatever the viewer was allowed to receive.
+function ProfileCard({ pv, children }) {
+  const socials = SOCIAL_KEYS.filter(([k]) => pv.socials?.[k]);
+  const site = pv.website ? safeLink(pv.website) : '';
+  const facts = [
+    pv.location && ['Lives in', pv.location],
+    isDay(pv.birthday) && ['Birthday', prettyBirthday(pv.birthday)],
+    pv.phone && ['Phone', pv.phone],
+    pv.contact_email && ['Email', pv.contact_email],
+  ].filter(Boolean);
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '15px 15px 14px' }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 20, fontWeight: 600, letterSpacing: '-0.03em', color: C.ink, overflowWrap: 'anywhere' }}>{pv.display_name}</span>
+        {pv.pronouns && <span style={{ fontSize: 13, color: C.faint }}>{pv.pronouns}</span>}
+      </div>
+      <div style={{ fontSize: 13, color: C.muted, marginTop: 2 }}>@{pv.username}</div>
+      {pv.bio && <p className="crm-serif" style={{ margin: '10px 0 0', fontSize: 15, lineHeight: 1.55, color: C.ink, overflowWrap: 'anywhere' }}>{pv.bio}</p>}
+      {facts.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          {facts.map(([l, v]) => (
+            <p key={l} style={{ margin: '0 0 4px', fontSize: 13, lineHeight: 1.5, color: C.ink, overflowWrap: 'anywhere' }}>
+              <span style={{ color: C.faint }}>{l} </span>{v}
+            </p>
+          ))}
+        </div>
+      )}
+      {(site || socials.length > 0) && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 14px', marginTop: 8 }}>
+          {site && <a href={site} target="_blank" rel="noreferrer noopener" style={linkStyle}><span style={{ color: C.faint }}>Website </span>{linkHost(site)}</a>}
+          {socials.map(([k, label]) => {
+            const href = socialHref(k, pv.socials[k]);
+            return href ? (
+              <a key={k} href={href} target="_blank" rel="noreferrer noopener" style={linkStyle}>
+                <span style={{ color: C.faint }}>{label} </span>{handle(String(pv.socials[k])).slice(0, 60)}
+              </a>
+            ) : null;
+          })}
+        </div>
+      )}
+      {children}
+    </div>
+  );
+}
+
+function VisibilityPick({ value, onChange, label }) {
+  return (
+    <select className="crm-select" aria-label={`Who sees ${label.toLowerCase()}`} value={value} onChange={(e) => onChange(e.target.value)}
+      style={{ ...inputStyle, width: 'auto', minHeight: 34, padding: '4px 30px 4px 10px', fontSize: 12.5, flexShrink: 0 }}>
+      {VISIBILITY.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+    </select>
+  );
+}
+
+function ProfileSettings({ account }) {
+  const pr = account.profile;
+  const ready = pr && 'visibility' in pr;
+  const start = () => ({
+    pronouns: pr?.pronouns || '', bio: pr?.bio || '', location: pr?.location || '', phone: pr?.phone || '',
+    contact_email: pr?.contact_email || '', website: pr?.website || '', socials: { ...(pr?.socials || {}) },
+    visibility: Object.fromEntries(PROFILE_FIELDS.map((f) => [f.key, visibilityOf(pr, f.key)])),
+    searchable: pr?.searchable !== false,
+  });
+  const [draft, setDraft] = useState(start);
+  const [as, setAs] = useState('none');
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState('');
+  const [said, setSaid] = useState('');
+  if (!pr) return <p style={{ fontSize: 14, color: C.muted }}>Your profile is not set up on the server yet.</p>;
+  if (!ready) {
+    return (
+      <p style={{ fontSize: 14, color: C.soonText, lineHeight: 1.5 }}>
+        Profiles and friends are not switched on yet. Run the updated setup script in Supabase, then come back.
+      </p>
+    );
+  }
+  const set = (k, v) => { setDraft({ ...draft, [k]: v }); setSaid(''); };
+  const setVis = (k, v) => set('visibility', { ...draft.visibility, [k]: v });
+  const save = async () => {
+    setProblem('');
+    const site = draft.website.trim() ? safeLink(draft.website) : '';
+    if (draft.website.trim() && !site) { setProblem('The website needs to be a web address, like https://example.com.'); return; }
+    if (draft.contact_email.trim() && emailProblem(draft.contact_email)) { setProblem('The email for friends does not look like an email address.'); return; }
+    const socials = Object.fromEntries(SOCIAL_KEYS.map(([k]) => [k, handle(draft.socials[k] || '').slice(0, 100)]).filter(([, v]) => v));
+    setBusy(true);
+    try {
+      await account.updateProfile({
+        pronouns: draft.pronouns, bio: draft.bio, location: draft.location, phone: draft.phone,
+        contactEmail: draft.contact_email, website: site, socials, visibility: draft.visibility, searchable: draft.searchable,
+      });
+      setDraft({ ...draft, website: site, socials });
+      setSaid('Your profile is saved.');
+    } catch (err) {
+      setProblem(err?.message || 'That did not save. Try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const preview = seenAs({ ...pr, ...draft }, as);
+
+  return (
+    <div>
+      <div style={settingsCard()}>
+        <p style={settingsHead}>What people see</p>
+        <p style={{ margin: '0 0 12px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+          Your name (<strong style={{ color: C.ink }}>{pr.display_name}</strong>) and username (<strong style={{ color: C.ink }}>@{pr.username}</strong>)
+          are always visible, so people can find you. Choose who sees everything else. The email you sign in with is never shown.
+        </p>
+        {PROFILE_FIELDS.map((f) => (
+          <div key={f.key} style={{ padding: '10px 0', borderTop: `1px solid ${C.line}` }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: f.fromAccount ? 0 : 7 }}>
+              <span style={{ flex: 1, fontSize: 13.5, fontWeight: 600, color: C.ink }}>{f.label}</span>
+              <VisibilityPick label={f.label} value={draft.visibility[f.key]} onChange={(v) => setVis(f.key, v)} />
+            </div>
+            {f.fromAccount ? (
+              <span style={hintStyle()}>{prettyDate(pr.birthday)}. Change it under Account.</span>
+            ) : f.key === 'socials' ? (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(170px, 1fr))', gap: 8 }}>
+                {SOCIAL_KEYS.map(([k, label]) => (
+                  <label key={k} style={{ display: 'block', fontSize: 12, color: C.faint }}>
+                    {label}
+                    <input placeholder={k === 'linkedin' ? 'profile URL or handle' : '@handle'} maxLength={100}
+                      style={{ ...inputStyle, minHeight: 36, fontSize: 14, marginTop: 3 }}
+                      value={draft.socials[k] || ''} onChange={(e) => set('socials', { ...draft.socials, [k]: e.target.value })} />
+                  </label>
+                ))}
+              </div>
+            ) : f.long ? (
+              <textarea aria-label={f.label} placeholder={f.ph} maxLength={f.max} rows={3} value={draft[f.key]}
+                onChange={(e) => set(f.key, e.target.value)}
+                style={{ ...inputStyle, fontSize: 14, lineHeight: 1.5, resize: 'vertical' }} />
+            ) : (
+              <input aria-label={f.label} placeholder={f.ph} maxLength={f.max} value={draft[f.key]}
+                type={f.key === 'contact_email' ? 'email' : f.key === 'phone' ? 'tel' : f.key === 'website' ? 'url' : 'text'}
+                onChange={(e) => set(f.key, e.target.value)} style={{ ...inputStyle, minHeight: 38, fontSize: 14 }} />
+            )}
+          </div>
+        ))}
+        <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
+          <Check on={draft.searchable} onChange={(v) => set('searchable', v)} label="Show me in search"
+            hint="Off: people can only add you from your QR code or link." />
+        </div>
+        {problem && <p role="alert" style={{ margin: '4px 0 10px', fontSize: 13, color: C.overdue, lineHeight: 1.5 }}>{problem}</p>}
+        <Button kind="solid" onClick={busy ? undefined : save}>{busy ? 'Saving…' : 'Save profile'}</Button>
+        <p aria-live="polite" style={{ margin: said ? '10px 0 0' : 0, fontSize: 13, color: C.calmText }}>{said}</p>
+      </div>
+
+      <div style={settingsCard()}>
+        <p style={settingsHead}>Preview</p>
+        <div role="group" aria-label="See your profile as" style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+          {[['none', 'Someone new'], ['friends', 'A friend']].map(([v, l]) => (
+            <button key={v} className="crm-btn" aria-pressed={as === v} onClick={() => setAs(v)} style={segment(as === v)}>{l}</button>
+          ))}
+        </div>
+        <ProfileCard pv={preview} />
+        <span style={hintStyle()}>Unsaved changes show here too.</span>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- friends ---------- */
+// A friend's profile as a person to keep in Orbit. It goes through the same
+// checks and the same preview as anything shared, so it can be merged with
+// someone already here rather than duplicated.
+const profileToPerson = (pv) => cleanSharedPerson({
+  n: pv.display_name,
+  ph: pv.phone,
+  e: pv.contact_email,
+  ad: pv.location,
+  b: pv.birthday,
+  so: pv.socials,
+  no: [pv.pronouns && `Pronouns: ${pv.pronouns}`, pv.bio, pv.website && safeLink(pv.website)].filter(Boolean).join('\n'),
+});
+
+const RELATION_WORDS = { friends: 'Friends', sent: 'Request sent', received: 'Wants to be friends', none: '', self: 'You' };
+
+function FriendRow({ pv, onOpen, children }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 0', borderBottom: `1px solid ${C.line}` }}>
+      <button className="crm-btn" onClick={onOpen} style={{
+        flex: 1, minWidth: 0, textAlign: 'left', font: 'inherit', background: 'transparent', border: 'none', padding: 0, cursor: 'pointer',
+      }}>
+        <span style={{ display: 'block', fontSize: 15, fontWeight: 600, color: C.ink, letterSpacing: '-0.02em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{pv.display_name}</span>
+        <span style={{ display: 'block', fontSize: 12.5, color: C.muted }}>@{pv.username}{RELATION_WORDS[pv.relation] ? ` · ${RELATION_WORDS[pv.relation]}` : ''}</span>
+      </button>
+      <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>{children}</div>
+    </div>
+  );
+}
+
+function FriendsView({ account, startWith, onStarted, onSaveToPeople, onCount, onClose }) {
+  const api = account.friends;
+  const [list, setList] = useState(null);
+  const [q, setQ] = useState('');
+  const [found, setFound] = useState({ q: '', rows: [] });
+  const [open, setOpen] = useState(null);
+  const [code, setCode] = useState(false);
+  const [blocks, setBlocks] = useState(null);
+  const [confirmBlock, setConfirmBlock] = useState(false);
+  const [problem, setProblem] = useState('');
+  const [said, setSaid] = useState('');
+
+  const reload = useCallback(async () => {
+    try {
+      const rows = await api.list();
+      setList(rows);
+      onCount(rows.filter((r) => r.relation === 'received').length);
+    } catch (err) {
+      setList([]);
+      setProblem(err.message);
+    }
+  }, [api, onCount]);
+  useEffect(() => { reload(); }, [reload]);
+
+  // Someone's code or link, opened: their profile, ready to add.
+  useEffect(() => {
+    if (!startWith) return;
+    let live = true;
+    api.get(startWith).then((pv) => {
+      if (!live) return;
+      if (pv) setOpen(pv); else setProblem(`No one called @${startWith} could be found.`);
+      onStarted();
+    }, (err) => { if (live) { setProblem(err.message); onStarted(); } });
+    return () => { live = false; };
+  }, [api, startWith, onStarted]);
+
+  const term = q.trim().replace(/^@/, '');
+  useEffect(() => {
+    if (term.length < 2) return undefined;
+    let live = true;
+    const t = setTimeout(() => {
+      api.search(term).then((rows) => { if (live) setFound({ q: term, rows }); }, (err) => { if (live) setProblem(err.message); });
+    }, 300);
+    return () => { live = false; clearTimeout(t); };
+  }, [api, term]);
+  const results = term.length >= 2 && found.q === term ? found.rows : null;
+
+  // Every change answers with how the two of you now stand; the list, the
+  // results and the open profile all follow it.
+  const act = async (pv, fn, done) => {
+    setProblem('');
+    setSaid('');
+    try {
+      const rel = await fn();
+      const relation = typeof rel === 'string' ? rel : 'none';
+      setFound((f) => ({ ...f, rows: f.rows.map((r) => (r.id === pv.id ? { ...r, relation } : r)) }));
+      if (open?.id === pv.id) {
+        // Becoming friends can show more of them, so their profile is read again.
+        const fresh = relation === 'friends' || relation === 'none' ? await api.get(pv.username).catch(() => null) : null;
+        setOpen(fresh || { ...open, relation });
+      }
+      if (done) setSaid(done);
+      await reload();
+    } catch (err) {
+      setProblem(err.message);
+    }
+  };
+  const actions = (pv, full) => {
+    const b = (label, fn, kind = 'quiet', done) => (
+      <Button key={label} kind={kind} style={small} onClick={() => act(pv, fn, done)}>{label}</Button>
+    );
+    if (pv.relation === 'none') return [b('Add friend', () => api.send(pv.id), 'solid', `Asked ${pv.display_name} to be friends.`)];
+    if (pv.relation === 'sent') return [b(full ? 'Cancel request' : 'Cancel', () => api.remove(pv.id))];
+    if (pv.relation === 'received') {
+      return [b('Accept', () => api.respond(pv.id, true), 'solid', `You and ${pv.display_name} are friends.`), b('Decline', () => api.respond(pv.id, false))];
+    }
+    if (pv.relation === 'friends' && full) return [b('Remove friend', () => api.remove(pv.id))];
+    return [];
+  };
+
+  const received = (list || []).filter((r) => r.relation === 'received');
+  const friends = (list || []).filter((r) => r.relation === 'friends');
+  const sent = (list || []).filter((r) => r.relation === 'sent');
+  const section = (title, rows, empty) => (
+    <div style={{ marginBottom: 20 }}>
+      <p style={settingsHead}>{title}{rows.length ? ` · ${rows.length}` : ''}</p>
+      {rows.length === 0 && empty && <p style={{ margin: 0, fontSize: 13.5, color: C.muted, lineHeight: 1.5 }}>{empty}</p>}
+      {rows.map((pv) => <FriendRow key={pv.id} pv={pv} onOpen={() => { setOpen(pv); setConfirmBlock(false); }}>{actions(pv, false)}</FriendRow>)}
+    </div>
+  );
+
+  const header = (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+      <h1 style={{ margin: 0, fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Friends</h1>
+      <Button onClick={onClose} style={{ marginLeft: 'auto' }}>Done</Button>
+    </div>
+  );
+  const notes = (
+    <>
+      {problem && <p role="alert" style={{ margin: '0 0 12px', fontSize: 13, color: C.overdue, lineHeight: 1.5 }}>{problem}</p>}
+      <p aria-live="polite" style={{ margin: said ? '0 0 12px' : 0, fontSize: 13, color: C.calmText, lineHeight: 1.5 }}>{said}</p>
+    </>
+  );
+
+  if (open) {
+    return (
+      <div style={{ maxWidth: 620 }}>
+        <button className="crm-btn" onClick={() => { setOpen(null); setSaid(''); setProblem(''); }} style={{
+          font: 'inherit', fontSize: 13, fontWeight: 600, color: C.muted, background: 'transparent', border: 'none', padding: '0 0 12px', cursor: 'pointer',
+        }}>← Friends</button>
+        {notes}
+        <ProfileCard pv={open}>
+          {RELATION_WORDS[open.relation] && <p style={{ margin: '10px 0 0', fontSize: 12.5, color: C.faint }}>{RELATION_WORDS[open.relation]}</p>}
+          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginTop: 12 }}>
+            {actions(open, true)}
+            {open.relation !== 'self' && (
+              <Button style={small} onClick={() => onSaveToPeople(open)}>Save to my People</Button>
+            )}
+          </div>
+          {open.relation !== 'friends' && open.relation !== 'self' && (
+            <p style={{ margin: '10px 0 0', fontSize: 12, color: C.faint, lineHeight: 1.5 }}>You see what they share with everyone. Friends may see more.</p>
+          )}
+          {open.relation !== 'self' && (
+            <div style={{ borderTop: `1px solid ${C.line}`, marginTop: 14, paddingTop: 10 }}>
+              {confirmBlock ? (
+                <>
+                  <p style={{ margin: '0 0 8px', fontSize: 13, color: C.ink, lineHeight: 1.5 }}>
+                    Block @{open.username}? You will not be friends, and neither of you will find the other. They are not told.
+                  </p>
+                  <div style={{ display: 'flex', gap: 7 }}>
+                    <Button kind="danger" style={{ ...small, border: `1px solid ${C.overdue}` }} onClick={async () => {
+                      await act(open, async () => { await api.block(open.id); return 'none'; });
+                      setOpen(null);
+                      setSaid(`Blocked @${open.username}.`);
+                    }}>Block</Button>
+                    <Button style={small} onClick={() => setConfirmBlock(false)}>Cancel</Button>
+                  </div>
+                </>
+              ) : (
+                <Button kind="danger" style={small} onClick={() => setConfirmBlock(true)}>Block</Button>
+              )}
+            </div>
+          )}
+        </ProfileCard>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ maxWidth: 620 }}>
+      {header}
+      {notes}
+      <div style={{ ...settingsCard(), marginBottom: 20 }}>
+        <p style={settingsHead}>Find people</p>
+        <input aria-label="Search by username or name" placeholder="Search by username or name" value={q} autoCapitalize="none" spellCheck={false}
+          onChange={(e) => setQ(e.target.value)} style={{ ...inputStyle, minHeight: 40 }} />
+        {term.length === 1 && <span style={hintStyle()}>Keep typing: at least two letters.</span>}
+        {results && results.length === 0 && <p style={{ margin: '10px 0 0', fontSize: 13.5, color: C.muted }}>No one found for “{term}”.</p>}
+        {results && results.map((pv) => (
+          <FriendRow key={pv.id} pv={pv} onOpen={() => { setOpen(pv); setConfirmBlock(false); }}>{actions(pv, false)}</FriendRow>
+        ))}
+        <div style={{ marginTop: 14, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <Button onClick={() => setCode(!code)} style={small}>{code ? 'Hide my code' : 'My friend code'}</Button>
+          <span style={{ fontSize: 12.5, color: C.faint }}>Let someone scan it to add you.</span>
+        </div>
+        {code && account.addLink && (
+          <div style={{ marginTop: 12 }}>
+            <QrCode text={account.addLink} label={`QR code to add @${account.profile.username} as a friend`} />
+            <p style={{ margin: '8px 0 6px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+              @{account.profile.username}. They point their phone’s camera at it, or open the link.
+            </p>
+            <Button style={small} onClick={async () => {
+              try { await navigator.clipboard.writeText(account.addLink); setSaid('Your link is copied.'); } catch { setProblem(account.addLink); }
+            }}>Copy my link</Button>
+          </div>
+        )}
+      </div>
+
+      {list === null ? <p style={{ fontSize: 13.5, color: C.muted }}>Loading your friends…</p> : (
+        <>
+          {received.length > 0 && section('Requests', received)}
+          {section('Friends', friends, 'No friends yet. Search for someone above, or share your code.')}
+          {sent.length > 0 && section('Sent', sent)}
+        </>
+      )}
+
+      <details onToggle={(e) => { if (e.target.open && blocks === null) api.blocks().then(setBlocks, () => setBlocks([])); }}
+        style={{ fontSize: 13, color: C.muted }}>
+        <summary style={{ cursor: 'pointer' }}>Blocked people</summary>
+        {blocks === null ? <p style={{ margin: '8px 0 0' }}>Loading…</p> : blocks.length === 0 ? <p style={{ margin: '8px 0 0' }}>No one.</p> : blocks.map((b) => (
+          <div key={b.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: `1px solid ${C.line}` }}>
+            <span style={{ flex: 1, color: C.ink }}>{b.display_name} <span style={{ color: C.faint }}>@{b.username}</span></span>
+            <Button style={small} onClick={async () => {
+              try { await api.unblock(b.id); setBlocks(blocks.filter((x) => x.id !== b.id)); } catch (err) { setProblem(err.message); }
+            }}>Unblock</Button>
+          </div>
+        ))}
+      </details>
+    </div>
+  );
+}
+
 function SettingsView({ account, onClose }) {
+  const [tab, setTab] = useState('account');
   return (
     <div style={{ maxWidth: 620 }}>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
         <h1 style={{ margin: 0, fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Settings</h1>
         <Button onClick={onClose} style={{ marginLeft: 'auto' }}>Done</Button>
       </div>
-      {account ? <AccountSettings account={account} /> : (
+      {account && (
+        <div role="group" aria-label="Settings section" style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+          {[['account', 'Account'], ['profile', 'Profile']].map(([v, l]) => (
+            <button key={v} className="crm-btn" aria-pressed={tab === v} onClick={() => setTab(v)} style={filterChip(tab === v)}>{l}</button>
+          ))}
+        </div>
+      )}
+      {account ? (tab === 'profile' ? <ProfileSettings account={account} /> : <AccountSettings account={account} />) : (
         <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
           This copy of Orbit has no accounts switched on, so everything is saved in this browser only.
         </p>
@@ -6051,6 +6467,11 @@ export default function PersonalCRM({ account = null } = {}) {
   const [incoming, setIncoming] = useState(null);
   // People someone shared, waiting to be looked at on the Receive screen.
   const [received, setReceived] = useState(null);
+  // Friend requests waiting for an answer, shown on the menu.
+  const [friendCount, setFriendCount] = useState(0);
+  // A username from a friend's code or link, to open on the Friends screen.
+  const [addTarget, setAddTarget] = useState('');
+  const friendsOn = Boolean(account?.friends && account.profile && 'visibility' in account.profile);
   const listsLook = useRef({ q: '', kind: 'All', order: 'recent' });
   // Saved lists that could not be read as they were: their original text,
   // shown in a warning with a way to download it.
@@ -6126,6 +6547,14 @@ export default function PersonalCRM({ account = null } = {}) {
   useEffect(() => {
     const look = async (arriving) => {
       const hash = window.location.hash;
+      // A friend's code: their profile, on the Friends screen.
+      const add = hash.match(/^#add=@?([A-Za-z0-9._]{3,20})$/);
+      if (add) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+        setAddTarget(add[1].toLowerCase());
+        setView('friends');
+        return;
+      }
       if (!hash.startsWith(`#${SHARE_PREFIX}`)) return;
       window.history.replaceState(null, '', window.location.pathname + window.location.search);
       const got = await readAnyShare(hash);
@@ -6202,6 +6631,23 @@ export default function PersonalCRM({ account = null } = {}) {
       const { via: _via, ...rest } = x;
       return rest;
     }));
+  };
+
+  // How many friend requests wait, read once when Orbit opens.
+  useEffect(() => {
+    if (!friendsOn) return undefined;
+    let live = true;
+    account.friends.list().then((rows) => {
+      if (live) setFriendCount(rows.filter((r) => r.relation === 'received').length);
+    }, () => {});
+    return () => { live = false; };
+  }, [friendsOn, account]);
+
+  const clearAddTarget = useCallback(() => setAddTarget(''), []);
+
+  const saveFriendToPeople = (pv) => {
+    const person = profileToPerson(pv);
+    if (person) openShare({ type: 'people', by: `@${pv.username}`, on: todayStr(), people: [person] });
   };
 
   const toggleVip = (id) => {
@@ -6618,7 +7064,7 @@ export default function PersonalCRM({ account = null } = {}) {
               <div style={{ position: 'relative' }}>
                 <button
                   className="crm-btn"
-                  aria-label="More"
+                  aria-label={friendCount ? `More, ${friendCount} friend ${friendCount === 1 ? 'request' : 'requests'}` : 'More'}
                   aria-expanded={menuOpen}
                   onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen); }}
                   style={{
@@ -6633,6 +7079,12 @@ export default function PersonalCRM({ account = null } = {}) {
                     <circle cx="2" cy="7.5" r="1.6" fill="currentColor" />
                     <circle cx="2" cy="12.5" r="1.6" fill="currentColor" />
                   </svg>
+                  {friendCount > 0 && (
+                    <span aria-hidden="true" style={{
+                      position: 'absolute', top: -3, right: -3, width: 9, height: 9, borderRadius: 9,
+                      background: C.overdueBar, border: `2px solid ${C.ground}`,
+                    }} />
+                  )}
                 </button>
 
                 {menuOpen && (
@@ -6646,7 +7098,7 @@ export default function PersonalCRM({ account = null } = {}) {
                       boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
                     }}
                   >
-                    {[['settings', 'Settings'], ['import', 'Import'], ['export', 'Export']].map(([v, l], i) => (
+                    {[...(friendsOn ? [['friends', friendCount ? `Friends (${friendCount})` : 'Friends']] : []), ['settings', 'Settings'], ['import', 'Import'], ['export', 'Export']].map(([v, l], i) => (
                       <button
                         key={v}
                         className="crm-btn"
@@ -6851,6 +7303,23 @@ export default function PersonalCRM({ account = null } = {}) {
                 onTakeShared={takeShared}
                 onDropShared={() => setIncoming(null)}
               />
+            )}
+          </div>
+        )}
+
+        {view === 'friends' && (
+          <div className="crm-full">
+            {friendsOn ? (
+              <FriendsView
+                account={account}
+                startWith={addTarget}
+                onStarted={clearAddTarget}
+                onSaveToPeople={saveFriendToPeople}
+                onCount={setFriendCount}
+                onClose={() => setView('list')}
+              />
+            ) : (
+              <p style={{ fontSize: 14, color: C.muted }}>Friends need an account with a username.</p>
             )}
           </div>
         )}

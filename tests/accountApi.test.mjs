@@ -86,3 +86,26 @@ describe('messages from the server', () => {
     assert.equal(authMessage({ message: 'Something new' }), 'Something new');
   });
 });
+
+describe('what others see of a profile', () => {
+  const me = {
+    username: 'bea', display_name: 'Bea', pronouns: 'she/her', bio: 'Reads', location: 'KC', birthday: '2000-01-01',
+    phone: '555', contact_email: 'b@x.com', website: '', socials: { instagram: 'bea' },
+    visibility: { location: 'friends', phone: 'me', birthday: 'everyone' },
+  };
+  it('starts private for anything that reaches someone directly', async () => {
+    const { visibilityOf } = await import('../src/accountApi.js');
+    assert.equal(visibilityOf({}, 'phone'), 'me');
+    assert.equal(visibilityOf({}, 'contact_email'), 'me');
+    assert.equal(visibilityOf({}, 'birthday'), 'friends');
+    assert.equal(visibilityOf({}, 'bio'), 'everyone');
+    assert.equal(visibilityOf({ visibility: { phone: 'everyone' } }, 'phone'), 'everyone');
+  });
+  it('follows each setting, the same way the database does', async () => {
+    const { seenAs } = await import('../src/accountApi.js');
+    assert.deepEqual(Object.keys(seenAs(me, 'none')).sort(), ['bio', 'birthday', 'display_name', 'pronouns', 'username']);
+    assert.deepEqual(Object.keys(seenAs(me, 'friends')).sort(), ['bio', 'birthday', 'display_name', 'location', 'pronouns', 'socials', 'username']);
+    assert.equal(seenAs(me, 'me').phone, '555');
+    assert.equal('website' in seenAs(me, 'me'), false, 'an empty field never shows');
+  });
+});

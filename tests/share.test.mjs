@@ -279,3 +279,24 @@ describe('a new card from a share', () => {
     assert.equal(A.personFromShare({ name: 'Dana' }).tier, 'friend');
   });
 });
+
+describe('a friend saved to your People', () => {
+  it('becomes a person through the same checks as a share', () => {
+    const p = A.profileToPerson({
+      id: 'x', username: 'bea', display_name: 'Bea Cho', relation: 'friends', pronouns: 'she/her', bio: 'Reads a lot',
+      location: 'Kansas City', birthday: '2000-01-01', phone: '816-555-0100', contact_email: 'bea@contact.example',
+      website: 'javascript:alert(1)', socials: { instagram: '@beareads', myspace: 'tom' },
+    });
+    assert.equal(p.name, 'Bea Cho');
+    assert.equal(p.address, 'Kansas City');
+    assert.equal(p.birthday, '2000-01-01');
+    assert.equal(p.phone, '816-555-0100');
+    assert.equal(p.email, 'bea@contact.example');
+    assert.deepEqual(p.socials, { instagram: 'beareads' });
+    assert.equal(p.note, 'Pronouns: she/her\nReads a lot', 'a script link never comes along');
+    for (const k of ['id', 'username', 'relation', 'tier', 'log']) assert.equal(k in p, false, k);
+  });
+  it('with only a name, is only a name', () => {
+    assert.deepEqual(A.profileToPerson({ username: 'd', display_name: 'Dora' }), { name: 'Dora' });
+  });
+});
