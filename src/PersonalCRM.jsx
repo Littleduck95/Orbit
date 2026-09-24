@@ -918,7 +918,11 @@ function PersonForm({ initial, defaultCircle, inline, families, allGroups, compa
 }
 
 /* ---------- one person ---------- */
-function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle }) {
+// Memoised: a keystroke, a star or a tick redraws only the rows it changed.
+// today and theme are passed only so a row is redrawn when either changes,
+// since both feed what it shows (how long ago, the colours in C) without
+// being in its other props.
+const PersonRow = memo(function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle, today: _today, theme: _theme }) {
   const st = status(p);
   const [justLogged, setJustLogged] = useState(false);
 
@@ -927,30 +931,22 @@ function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle }) {
     setJustLogged(true);
     setTimeout(() => setJustLogged(false), 1600);
   };
+  // Only what differs row to row is inline; the rest is in .crm-person-*
+  // in the app's stylesheet (see PersonalCRM), because setting inline styles
+  // is most of what drawing hundreds of these costs.
   return (
-    <div className="crm-person" style={{
-      display: 'flex',
-      background: selected ? C.accentSoft : C.surface,
-      borderBottom: `1px solid ${C.line}`,
-    }}>
-      <div style={{ width: 4, background: st.bar, flexShrink: 0, opacity: st.over || selected ? 1 : 0.6 }} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div
-          className="crm-row"
-          onClick={onOpen}
-          style={{ padding: '14px 15px', cursor: 'pointer', display: 'flex', alignItems: 'baseline', gap: 10 }}
-        >
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
-              <span style={{
-                fontSize: 17, fontWeight: 600, letterSpacing: '-0.02em', color: C.ink,
-                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-              }}>{p.name}</span>
+    <div className="crm-person" style={{ background: selected ? C.accentSoft : C.surface }}>
+      <div className="crm-person-bar" style={{ background: st.bar, opacity: st.over || selected ? 1 : 0.6 }} />
+      <div className="crm-person-body">
+        <div className="crm-row" onClick={() => onOpen(p.id)}>
+          <div className="crm-person-main">
+            <div className="crm-person-top">
+              <span className="crm-person-name">{p.name}</span>
               {ageOf(p) !== null && (
-                <span style={{ fontSize: 13, color: C.faint, flexShrink: 0 }}>{ageOf(p)}</span>
+                <span className="crm-person-age">{ageOf(p)}</span>
               )}
             </div>
-            <div style={{ fontSize: 13, color: C.muted, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div className="crm-person-sub">
               {[
                 showCircle ? (p.circle === 'work' ? 'Professional' : 'Personal') : '',
                 p.circle === 'friend' ? (p.relation || tierLabel(p.tier)) : '',
@@ -960,17 +956,14 @@ function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle }) {
                 (p.circle === 'work' ? 'Professional' : 'Personal')}
             </div>
           </div>
-          <div style={{ textAlign: 'right', flexShrink: 0, maxWidth: 116, whiteSpace: 'nowrap' }}>
-            <div style={{ fontSize: 14, fontWeight: 600, color: st.tone, letterSpacing: '-0.01em' }}>
+          <div className="crm-person-when">
+            <div className="crm-person-status" style={{ color: st.tone }}>
               {st.paused ? 'paused'
                 : st.child ? (st.days === null ? '—' : elapsed(st.days))
                 : st.always ? 'in touch'
                 : st.days === null ? 'no log' : elapsed(st.days)}
             </div>
-            <div style={{
-              fontSize: 12, color: C.faint, marginTop: 2,
-              overflow: 'hidden', textOverflow: 'ellipsis',
-            }}>
+            <div className="crm-person-cadence">
               {p.child ? 'child' : CADENCES.find((c) => c.days === Number(p.cadence))?.short || 'monthly'}
             </div>
           </div>
@@ -978,17 +971,12 @@ function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle }) {
       </div>
 
       <button
-        className="crm-btn"
-        onClick={onStar}
+        className="crm-btn crm-person-act"
+        onClick={() => onStar(p.id)}
         title={p.vip ? 'Remove from VIPs' : 'Mark as VIP'}
         aria-label={p.vip ? `Remove ${p.name} from VIPs` : `Mark ${p.name} as a VIP`}
         aria-pressed={Boolean(p.vip)}
-        style={{
-          width: 40, flexShrink: 0, cursor: 'pointer', background: 'transparent',
-          border: 'none', borderLeft: `1px solid ${C.line}`,
-          color: p.vip ? C.soonBar : C.faint,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}
+        style={{ width: 40, color: p.vip ? C.soonBar : C.faint }}
       >
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
           <path
@@ -1000,16 +988,14 @@ function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle }) {
       </button>
 
       <button
-        className="crm-btn"
+        className="crm-btn crm-person-act"
         onClick={quick}
         title="Caught up with them today"
         aria-label={`Log a catch-up with ${p.name} today`}
         style={{
-          width: 48, flexShrink: 0, cursor: 'pointer',
+          width: 48,
           background: justLogged ? C.accent : 'transparent',
-          border: 'none', borderLeft: `1px solid ${C.line}`,
           color: justLogged ? C.onAccent : C.faint,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
         }}
       >
         <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true">
@@ -1019,7 +1005,7 @@ function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle }) {
       </button>
     </div>
   );
-}
+});
 
 function PersonDetail({ p, owner, myEvents, myReminders, myRecs, myTrips, onTrip, onLog, onEditLog, onRemoveLog, onEdit, onRemove, onTag, onList, onClearVia, onClose }) {
   const [logging, setLogging] = useState(false);
@@ -8926,6 +8912,15 @@ export default function PersonalCRM({ account = null } = {}) {
       : p)));
   };
 
+  // The rows' actions, made once, so memoised rows are not all redrawn just
+  // because this component was. They call the current quickLog and toggleVip,
+  // which the layout effect keeps up to date before another tap can arrive.
+  const rowActs = useRef(null);
+  useLayoutEffect(() => { rowActs.current = { quickLog, toggleVip }; });
+  const openRow = useCallback((id) => { setOpenId(id); setEditing(null); setAdding(false); }, []);
+  const quickLogRow = useCallback((id) => rowActs.current.quickLog(id), []);
+  const starRow = useCallback((id) => rowActs.current.toggleVip(id), []);
+
   const logTouch = (id, date, text) => {
     persist(people.map((p) => (p.id === id
       ? withLog(p, [{ date, text }, ...(p.log || [])])
@@ -9206,7 +9201,24 @@ export default function PersonalCRM({ account = null } = {}) {
       : people.filter((p) => (p.circle || 'friend') === circle);
 
   const inCircle = useMemo(() => ofCircle(circleTab), [people, circleTab]);
-  const overdueCount = (circle) => ofCircle(circle).filter((p) => status(p).over).length;
+  // Passed to the memoised rows so they still move on at midnight.
+  const today = todayStr();
+  // How many have gone quiet in each circle, for the chips: one pass over
+  // everyone, rather than one per chip, and only when the chips are drawn.
+  let overdueByCircle = null;
+  const overdueCount = (circle) => {
+    if (!overdueByCircle) {
+      overdueByCircle = { all: 0, vip: 0, friend: 0, work: 0 };
+      people.forEach((p) => {
+        if (!status(p).over) return;
+        overdueByCircle.all += 1;
+        if (p.vip) overdueByCircle.vip += 1;
+        const c = p.circle || 'friend';
+        if (c === 'friend' || c === 'work') overdueByCircle[c] += 1;
+      });
+    }
+    return overdueByCircle[circle];
+  };
   const totalCount = (circle) => ofCircle(circle).length;
 
   const pickTheme = async (name) => {
@@ -9394,9 +9406,34 @@ export default function PersonalCRM({ account = null } = {}) {
            until scrolled to, which is most of what a keystroke costs on a long
            list. Still found by find-in-page and screen readers. */
         .crm-entry { content-visibility: auto; contain-intrinsic-size: auto 62px; }
+        /* The same for people, who can run to hundreds. What every person
+           row shares is here too, rather than inline (see PersonRow). */
+        .crm-person {
+          content-visibility: auto; contain-intrinsic-size: auto 65px;
+          display: flex; border-bottom: 1px solid ${C.line};
+        }
+        .crm-person-bar { width: 4px; flex-shrink: 0; }
+        .crm-person-body, .crm-person-main { flex: 1; min-width: 0; }
+        .crm-person .crm-row { padding: 14px 15px; cursor: pointer; display: flex; align-items: baseline; gap: 10px; }
+        .crm-person-top { display: flex; align-items: baseline; gap: 7px; }
+        .crm-person-name {
+          font-size: 17px; font-weight: 600; letter-spacing: -0.02em; color: ${C.ink};
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .crm-person-age { font-size: 13px; color: ${C.faint}; flex-shrink: 0; }
+        .crm-person-sub { font-size: 13px; color: ${C.muted}; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .crm-person-when { text-align: right; flex-shrink: 0; max-width: 116px; white-space: nowrap; }
+        .crm-person-status { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+        .crm-person-cadence { font-size: 12px; color: ${C.faint}; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
+        .crm-person-act {
+          flex-shrink: 0; cursor: pointer; background: transparent;
+          border: none; border-left: 1px solid ${C.line};
+          display: flex; align-items: center; justify-content: center;
+        }
         /* That also clips painting to each row, which would cut off a focus
            ring drawn outside a button that fills the row, so rings go inside. */
-        .crm-entry .crm-btn:focus-visible, .crm-entry a:focus-visible { outline-offset: -3px; }
+        .crm-entry .crm-btn:focus-visible, .crm-entry a:focus-visible,
+        .crm-person .crm-btn:focus-visible { outline-offset: -3px; }
         .crm-select {
           appearance: none; -webkit-appearance: none;
           background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.5 4.5 L6 8 L9.5 4.5' fill='none' stroke='${encodeURIComponent(C.muted)}' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
@@ -9966,9 +10003,11 @@ export default function PersonalCRM({ account = null } = {}) {
                 p={p}
                 selected={openId === p.id}
                 showCircle={circleTab === 'all' || circleTab === 'vip' || searching || filtering}
-                onOpen={() => { setOpenId(p.id); setEditing(null); setAdding(false); }}
-                onQuickLog={quickLog}
-                onStar={() => toggleVip(p.id)}
+                onOpen={openRow}
+                onQuickLog={quickLogRow}
+                onStar={starRow}
+                today={today}
+                theme={theme}
               />
             ))}
           </div>

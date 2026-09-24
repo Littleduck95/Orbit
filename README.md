@@ -257,8 +257,11 @@ Each of the app's keys (below) is one row in the `orbit_data` table, holding
 the same text the app always stored. The whole account is read once when it
 opens, and every change is written straight to it; a change only counts as
 saved once the account has it, so the app's "did not save" message still
-means what it says. If two devices change the same kind of thing (say, both
-edit people) the later save wins.
+means what it says. On one device, saves of the same kind go one at a time
+and in order, so a slow one can never land after, and undo, a newer one; while
+one is on its way, further changes wait and go together as the newest. If two
+devices change the same kind of thing (say, both edit people) the later save
+wins.
 
 - **The first sign-in** moves everything this browser had saved into an empty
   account, then removes the browser's copy, so the next person to sign in on

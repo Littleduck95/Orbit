@@ -165,23 +165,64 @@ export async function replaceAccount({ client, userId, store }) {
 }
 
 // The window.storage object the app talks to, over entries already read.
+//
+// Writes to one key go one at a time. Two sent together can finish in either
+// order, and an older one finishing last would quietly put back what the newer
+// one replaced. While a write is under way, only the newest value for that key
+// waits to go next: each value is the whole of what that key holds, so the
+// newest includes what the ones before it changed, and sending those too would
+// only upload the same list again. Every caller still hears whether its change
+// reached the account: those whose value was replaced hear how the newer one went.
 export function cloudStorage({ client, userId, store, entries }) {
   const mem = new Map(Object.entries(entries));
   const p = cachePrefix(userId);
+  // key -> { value, callers }: the next write for that key, not yet sent.
+  // A value of null deletes the key.
+  const next = new Map();
+  const busy = new Set();
+
+  const write = async (key, v) => {
+    if (v === null) {
+      await run(client.from(TABLE).delete().eq('user_id', userId).eq('key', key));
+      mem.delete(key);
+      quietly(() => store.removeItem(p + key));
+    } else {
+      await upsert(client, userId, { [key]: v });
+      mem.set(key, v);
+      quietly(() => store.setItem(p + key, v));
+    }
+  };
+
+  const drain = async (key) => {
+    busy.add(key);
+    while (next.has(key)) {
+      const { value, callers } = next.get(key);
+      next.delete(key);
+      try {
+        await write(key, value);
+        callers.forEach(({ resolve }) => resolve());
+      } catch (err) {
+        callers.forEach(({ reject }) => reject(err));
+      }
+    }
+    busy.delete(key);
+  };
+
+  const queue = (key, value) => new Promise((resolve, reject) => {
+    const waiting = next.get(key);
+    next.set(key, { value, callers: [...(waiting ? waiting.callers : []), { resolve, reject }] });
+    if (!busy.has(key)) drain(key);
+  });
+
   return {
     async get(key) {
       return mem.has(key) ? { value: mem.get(key) } : null;
     },
     async set(key, value) {
-      const v = String(value);
-      await upsert(client, userId, { [key]: v });
-      mem.set(key, v);
-      quietly(() => store.setItem(p + key, v));
+      return queue(key, String(value));
     },
     async delete(key) {
-      await run(client.from(TABLE).delete().eq('user_id', userId).eq('key', key));
-      mem.delete(key);
-      quietly(() => store.removeItem(p + key));
+      return queue(key, null);
     },
   };
 }
