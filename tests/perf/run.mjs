@@ -84,7 +84,9 @@ const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-perf-'));
 // value outranks .env, which switches sign-in off (see src/supabase.js).
 process.env.VITE_SUPABASE_URL = '';
 process.env.VITE_SUPABASE_PUBLISHABLE_KEY = '';
-await build({ root, logLevel: 'error', build: { outDir, emptyOutDir: true, minify: !PROFILE } });
+// Built for / rather than the /Orbit/ the site is hosted under, since the
+// preview server here serves from /.
+await build({ root, base: '/', logLevel: 'error', build: { outDir, emptyOutDir: true, minify: !PROFILE } });
 const server = await preview({ root, logLevel: 'error', build: { outDir }, preview: { port: 0 } });
 const url = server.resolvedUrls.local[0];
 const browser = await pw.chromium.launch();

@@ -20,13 +20,15 @@ const fakeLocalStorage = (init = {}) => {
 };
 
 // Enough of supabase-js's query builder for what cloudStorage calls. Every
-// request can be made to fail, the way a dropped connection does.
+// request can be made to fail, the way a dropped connection does. With hold
+// set, requests wait in held until released, in whatever order a test picks,
+// the way requests over a network can finish out of order.
 const fakeClient = (rows = []) => {
   const table = new Map(rows.map((r) => [`${r.user_id}|${r.key}`, { ...r }]));
-  const state = { table, down: false, calls: [] };
+  const state = { table, down: false, calls: [], hold: false, held: [] };
   const answer = (fn) => {
-    const p = Promise.resolve().then(() => (state.down ? { data: null, error: { message: 'Failed to fetch' } } : { data: fn(), error: null }));
-    return p;
+    const gate = state.hold ? new Promise((release) => state.held.push(release)) : Promise.resolve();
+    return gate.then(() => (state.down ? { data: null, error: { message: 'Failed to fetch' } } : { data: fn(), error: null }));
   };
   const filtered = (filters) => [...table.values()].filter((r) => filters.every((f) => f(r)));
   const chain = (kind, payload) => {
@@ -191,6 +193,70 @@ describe('cloud storage', () => {
     db.down = true;
     await assert.rejects(s.set('a', '2'), /Failed to fetch/);
     assert.deepEqual(await s.get('a'), { value: '1' });
+  });
+
+  // Lets every request already sent reach the point of waiting in held.
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  it('a save that finishes late never undoes a newer one', async () => {
+    const store = fakeLocalStorage();
+    const db = fakeClient();
+    const s = cloudStorage({ client: db.client, userId: 'u1', store, entries: {} });
+    db.hold = true;
+    const first = s.set('a', '1');
+    const second = s.set('a', '2');
+    await settle();
+    // The newest request is answered first, then the older one.
+    while (db.held.length) { db.held.pop()(); await settle(); }
+    await Promise.all([first, second]);
+    assert.equal(valuesFor(db, 'u1').a, '2');
+    assert.deepEqual(await s.get('a'), { value: '2' });
+    assert.equal(store.getItem('orbit:@u1:a'), '2');
+  });
+
+  it('saves made while one is under way go as one, the newest', async () => {
+    const db = fakeClient();
+    const s = cloudStorage({ client: db.client, userId: 'u1', store: fakeLocalStorage(), entries: {} });
+    db.hold = true;
+    const saves = [s.set('a', '1'), s.set('a', '2'), s.set('a', '3'), s.set('b', 'x')];
+    await settle();
+    assert.equal(db.held.length, 2, 'one request for a, one for b; the rest wait');
+    while (db.held.length) { db.held.shift()(); await settle(); }
+    await Promise.all(saves);
+    assert.deepEqual(db.calls, ['upsert', 'upsert', 'upsert'], 'a is sent twice (1, then 3), b once');
+    assert.deepEqual(valuesFor(db, 'u1'), { a: '3', b: 'x' });
+  });
+
+  it('a failed save is reported to its callers, and the next still goes', async () => {
+    const db = fakeClient();
+    const s = cloudStorage({ client: db.client, userId: 'u1', store: fakeLocalStorage(), entries: { a: '0' } });
+    db.hold = true;
+    db.down = true;
+    const first = s.set('a', '1');
+    const second = s.set('a', '2');
+    await settle();
+    db.held.shift()();
+    await assert.rejects(first, /Failed to fetch/);
+    assert.deepEqual(await s.get('a'), { value: '0' }, 'the failed value is not kept');
+    db.down = false;
+    await settle();
+    db.held.shift()();
+    await second;
+    assert.deepEqual(await s.get('a'), { value: '2' });
+    assert.equal(valuesFor(db, 'u1').a, '2');
+  });
+
+  it('a delete waits its turn behind a save of the same key', async () => {
+    const db = fakeClient();
+    const s = cloudStorage({ client: db.client, userId: 'u1', store: fakeLocalStorage(), entries: {} });
+    db.hold = true;
+    const saved = s.set('a', '1');
+    const gone = s.delete('a');
+    await settle();
+    while (db.held.length) { db.held.pop()(); await settle(); }
+    await Promise.all([saved, gone]);
+    assert.equal('a' in valuesFor(db, 'u1'), false);
+    assert.equal(await s.get('a'), null);
   });
 
   it('a full localStorage never turns a saved change into a failure', async () => {
