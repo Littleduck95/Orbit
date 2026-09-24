@@ -212,6 +212,27 @@ edit people) the later save wins.
   Email and birthday are only ever shown to their owner.
 - **Sign out** is in the ⋮ menu, under your username.
 
+### Friends and profiles
+
+**Friends** (⋮ menu, with a dot while a request waits) finds people by the
+start of their username or any part of their name, and sends a request they
+accept or decline. Each person has a friend code: a QR code of a link
+(`#add=username`) that opens their profile ready to add, even after signing
+in. A friend can be saved into People through the same preview and merge as a
+share, and anyone can be blocked, which ends any friendship and hides each
+from the other.
+
+**Settings → Profile** chooses what others see. Name and username always
+show; everything else (pronouns, about, where you live, birthday, phone, an
+email for friends, website, socials) is set to Everyone, Friends or Only me,
+with a preview of how a stranger and a friend see it. Phone and the friends
+email start as Only me. The sign-in email is never shown. People can also
+turn off being found in search, leaving only their code.
+
+The database decides what each viewer receives: profiles are only read
+through functions that apply those settings, and friendships and blocks are
+only changed through functions that check who is asking.
+
 ### Setting up the Supabase project
 
 Done once, in the [Supabase dashboard](https://supabase.com/dashboard):

@@ -3,7 +3,7 @@ import {
   clearCache, cloudStorage, localEntries, parkLocal, readAccountState, replaceAccount,
 } from './cloudStorage.js';
 import {
-  changeEmail, deleteAccount, loadProfile, setPassword, updateProfile, usernameAvailable,
+  changeEmail, deleteAccount, friendsApi, loadProfile, setPassword, updateProfile, usernameAvailable,
 } from './accountApi.js';
 import { NewPassword, ProfileSetup, Screen, SignIn, css, returnTo } from './SignIn.jsx';
 
@@ -17,19 +17,20 @@ import { NewPassword, ProfileSetup, Screen, SignIn, css, returnTo } from './Sign
  * empty and saves that emptiness over what the account holds.
  */
 
-// A shared-list link (#share=…) opened while signed out would be lost on the
-// way through sign-in, so it is held here and put back before the app looks.
+// A share link (#share=…) or a friend's code (#add=…) opened while signed out
+// would be lost on the way through sign-in, so it is held here and put back
+// before the app looks.
 const PENDING_SHARE = 'orbit-pending-share';
 const holdShare = () => {
   try {
-    if (window.location.hash.startsWith('#share=')) localStorage.setItem(PENDING_SHARE, window.location.hash);
+    if (/^#(share|add)=/.test(window.location.hash)) localStorage.setItem(PENDING_SHARE, window.location.hash);
   } catch { /* the link just is not carried through */ }
 };
 const restoreShare = () => {
   try {
     const held = localStorage.getItem(PENDING_SHARE);
     localStorage.removeItem(PENDING_SHARE);
-    if (held && !window.location.hash.startsWith('#share=')) {
+    if (held && !/^#(share|add)=/.test(window.location.hash)) {
       window.history.replaceState(null, '', window.location.pathname + window.location.search + held);
     }
   } catch { /* nothing held */ }
@@ -212,6 +213,9 @@ export default function Account({ client, children }) {
           profile: profile || null,
           signOut,
           checkUsername: (name) => usernameAvailable(client, name),
+          friends: friendsApi(client),
+          // The link a friend's QR code opens: this page, with their username.
+          addLink: profile ? `${returnTo()}#add=${profile.username}` : '',
           updateProfile: async (changes) => {
             const next = await updateProfile(client, userId, changes);
             if (next) setProfile(next);

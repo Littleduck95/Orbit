@@ -130,6 +130,289 @@ end $$;
 revoke all on function public.delete_my_account() from public, anon;
 grant execute on function public.delete_my_account() to authenticated;
 
+-- ---------------------------------------------------------------------------
+-- Profiles as others see them. Username and name are always visible, so
+-- people can be found. Every other detail has its own setting: 'everyone',
+-- 'friends', or 'me' (only you). Nobody reads another person's row
+-- directly; the functions below hand out only what the settings allow. The
+-- email you sign in with is never among it.
+
+alter table public.profiles add column if not exists pronouns      text    not null default '' check (char_length(pronouns) <= 30);
+alter table public.profiles add column if not exists bio           text    not null default '' check (char_length(bio) <= 300);
+alter table public.profiles add column if not exists location      text    not null default '' check (char_length(location) <= 80);
+alter table public.profiles add column if not exists phone         text    not null default '' check (char_length(phone) <= 40);
+alter table public.profiles add column if not exists contact_email text    not null default '' check (char_length(contact_email) <= 200);
+alter table public.profiles add column if not exists website       text    not null default '' check (website = '' or (website ~* '^https?://' and char_length(website) <= 300));
+alter table public.profiles add column if not exists socials       jsonb   not null default '{}'::jsonb check (jsonb_typeof(socials) = 'object');
+alter table public.profiles add column if not exists visibility    jsonb   not null default '{}'::jsonb check (jsonb_typeof(visibility) = 'object');
+alter table public.profiles add column if not exists searchable    boolean not null default true;
+
+-- Keeps only known socials (short text) and known visibility settings.
+create or replace function public.clean_profile_extras() returns trigger
+language plpgsql set search_path = '' as $$
+declare
+  k text;
+  v jsonb;
+  s jsonb := '{}'::jsonb;
+  vis jsonb := '{}'::jsonb;
+begin
+  for k, v in select * from jsonb_each(coalesce(new.socials, '{}'::jsonb)) loop
+    if k in ('instagram', 'x', 'tiktok', 'snapchat', 'linkedin') and jsonb_typeof(v) = 'string'
+       and char_length(v #>> '{}') between 1 and 100 then
+      s := s || jsonb_build_object(k, v #>> '{}');
+    end if;
+  end loop;
+  for k, v in select * from jsonb_each(coalesce(new.visibility, '{}'::jsonb)) loop
+    if k in ('pronouns', 'bio', 'location', 'birthday', 'phone', 'contact_email', 'website', 'socials')
+       and v #>> '{}' in ('everyone', 'friends', 'me') then
+      vis := vis || jsonb_build_object(k, v #>> '{}');
+    end if;
+  end loop;
+  new.socials := s;
+  new.visibility := vis;
+  return new;
+end $$;
+
+drop trigger if exists profiles_clean_extras on public.profiles;
+create trigger profiles_clean_extras before insert or update on public.profiles
+  for each row execute function public.clean_profile_extras();
+
+-- Friendships: a request waits until the other person accepts. One row per
+-- pair, whichever way it was asked.
+create table if not exists public.friendships (
+  requester    uuid        not null references auth.users (id) on delete cascade,
+  addressee    uuid        not null references auth.users (id) on delete cascade,
+  status       text        not null default 'pending' check (status in ('pending', 'accepted')),
+  created_at   timestamptz not null default now(),
+  responded_at timestamptz,
+  primary key (requester, addressee),
+  check (requester <> addressee)
+);
+create unique index if not exists friendships_pair
+  on public.friendships (least(requester, addressee), greatest(requester, addressee));
+
+-- Blocking someone hides you from them and them from you, and ends any
+-- friendship or request between you.
+create table if not exists public.blocks (
+  blocker    uuid        not null references auth.users (id) on delete cascade,
+  blocked    uuid        not null references auth.users (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (blocker, blocked),
+  check (blocker <> blocked)
+);
+
+-- Neither table is read or written directly: everything goes through the
+-- functions below, which check who is asking.
+alter table public.friendships enable row level security;
+alter table public.blocks enable row level security;
+revoke all on public.friendships from anon, authenticated;
+revoke all on public.blocks from anon, authenticated;
+
+create or replace function public.are_friends(a uuid, b uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select exists (select 1 from public.friendships
+    where status = 'accepted' and ((requester = a and addressee = b) or (requester = b and addressee = a)));
+$$;
+
+create or replace function public.is_blocked(a uuid, b uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select exists (select 1 from public.blocks
+    where (blocker = a and blocked = b) or (blocker = b and blocked = a));
+$$;
+
+-- How the viewer stands with someone: 'self', 'friends', 'sent' (asked, not
+-- yet answered), 'received' (they asked), or 'none'.
+create or replace function public.relation_to(other uuid, viewer uuid) returns text
+language sql stable security definer set search_path = '' as $$
+  select case
+    when other = viewer then 'self'
+    when exists (select 1 from public.friendships where status = 'accepted'
+      and ((requester = viewer and addressee = other) or (requester = other and addressee = viewer))) then 'friends'
+    when exists (select 1 from public.friendships where status = 'pending' and requester = viewer and addressee = other) then 'sent'
+    when exists (select 1 from public.friendships where status = 'pending' and requester = other and addressee = viewer) then 'received'
+    else 'none'
+  end;
+$$;
+
+-- One profile, holding only what this viewer may see. Anything without a
+-- setting counts as 'me'.
+create or replace function public.profile_for(p public.profiles, viewer uuid) returns jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  rel text := public.relation_to(p.id, viewer);
+  out jsonb := jsonb_build_object('id', p.id, 'username', p.username, 'display_name', p.display_name, 'relation', rel);
+  f text;
+  lvl text;
+  val jsonb;
+begin
+  foreach f in array array['pronouns', 'bio', 'location', 'birthday', 'phone', 'contact_email', 'website', 'socials'] loop
+    lvl := coalesce(p.visibility ->> f, 'me');
+    if rel = 'self' or lvl = 'everyone' or (lvl = 'friends' and rel = 'friends') then
+      val := case f
+        when 'pronouns' then to_jsonb(p.pronouns)
+        when 'bio' then to_jsonb(p.bio)
+        when 'location' then to_jsonb(p.location)
+        when 'birthday' then to_jsonb(p.birthday)
+        when 'phone' then to_jsonb(p.phone)
+        when 'contact_email' then to_jsonb(p.contact_email)
+        when 'website' then to_jsonb(p.website)
+        when 'socials' then p.socials
+      end;
+      if val is not null and val <> '""'::jsonb and val <> '{}'::jsonb then
+        out := out || jsonb_build_object(f, val);
+      end if;
+    end if;
+  end loop;
+  return out;
+end $$;
+revoke all on function public.profile_for(public.profiles, uuid) from public, anon, authenticated;
+revoke all on function public.are_friends(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.is_blocked(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.relation_to(uuid, uuid) from public, anon, authenticated;
+
+-- Finding people: usernames starting with what was typed, or names
+-- containing it. People who turned off "Show me in search", and anyone
+-- blocked either way, never appear.
+create or replace function public.search_profiles(q text) returns setof jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  term text := lower(btrim(coalesce(q, '')));
+  pat text;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  term := ltrim(term, '@');
+  if char_length(term) < 2 then return; end if;
+  pat := replace(replace(replace(term, '\', '\\'), '%', '\%'), '_', '\_');
+  return query
+    select public.profile_for(p, me)
+    from public.profiles p
+    where p.id <> me and p.searchable and not public.is_blocked(p.id, me)
+      and (p.username like pat || '%' or lower(p.display_name) like '%' || pat || '%')
+    order by (p.username = term) desc, (p.username like pat || '%') desc, p.username
+    limit 20;
+end $$;
+
+-- One person by exact username, as their QR code or link opens it. Works
+-- even when they are hidden from search, but never across a block.
+create or replace function public.get_profile(uname text) returns jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  p public.profiles;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  select * into p from public.profiles where username = lower(ltrim(btrim(uname), '@'));
+  if p.id is null or public.is_blocked(p.id, me) then return null; end if;
+  return public.profile_for(p, me);
+end $$;
+
+-- Friends, requests both ways, each with what that person lets you see.
+create or replace function public.my_friends() returns setof jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare me uuid := auth.uid();
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  return query
+    select public.profile_for(p, me) || jsonb_build_object('since', coalesce(f.responded_at, f.created_at))
+    from public.friendships f
+    join public.profiles p on p.id = case when f.requester = me then f.addressee else f.requester end
+    where me in (f.requester, f.addressee)
+    order by lower(p.display_name);
+end $$;
+
+-- Asking to be friends. If they already asked you, this accepts. Answers
+-- with how you now stand.
+create or replace function public.send_friend_request(target uuid) returns text
+language plpgsql security definer set search_path = '' as $$
+declare me uuid := auth.uid();
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if target = me then raise exception 'That is you'; end if;
+  if not exists (select 1 from public.profiles where id = target) or public.is_blocked(target, me) then
+    raise exception 'That person could not be found';
+  end if;
+  update public.friendships set status = 'accepted', responded_at = now()
+    where requester = target and addressee = me and status = 'pending';
+  if not found then
+    insert into public.friendships (requester, addressee) values (me, target) on conflict do nothing;
+  end if;
+  return public.relation_to(target, me);
+end $$;
+
+-- Answering someone's request.
+create or replace function public.respond_friend_request(other uuid, accept boolean) returns text
+language plpgsql security definer set search_path = '' as $$
+declare me uuid := auth.uid();
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if accept then
+    update public.friendships set status = 'accepted', responded_at = now()
+      where requester = other and addressee = me and status = 'pending';
+  else
+    delete from public.friendships where requester = other and addressee = me and status = 'pending';
+  end if;
+  return public.relation_to(other, me);
+end $$;
+
+-- Unfriending, or taking back a request you sent.
+create or replace function public.remove_friend(other uuid) returns text
+language plpgsql security definer set search_path = '' as $$
+declare me uuid := auth.uid();
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  delete from public.friendships where (requester = me and addressee = other) or (requester = other and addressee = me);
+  return 'none';
+end $$;
+
+create or replace function public.block_user(other uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+declare me uuid := auth.uid();
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if other = me then raise exception 'That is you'; end if;
+  delete from public.friendships where (requester = me and addressee = other) or (requester = other and addressee = me);
+  insert into public.blocks (blocker, blocked) values (me, other) on conflict do nothing;
+end $$;
+
+create or replace function public.unblock_user(other uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+begin
+  if auth.uid() is null then raise exception 'Not signed in'; end if;
+  delete from public.blocks where blocker = auth.uid() and blocked = other;
+end $$;
+
+-- The people you blocked, by name only.
+create or replace function public.my_blocks() returns setof jsonb
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if auth.uid() is null then raise exception 'Not signed in'; end if;
+  return query
+    select jsonb_build_object('id', p.id, 'username', p.username, 'display_name', p.display_name)
+    from public.blocks b join public.profiles p on p.id = b.blocked
+    where b.blocker = auth.uid()
+    order by p.username;
+end $$;
+
+revoke all on function public.search_profiles(text) from public, anon;
+revoke all on function public.get_profile(text) from public, anon;
+revoke all on function public.my_friends() from public, anon;
+revoke all on function public.send_friend_request(uuid) from public, anon;
+revoke all on function public.respond_friend_request(uuid, boolean) from public, anon;
+revoke all on function public.remove_friend(uuid) from public, anon;
+revoke all on function public.block_user(uuid) from public, anon;
+revoke all on function public.unblock_user(uuid) from public, anon;
+revoke all on function public.my_blocks() from public, anon;
+grant execute on function public.search_profiles(text) to authenticated;
+grant execute on function public.get_profile(text) to authenticated;
+grant execute on function public.my_friends() to authenticated;
+grant execute on function public.send_friend_request(uuid) to authenticated;
+grant execute on function public.respond_friend_request(uuid, boolean) to authenticated;
+grant execute on function public.remove_friend(uuid) to authenticated;
+grant execute on function public.block_user(uuid) to authenticated;
+grant execute on function public.unblock_user(uuid) to authenticated;
+grant execute on function public.my_blocks() to authenticated;
+
 -- Tell the API about the table now. Without this it can briefly answer
 -- "Could not find the table 'public.orbit_data' in the schema cache".
 notify pgrst, 'reload schema';

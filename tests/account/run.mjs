@@ -67,8 +67,13 @@ const session = () => ({
  * already in use. Sign-ups, password logins, resets and profile changes are
  * all recorded on db for the checks to look at.
  */
-const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = signedIn ? PROFILE : null, taken = ['bea'] } = {}) => {
-  const db = { rows: new Map(Object.entries(rows).map(([u, kv]) => [u, new Map(Object.entries(kv))])), down: false, calls: [], profile, taken: new Set(taken) };
+const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = signedIn ? PROFILE : null, taken = ['bea'], others = [] } = {}) => {
+  const db = {
+    rows: new Map(Object.entries(rows).map(([u, kv]) => [u, new Map(Object.entries(kv))])), down: false, calls: [], profile, taken: new Set(taken),
+    // Other people, as the friends functions hand them out: each with how
+    // this user stands with them.
+    others: others.map((o) => ({ ...o })), blocked: [],
+  };
   const mine = () => {
     if (!db.rows.has(USER.id)) db.rows.set(USER.id, new Map());
     return db.rows.get(USER.id);
@@ -118,6 +123,31 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
     if (u.pathname === '/rest/v1/rpc/username_available') {
       const { name } = JSON.parse(req.postData());
       return r.fulfill({ status: 200, headers, body: JSON.stringify(!db.taken.has(name) && name !== db.profile?.username) });
+    }
+    if (u.pathname.startsWith('/rest/v1/rpc/') && ['search_profiles', 'get_profile', 'my_friends', 'send_friend_request',
+      'respond_friend_request', 'remove_friend', 'block_user', 'unblock_user', 'my_blocks'].includes(u.pathname.slice(13))) {
+      const fn = u.pathname.slice(13);
+      const a = JSON.parse(req.postData() || '{}');
+      const one = (id) => db.others.find((o) => o.id === id);
+      const reply = (v) => r.fulfill({ status: 200, headers, body: JSON.stringify(v) });
+      db.calls.push(`rpc ${fn} ${JSON.stringify(a)}`);
+      if (fn === 'search_profiles') {
+        const q = a.q.toLowerCase().replace(/^@/, '');
+        return reply(db.others.filter((o) => o.username.startsWith(q) || o.display_name.toLowerCase().includes(q)));
+      }
+      if (fn === 'get_profile') return reply(db.others.find((o) => o.username === a.uname) || null);
+      if (fn === 'my_friends') return reply(db.others.filter((o) => o.relation !== 'none'));
+      if (fn === 'send_friend_request') { const o = one(a.target); o.relation = o.relation === 'received' ? 'friends' : 'sent'; return reply(o.relation); }
+      if (fn === 'respond_friend_request') { const o = one(a.other); o.relation = a.accept ? 'friends' : 'none'; return reply(o.relation); }
+      if (fn === 'remove_friend') { one(a.other).relation = 'none'; return reply('none'); }
+      if (fn === 'block_user') {
+        const o = one(a.other);
+        db.blocked.push(o);
+        db.others = db.others.filter((x) => x !== o);
+        return reply(null);
+      }
+      if (fn === 'unblock_user') { db.blocked = db.blocked.filter((x) => x.id !== a.other); return reply(null); }
+      if (fn === 'my_blocks') return reply(db.blocked.map(({ id, username, display_name }) => ({ id, username, display_name })));
     }
     if (u.pathname === '/rest/v1/rpc/delete_my_account') {
       db.deleted = true;
@@ -496,6 +526,135 @@ const scenarios = {
     check('then deletes the account and signs out', await shown(page.getByRole('heading', { name: 'Welcome back' })) && db.deleted === true);
     const keys = await localKeys(page);
     check('leaving none of it on this device', keys.every((k) => !k.startsWith(`orbit:@${USER.id}`)), keys);
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
+  async 'friends'() {
+    const FULL = { ...PROFILE, pronouns: '', bio: '', location: '', phone: '', contact_email: '', website: '', socials: {}, visibility: {}, searchable: true };
+    const others = [
+      { id: 'b', username: 'bea', display_name: 'Bea Cho', relation: 'received', bio: 'Reads a lot' },
+      { id: 'd', username: 'dora', display_name: 'Dora Diaz', relation: 'none', bio: 'Climbs' },
+      { id: 'e', username: 'eli', display_name: 'Eli Park', relation: 'friends', phone: '816-555-0199', location: 'Kansas City', birthday: '1990-03-04',
+        socials: { instagram: 'elipark' }, website: 'javascript:alert(1)' },
+    ];
+    const { page, db, mine, problems, close } = await newPage({ signedIn: true, profile: FULL, others, rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } } });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    check('the menu button says a friend request is waiting', await shown(page.getByRole('button', { name: 'More, 1 friend request' })));
+    await page.getByRole('button', { name: /^More/ }).click();
+    await page.getByRole('button', { name: 'Friends (1)' }).click();
+    check('the Friends screen lists requests and friends', await shown(page.getByRole('heading', { name: 'Friends' }))
+      && await page.getByText('Requests · 1').isVisible() && await page.getByText('Friends · 1').isVisible());
+
+    await page.getByRole('button', { name: 'Accept' }).click();
+    check('accepting a request makes them a friend', await shown(page.getByText('You and Bea Cho are friends.'))
+      && db.others.find((o) => o.id === 'b').relation === 'friends' && await shown(page.getByText('Friends · 2')));
+    check('and the menu stops counting it', !(await page.getByRole('button', { name: /friend request/ }).count()));
+
+    const search = page.getByLabel('Search by username or name');
+    await search.fill('d');
+    check('search waits for two letters', await page.getByText('Keep typing: at least two letters.').isVisible());
+    await search.fill('do');
+    await shown(page.getByText('@dora'));
+    await page.getByRole('button', { name: 'Add friend' }).click();
+    check('a request can be sent from search', await shown(page.getByText('Asked Dora Diaz to be friends.')) && db.others.find((o) => o.id === 'd').relation === 'sent');
+    check('and shows as sent', await shown(page.getByText('Sent · 1')));
+    await search.fill('zz');
+    check('a search with no one says so', await shown(page.getByText('No one found for “zz”.')));
+
+    await page.getByRole('button', { name: 'My friend code' }).click();
+    check('my friend code is a QR code', await shown(page.getByRole('img', { name: 'QR code to add @sam as a friend' })));
+
+    await search.fill('');
+    await page.getByRole('button', { name: /^Eli Park/ }).click();
+    check('a friend\'s profile shows what they let friends see', await shown(page.getByText('816-555-0199'))
+      && await page.getByText('Kansas City').isVisible() && await page.getByRole('link', { name: /Instagram elipark/ }).isVisible());
+    check('a script posing as a website is never a link', !(await page.getByRole('link', { name: /Website/ }).count()));
+    check('the Instagram link goes to Instagram', (await page.getByRole('link', { name: /Instagram/ }).getAttribute('href')) === 'https://instagram.com/elipark');
+    await page.getByRole('button', { name: 'Save to my People' }).click();
+    check('saving a friend opens the usual preview', await shown(page.getByRole('heading', { name: 'Eli Park' }))
+      && await page.getByText('@eli sent you a contact', { exact: false }).isVisible());
+    await page.getByRole('button', { name: 'Add Eli' }).click();
+    await shown(page.getByText('From @eli'));
+    const saved = JSON.parse(mine().get('crm-people-v1') || '[]');
+    check('and adds them to People, with where they came from', saved.length === 1 && saved[0].name === 'Eli Park' && saved[0].phone === '816-555-0199'
+      && saved[0].address === 'Kansas City' && saved[0].via?.by === '@eli' && !saved[0].note, saved);
+
+    await page.getByRole('button', { name: /^More/ }).click();
+    await page.getByRole('button', { name: 'Friends', exact: true }).click();
+    await page.getByRole('button', { name: /^Dora Diaz/ }).click();
+    await page.getByRole('button', { name: 'Cancel request' }).waitFor();
+    await page.getByRole('button', { name: 'Block', exact: true }).click();
+    check('blocking asks first, and says what it does', await page.getByText('Block @dora? You will not be friends', { exact: false }).isVisible());
+    await page.getByRole('button', { name: 'Block', exact: true }).first().click();
+    check('then blocks them', await shown(page.getByText('Blocked @dora.')) && db.blocked.some((o) => o.id === 'd'));
+    await page.getByText('Blocked people').click();
+    await shown(page.getByText('@dora'));
+    await page.getByRole('button', { name: 'Unblock' }).click();
+    await page.waitForTimeout(200);
+    check('and can unblock them', db.blocked.length === 0);
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
+  async 'opening a friend code'() {
+    const FULL = { ...PROFILE, pronouns: '', bio: '', location: '', phone: '', contact_email: '', website: '', socials: {}, visibility: {}, searchable: true };
+    const { page, db, close } = await newPage({
+      signedIn: true, profile: FULL, rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } },
+      others: [{ id: 'd', username: 'dora', display_name: 'Dora Diaz', relation: 'none', bio: 'Climbs' }],
+    });
+    await page.goto(`${url}#add=dora`);
+    check('opens their profile, ready to add', await shown(page.getByText('Climbs')) && await page.getByRole('button', { name: 'Add friend' }).isVisible());
+    check('and takes the code out of the address', (await page.evaluate(() => window.location.hash)) === '');
+    await page.getByRole('button', { name: 'Add friend' }).click();
+    check('adding from there sends the request', await shown(page.getByText('Asked Dora Diaz to be friends.')) && db.others[0].relation === 'sent');
+    await page.goto(`${url}?again#add=nobody`);
+    check('an unknown code says so', await shown(page.getByText('No one called @nobody could be found.')));
+    await close();
+  },
+
+  async 'a friend code opened while signed out'() {
+    const { page, close } = await newPage();
+    await page.goto(`${url}#add=dora`);
+    await shown(page.getByRole('heading', { name: 'Welcome back' }));
+    check('is held through sign-in', (await page.evaluate(() => localStorage.getItem('orbit-pending-share'))) === '#add=dora');
+    await close();
+  },
+
+  async 'profile settings'() {
+    const FULL = { ...PROFILE, pronouns: '', bio: '', location: 'Kansas City', phone: '', contact_email: '', website: '', socials: {}, visibility: {}, searchable: true };
+    const { page, db, problems, close } = await newPage({ signedIn: true, profile: FULL, rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } } });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    await page.getByRole('button', { name: /^More/ }).click();
+    await page.getByRole('button', { name: 'Settings' }).click();
+    await page.getByRole('button', { name: 'Profile', exact: true }).click();
+    check('says name and username always show, and the sign-in email never does', await shown(page.getByText('are always visible, so people can find you', { exact: false }))
+      && await page.getByText('The email you sign in with is never shown.', { exact: false }).isVisible());
+    check('private things start private', (await page.getByLabel('Who sees phone').inputValue()) === 'me'
+      && (await page.getByLabel('Who sees email for friends').inputValue()) === 'me' && (await page.getByLabel('Who sees birthday').inputValue()) === 'friends');
+
+    await page.getByLabel('About', { exact: true }).fill('Collects vinyl');
+    await page.getByLabel('Phone', { exact: true }).fill('816-555-0123');
+    await page.getByLabel('Instagram', { exact: true }).fill('@samspins');
+    const preview = page.locator('div', { has: page.getByText('Preview', { exact: true }) }).last();
+    check('the preview shows what someone new sees', await preview.getByText('Collects vinyl').isVisible()
+      && !(await preview.getByText('Kansas City').isVisible()) && !(await preview.getByText('816-555-0123').isVisible()));
+    await page.getByRole('button', { name: 'A friend', exact: true }).click();
+    check('and what a friend sees', await preview.getByText('Kansas City').isVisible() && !(await preview.getByText('816-555-0123').isVisible()));
+
+    await page.getByLabel('Website', { exact: true }).fill('javascript:alert(1)');
+    await page.getByRole('button', { name: 'Save profile' }).click();
+    check('a website must be a web address', await shown(page.getByRole('alert').getByText('The website needs to be a web address', { exact: false })) && !db.profile.bio);
+    await page.getByLabel('Website', { exact: true }).fill('sam.example.com');
+    await page.getByLabel('Who sees phone').selectOption('friends');
+    await page.getByRole('checkbox', { name: /Show me in search/ }).uncheck();
+    await page.getByRole('button', { name: 'Save profile' }).click();
+    check('saves', await shown(page.getByText('Your profile is saved.')));
+    check('with each detail and who sees it', db.profile.bio === 'Collects vinyl' && db.profile.phone === '816-555-0123'
+      && db.profile.website === 'https://sam.example.com/' && db.profile.socials?.instagram === 'samspins'
+      && db.profile.visibility?.phone === 'friends' && db.profile.visibility?.bio === 'everyone' && db.profile.searchable === false, db.profile);
     check('no page errors', problems.length === 0, problems);
     await close();
   },

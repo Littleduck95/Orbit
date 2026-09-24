@@ -99,7 +99,9 @@ export function authMessage(error) {
 
 /* ---------- calls ---------- */
 
-const PROFILE_COLS = 'id, username, display_name, birthday';
+// Every column, so a profile still reads before and after the friends part
+// of the schema has been run.
+const PROFILE_COLS = '*';
 
 // The signed-in person's profile. { profile } when there is one, { profile:
 // null } when there is not yet, and { missing: true } when the table itself
@@ -133,6 +135,11 @@ export async function updateProfile(client, userId, changes) {
   if ('username' in changes) row.username = cleanUsername(changes.username);
   if ('displayName' in changes) row.display_name = changes.displayName.trim();
   if ('birthday' in changes) row.birthday = changes.birthday;
+  for (const [from, to] of [['pronouns', 'pronouns'], ['bio', 'bio'], ['location', 'location'], ['phone', 'phone'],
+    ['contactEmail', 'contact_email'], ['website', 'website'], ['socials', 'socials'], ['visibility', 'visibility'],
+    ['searchable', 'searchable']]) {
+    if (from in changes) row[to] = typeof changes[from] === 'string' ? changes[from].trim() : changes[from];
+  }
   const { data, error } = await client.from('profiles').update(row).eq('id', userId).select(PROFILE_COLS);
   if (error) throw new Error(authMessage(error));
   return data?.[0];
@@ -180,3 +187,59 @@ export async function deleteAccount(client) {
   const { error } = await client.rpc('delete_my_account');
   if (error) throw new Error(authMessage(error));
 }
+
+/* ---------- what others can see ---------- */
+
+export const VISIBILITY = [['everyone', 'Everyone'], ['friends', 'Friends'], ['me', 'Only me']];
+
+// The details a profile can show, in the order they are shown, with who sees
+// each one until its owner chooses otherwise. Username and name are always
+// visible, so people can be found.
+export const PROFILE_FIELDS = [
+  { key: 'pronouns', label: 'Pronouns', max: 30, start: 'everyone', ph: 'she/her' },
+  { key: 'bio', label: 'About', max: 300, start: 'everyone', long: true, ph: 'A line or two about you' },
+  { key: 'location', label: 'Where you live', max: 80, start: 'friends', ph: 'Kansas City' },
+  { key: 'birthday', label: 'Birthday', start: 'friends', fromAccount: true },
+  { key: 'phone', label: 'Phone', max: 40, start: 'me', ph: '+1 816 555 0100' },
+  { key: 'contact_email', label: 'Email for friends', max: 200, start: 'me', ph: 'Can differ from the one you sign in with' },
+  { key: 'website', label: 'Website', max: 300, start: 'everyone', ph: 'https://' },
+  { key: 'socials', label: 'Socials', start: 'friends' },
+];
+
+export const SOCIAL_KEYS = [['instagram', 'Instagram'], ['x', 'X'], ['tiktok', 'TikTok'], ['snapchat', 'Snapchat'], ['linkedin', 'LinkedIn']];
+
+export const visibilityOf = (profile, key) => profile?.visibility?.[key]
+  || PROFILE_FIELDS.find((f) => f.key === key)?.start || 'me';
+
+// What someone standing this way sees of a profile: the same rule the
+// database applies, used for the preview in Settings.
+export function seenAs(profile, as) {
+  const out = { username: profile.username, display_name: profile.display_name };
+  PROFILE_FIELDS.forEach(({ key }) => {
+    const lvl = visibilityOf(profile, key);
+    const v = profile[key];
+    const empty = v == null || v === '' || (typeof v === 'object' && !Object.keys(v).length);
+    if (!empty && (as === 'me' || lvl === 'everyone' || (lvl === 'friends' && as === 'friends'))) out[key] = v;
+  });
+  return out;
+}
+
+/* ---------- friends ---------- */
+
+const rpc = async (client, fn, args) => {
+  const { data, error } = await client.rpc(fn, args);
+  if (error) throw new Error(/could not find the function|PGRST202/i.test(error.message || '') ? 'Friends are not set up on the server yet.' : authMessage(error));
+  return data;
+};
+
+export const friendsApi = (client) => ({
+  search: async (q) => (await rpc(client, 'search_profiles', { q })) || [],
+  get: (username) => rpc(client, 'get_profile', { uname: username }),
+  list: async () => (await rpc(client, 'my_friends')) || [],
+  send: (id) => rpc(client, 'send_friend_request', { target: id }),
+  respond: (id, accept) => rpc(client, 'respond_friend_request', { other: id, accept }),
+  remove: (id) => rpc(client, 'remove_friend', { other: id }),
+  block: (id) => rpc(client, 'block_user', { other: id }),
+  unblock: (id) => rpc(client, 'unblock_user', { other: id }),
+  blocks: async () => (await rpc(client, 'my_blocks')) || [],
+});
