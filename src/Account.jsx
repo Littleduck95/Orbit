@@ -2,12 +2,16 @@ import { useEffect, useState } from 'react';
 import {
   clearCache, cloudStorage, localEntries, parkLocal, readAccountState, replaceAccount,
 } from './cloudStorage.js';
-import { redirectError } from './supabase.js';
+import {
+  changeEmail, deleteAccount, loadProfile, setPassword, updateProfile, usernameAvailable,
+} from './accountApi.js';
+import { NewPassword, ProfileSetup, Screen, SignIn, css, returnTo } from './SignIn.jsx';
 
 /*
  * Stands in front of the app when Orbit has a Supabase project (see .env).
- * Nobody reaches their data without signing in, by an emailed link or with
- * Google, and once they have, window.storage is their account.
+ * Nobody reaches their data without signing in (with a password, an emailed
+ * link, or Google), and once they have, window.storage is their account.
+ * An account with no username yet is asked for one first.
  *
  * The app is only drawn once the account has been read, so it never starts
  * empty and saves that emptiness over what the account holds.
@@ -41,10 +45,6 @@ const openOnce = (id, args) => {
   return opening.promise;
 };
 
-// Where sign-in links and Google send people back to: this page, as it is
-// hosted. It must be listed under Redirect URLs in the Supabase dashboard.
-const returnTo = () => window.location.origin + window.location.pathname;
-
 const download = (name, text) => {
   const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
   const a = document.createElement('a');
@@ -56,120 +56,35 @@ const download = (name, text) => {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 
-const css = `
-  .acct { --ink:#15211B; --muted:#5A6B60; --bg:#FBFDFB; --line:#D5DED8; --accent:#72DE88; --bad:#B3261E;
-    min-height:100vh; background:var(--bg); color:var(--ink);
-    font-family:'Segoe UI', system-ui, sans-serif; line-height:1.5; }
-  @media (prefers-color-scheme: dark) {
-    .acct { --ink:#E4ECE6; --muted:#9AAB9F; --bg:#111713; --line:#2C3830; --bad:#F2B8B5; }
-  }
-  .acct-card { max-width:400px; margin:0 auto; padding:56px 16px 40px; }
-  .acct h1 { font-size:26px; margin:0 0 8px; letter-spacing:-0.03em; font-weight:600; }
-  .acct p { margin:0 0 16px; font-size:15px; }
-  .acct .muted { color:var(--muted); font-size:14px; }
-  .acct .bad { color:var(--bad); font-size:14px; }
-  .acct label { display:block; font-size:13px; font-weight:600; margin:0 0 6px; }
-  .acct input { box-sizing:border-box; width:100%; font:inherit; font-size:16px; padding:10px 12px;
-    border-radius:8px; border:1px solid var(--line); background:transparent; color:var(--ink); }
-  .acct button { font:inherit; font-size:15px; font-weight:600; padding:10px 14px; border-radius:8px;
-    cursor:pointer; border:1px solid var(--ink); background:transparent; color:var(--ink); }
-  .acct button.primary { background:var(--accent); border-color:var(--accent); color:#15211B; }
-  .acct button.wide { width:100%; margin-top:10px; }
-  .acct button:disabled { opacity:.6; cursor:default; }
-  .acct button:focus-visible, .acct input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
-  .acct .or { display:flex; align-items:center; gap:10px; margin:22px 0; color:var(--muted); font-size:13px; }
-  .acct .or::before, .acct .or::after { content:''; flex:1; border-top:1px solid var(--line); }
-  .acct .stack button { display:block; width:100%; margin-bottom:10px; text-align:left; }
-  .acct-bar { display:flex; gap:12px; align-items:center; justify-content:center; flex-wrap:wrap;
-    padding:8px 16px; font:14px/1.4 'Segoe UI', system-ui, sans-serif; background:#15211B; color:#FBFDFB; }
-  .acct-bar button { font:inherit; font-weight:600; background:transparent; color:inherit;
-    border:1px solid currentColor; border-radius:6px; padding:3px 10px; cursor:pointer; }
-`;
-
-const Screen = ({ children }) => (
-  <main className="acct">
-    <style>{css}</style>
-    <div className="acct-card">{children}</div>
-  </main>
-);
-
-const GoogleMark = () => (
-  <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true" style={{ verticalAlign: '-3px', marginRight: 9 }}>
-    <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z" />
-    <path fill="#FF3D00" d="m6.3 14.7 6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z" />
-    <path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z" />
-    <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z" />
-  </svg>
-);
-
-function SignIn({ client }) {
-  const [email, setEmail] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [sentTo, setSentTo] = useState('');
-  const [problem, setProblem] = useState(redirectError ? `That sign-in link did not work: ${redirectError}` : '');
-
-  const sendLink = async (e) => {
-    e.preventDefault();
-    const to = email.trim();
-    if (!to) { setProblem('Type your email address first.'); return; }
-    setBusy(true); setProblem('');
-    const { error } = await client.auth.signInWithOtp({ email: to, options: { emailRedirectTo: returnTo() } });
-    setBusy(false);
-    if (error) setProblem(`The link could not be sent: ${error.message}`);
-    else setSentTo(to);
-  };
-
-  const google = async () => {
-    setBusy(true); setProblem('');
-    const { error } = await client.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: returnTo() } });
-    // On success the page is already on its way to Google.
-    if (error) { setBusy(false); setProblem(`Google sign-in could not start: ${error.message}`); }
-  };
-
-  if (sentTo) {
-    return (
-      <Screen>
-        <h1>Check your email</h1>
-        <p>A sign-in link is on its way to <strong>{sentTo}</strong>. Open it on any device to sign in there.</p>
-        <p className="muted">Nothing arrived after a few minutes? Look in spam, or try again.</p>
-        <button type="button" onClick={() => setSentTo('')}>Use a different address</button>
-      </Screen>
-    );
-  }
-
-  return (
-    <Screen>
-      <h1>Sign in to Orbit</h1>
-      <p className="muted">
-        Your people, events, reminders and lists are kept in your account, so they are the same on every device
-        you sign in on.
-      </p>
-      <form onSubmit={sendLink} noValidate>
-        <label htmlFor="acct-email">Email</label>
-        <input
-          id="acct-email" type="email" autoComplete="email" inputMode="email" value={email}
-          onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com"
-        />
-        <button type="submit" className="primary wide" disabled={busy}>Email me a sign-in link</button>
-      </form>
-      <div className="or">or</div>
-      <button type="button" className="wide" onClick={google} disabled={busy}><GoogleMark />Continue with Google</button>
-      {problem && <p className="bad" role="alert" style={{ marginTop: 16 }}>{problem}</p>}
-    </Screen>
-  );
-}
-
 export default function Account({ client, children }) {
   const [session, setSession] = useState(undefined);
   const [phase, setPhase] = useState({ name: 'opening' });
   const [attempt, setAttempt] = useState(0);
   const [note, setNote] = useState('');
+  // undefined while being read; null when the account has none yet. When it
+  // cannot be read (no connection, or the setup script not yet run) Orbit
+  // opens anyway, without one.
+  const [profile, setProfile] = useState(undefined);
+  const [recovering, setRecovering] = useState(false);
   const userId = session?.user?.id || null;
 
   useEffect(() => {
-    const { data } = client.auth.onAuthStateChange((_event, s) => setSession(s || null));
+    const { data } = client.auth.onAuthStateChange((event, s) => {
+      if (event === 'PASSWORD_RECOVERY') setRecovering(true);
+      setSession(s || null);
+    });
     return () => data.subscription.unsubscribe();
   }, [client]);
+
+  useEffect(() => {
+    if (!userId) { setProfile(undefined); return undefined; }
+    let live = true;
+    loadProfile(client, userId).then(
+      (r) => { if (live) setProfile(r.missing ? false : r.profile); },
+      () => { if (live) setProfile(false); },
+    );
+    return () => { live = false; };
+  }, [client, userId]);
 
   useEffect(() => {
     if (!userId) {
@@ -207,8 +122,12 @@ export default function Account({ client, children }) {
 
   if (session === undefined) return <Screen><p className="muted">Opening Orbit…</p></Screen>;
   if (!session) return <SignIn client={client} />;
+  if (recovering) return <NewPassword client={client} onDone={() => setRecovering(false)} />;
 
-  if (phase.name === 'opening') return <Screen><p className="muted">Opening your Orbit…</p></Screen>;
+  if (phase.name === 'opening' || profile === undefined) return <Screen><p className="muted">Opening your Orbit…</p></Screen>;
+  if (profile === null && phase.name !== 'failed') {
+    return <ProfileSetup client={client} user={session.user} onDone={setProfile} onSignOut={signOut} />;
+  }
 
   if (phase.name === 'failed') {
     return (
@@ -284,7 +203,31 @@ export default function Account({ client, children }) {
           <button type="button" onClick={() => setPhase({ ...phase, dismissed: true })}>OK</button>
         </div>
       )}
-      {children({ key: userId, account: { email: session.user.email || '', signOut } })}
+      {children({
+        key: userId,
+        account: {
+          email: session.user.email || '',
+          // How they can sign in: 'email' (a password or an emailed link), 'google'.
+          providers: session.user.app_metadata?.providers || [],
+          profile: profile || null,
+          signOut,
+          checkUsername: (name) => usernameAvailable(client, name),
+          updateProfile: async (changes) => {
+            const next = await updateProfile(client, userId, changes);
+            if (next) setProfile(next);
+            return next;
+          },
+          changeEmail: (email) => changeEmail(client, email, returnTo()),
+          changePassword: (password) => setPassword(client, password),
+          deleteAccount: async () => {
+            await deleteAccount(client);
+            clearCache(localStorage, userId);
+            delete window.storage;
+            // The account is gone, so only this device's session is left to clear.
+            await client.auth.signOut({ scope: 'local' });
+          },
+        },
+      })}
     </>
   );
 }

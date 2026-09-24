@@ -11,7 +11,8 @@
     "lint": "eslint .",
     "test": "node --test tests/*.test.mjs",
     "test:browser": "node tests/browser/run.mjs",
-    "test:account": "node tests/account/run.mjs"
+    "test:account": "node tests/account/run.mjs",
+    "test:db": "node tests/db/run.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.1",

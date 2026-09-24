@@ -27,6 +27,7 @@ Then open http://localhost:5173.
 | `npm test` | Logic, storage and account tests (Node's built-in runner, no extra installs) |
 | `npm run test:browser` | Drives the real app in Chromium; needs Playwright installed |
 | `npm run test:account` | Drives sign-in in Chromium against a stand-in for Supabase; needs Playwright |
+| `npm run test:db` | Runs `supabase/schema.sql` on a throwaway PostgreSQL and checks its security rules; needs PostgreSQL installed |
 
 The tests are characterization tests: they pin down what the app does today,
 with the clock, timezone and locale fixed so dates are repeatable. Checks whose
@@ -166,8 +167,8 @@ Lists shared with the older links still open as before.
 
 ## Accounts
 
-Orbit asks people to sign in, by a link sent to their email or with Google,
-and keeps their data in their own account on [Supabase](https://supabase.com),
+Orbit asks people to log in or create an account, and keeps their data in
+their own account on [Supabase](https://supabase.com),
 so it is the same on every device they sign in on. The project is set in
 `.env`. Both values there are public by design: the publishable key can only
 do what the row-level security in `supabase/schema.sql` allows, which is each
@@ -196,14 +197,28 @@ edit people) the later save wins.
   than opening empty. Signing out removes the copy.
 - **A shared-list link** opened while signed out is held through sign-in and
   offered afterwards.
-- **Sign out** is in the ⋮ menu, under your email address.
+- **Creating an account** asks for a name (what friends see), a username
+  (how friends find you: lowercase letters, numbers, dots and underscores),
+  an email, a password of at least 8 characters, and a birthday. Orbit is for
+  people 13 and older, which the database enforces as well as the form. A
+  confirmation email finishes the sign-up.
+- **Logging in** is by email and password, with a link by email or Google as
+  alternatives, and **Forgot password?** sends a reset link. An account made
+  with Google or an email link, or before usernames existed, is asked once
+  for a username, name and birthday.
+- **Settings** (⋮ menu) shows the account and changes the name, username,
+  birthday, email (confirmed by a link) and password. It also deletes the
+  account, which removes the sign-in, the profile and every saved row.
+  Email and birthday are only ever shown to their owner.
+- **Sign out** is in the ⋮ menu, under your username.
 
 ### Setting up the Supabase project
 
 Done once, in the [Supabase dashboard](https://supabase.com/dashboard):
 
-1. **Create the table.** SQL Editor → New query → paste all of
-   `supabase/schema.sql` → Run.
+1. **Create the tables.** SQL Editor → New query → paste all of
+   `supabase/schema.sql` → Run. Run it again, whole, whenever it changes:
+   it only adds what is missing.
 2. **Say where Orbit lives.** Authentication → URL Configuration. Set *Site
    URL* to the address Orbit is served from, and add every address people sign
    in from under *Redirect URLs*: for example `http://localhost:5173/` for

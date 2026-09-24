@@ -28,9 +28,13 @@ const topLevelNames = (src) => [...new Set(
 export async function loadApp() {
   const src = fs.readFileSync(SRC, 'utf8');
   const names = topLevelNames(src);
-  const { code } = await transformWithOxc(`${src}\nexport { ${names.join(', ')} };\n`, 'PersonalCRM.jsx', {
+  const { code: compiled } = await transformWithOxc(`${src}\nexport { ${names.join(', ')} };\n`, 'PersonalCRM.jsx', {
     jsx: { runtime: 'automatic' },
   });
+  // The compiled copy lives elsewhere, so the app's own files it imports
+  // ('./accountApi.js') are pointed back at src.
+  const srcDir = pathToFileURL(path.join(root, 'src')).href;
+  const code = compiled.replace(/from (['"])\.\/([^'"]+)\1/g, (m, q, f) => `from ${q}${srcDir}/${f}${q}`);
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const out = path.join(OUT_DIR, `app-${process.pid}.mjs`);
   fs.writeFileSync(out, code);
