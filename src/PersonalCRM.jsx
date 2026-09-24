@@ -1,10 +1,12 @@
-import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, memo } from 'react';
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, useId, memo, Component } from 'react';
 import Papa from 'papaparse';
 import { KINDS, deviceTimeZone, pushSupport } from './notifications.js';
 import {
   MIN_PASSWORD, PROFILE_FIELDS, SOCIAL_KEYS, VISIBILITY, birthdayProblem, cleanUsername, displayNameProblem, emailProblem,
   passwordProblem, seenAs, usernameProblem, visibilityOf,
 } from './accountApi.js';
+import * as photoStore from './photoStore.js';
+import { GEOCODER } from './mapConfig.js';
 
 /* ---------- palette ---------- */
 const THEMES = {
@@ -383,7 +385,7 @@ function EmptySky({ width = 132 }) {
 }
 
 
-function Button({ children, onClick, kind = 'quiet', style }) {
+function Button({ children, onClick, kind = 'quiet', style, ...rest }) {
   const base = {
     font: 'inherit',
     fontSize: 14,
@@ -401,7 +403,7 @@ function Button({ children, onClick, kind = 'quiet', style }) {
     danger: { background: 'transparent', color: C.overdue, borderColor: 'transparent', padding: '9px 10px' },
   };
   return (
-    <button className="crm-btn" style={{ ...base, ...kinds[kind] }} onClick={onClick}>
+    <button className="crm-btn" style={{ ...base, ...kinds[kind], ...(rest.disabled ? { opacity: 0.55, cursor: 'default' } : null) }} onClick={onClick} {...rest}>
       {children}
     </button>
   );
@@ -1019,7 +1021,7 @@ function PersonRow({ p, selected, onOpen, onQuickLog, onStar, showCircle }) {
   );
 }
 
-function PersonDetail({ p, owner, myEvents, myReminders, myRecs, onLog, onEditLog, onRemoveLog, onEdit, onRemove, onTag, onList, onClearVia, onClose }) {
+function PersonDetail({ p, owner, myEvents, myReminders, myRecs, myTrips, onTrip, onLog, onEditLog, onRemoveLog, onEdit, onRemove, onTag, onList, onClearVia, onClose }) {
   const [logging, setLogging] = useState(false);
   const [sharing, setSharing] = useState(false);
   const [logDate, setLogDate] = useState(todayStr());
@@ -1228,6 +1230,27 @@ function PersonDetail({ p, owner, myEvents, myReminders, myRecs, onLog, onEditLo
                   {e.title}
                   <span style={{ color: C.faint }}> — {eventWhen(e).text}</span>
                 </p>
+              ))}
+            </div>
+          )}
+
+          {(myTrips || []).length > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <p style={{ margin: '0 0 6px', fontSize: 12.5, color: C.faint }}>Trips together</p>
+              {myTrips.map((t) => (
+                <button
+                  key={t.id}
+                  className="crm-btn"
+                  onClick={() => onTrip(t.id)}
+                  style={{
+                    display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
+                    fontSize: 13, color: C.ink, lineHeight: 1.45, cursor: 'pointer',
+                    background: 'transparent', border: 'none', padding: '0 0 4px',
+                  }}
+                >
+                  {t.title}
+                  <span style={{ color: C.faint }}>{` — ${tripWhen(t).text}`}</span>
+                </button>
               ))}
             </div>
           )}
@@ -3391,40 +3414,446 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
 }
 
 /* ---------- place lookup ---------- */
-// The artifact sandbox blocks every external host except cdnjs, so ordinary
-// geocoding APIs are unreachable. api.anthropic.com is the one permitted
-// exception, and Claude handles misspellings and abbreviations better anyway.
-const searchPlaces = async (raw) => {
-  const prompt =
-    `Give coordinates for this place: "${raw}"\n\n` +
-    `Correct obvious misspellings (Cincinatti means Cincinnati). Expand ` +
-    `abbreviations (DR means Dominican Republic, MO means Missouri).\n` +
-    `Return ONLY a JSON array, up to 4 candidates, most likely first, each ` +
-    `{"label":"City, Region, Country","lat":number,"lon":number}. ` +
-    `No prose, no markdown fences. If it is not a real place, return [].`;
+// Nominatim, OpenStreetMap's free place search. Its usage policy allows one
+// request a second from any one user, so every lookup waits its turn here,
+// however many search boxes are asking. Answers are remembered for the visit,
+// so asking again costs nothing.
+const placeCache = new Map();
+let placeNext = 0;
 
+const pause = (ms, signal) => new Promise((resolve, reject) => {
+  const stop = () => reject(new DOMException('Aborted', 'AbortError'));
+  if (signal?.aborted) { stop(); return; }
+  const t = setTimeout(resolve, ms);
+  signal?.addEventListener('abort', () => { clearTimeout(t); stop(); }, { once: true });
+});
+
+// A short name for a place: Nominatim's own, or the first part of its address.
+const placeName = (r) => clip(r?.name, 200) || clip(String(r?.display_name || '').split(',')[0], 200);
+
+// -> { status: 'ok' | 'none' | 'offline' | 'aborted', results: [{ label, name, lat, lon }] }
+const searchPlaces = async (raw, { signal } = {}) => {
+  const q = String(raw || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+  if (!q) return { status: 'none', results: [] };
+  const key = q.toLowerCase();
+  if (placeCache.has(key)) return placeCache.get(key);
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: prompt }],
-      }),
+    const now = Date.now();
+    const at = Math.max(now, placeNext);
+    placeNext = at + GEOCODER.minGapMs;
+    if (at > now) await pause(at - now, signal);
+    const params = new URLSearchParams({
+      q, format: 'jsonv2', limit: String(GEOCODER.limit),
+      'accept-language': (typeof navigator !== 'undefined' && navigator.language) || 'en',
     });
+    const res = await fetch(`${GEOCODER.url}?${params}`, { signal, headers: { Accept: 'application/json' } });
     if (!res.ok) return { status: 'offline', results: [] };
     const data = await res.json();
-    const text = (data.content || [])
-      .filter((i) => i.type === 'text').map((i) => i.text).join('');
-    const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
-    const parsed = JSON.parse(clean.slice(clean.indexOf('['), clean.lastIndexOf(']') + 1));
-    const good = parsed.filter(
-      (r) => r && typeof r.lat === 'number' && typeof r.lon === 'number' && r.label
+    const good = (Array.isArray(data) ? data : [])
+      .map((r) => ({ label: clip(r?.display_name, 300), name: placeName(r), lat: Number(r?.lat), lon: Number(r?.lon) }))
+      .filter((r) => r.label && Number.isFinite(r.lat) && Number.isFinite(r.lon)
         && Math.abs(r.lat) <= 90 && Math.abs(r.lon) <= 180);
-    return good.length ? { status: 'ok', results: good.slice(0, 4) } : { status: 'none', results: [] };
-  } catch {
+    const out = good.length ? { status: 'ok', results: good } : { status: 'none', results: [] };
+    placeCache.set(key, out);
+    return out;
+  } catch (e) {
+    if (e?.name === 'AbortError') return { status: 'aborted', results: [] };
     return { status: 'offline', results: [] };
+  }
+};
+
+/* ---------- trips: the records ---------- */
+// A trip is a place (or several) you went, when, how it was, and who with.
+// The record lives in localStorage like everything else; its photos are too
+// big for that and live in IndexedDB (see photoStore.js), referenced here by id.
+const TRIPS_KEY = 'crm-trips-v1';
+// Set once the "this stays on this device" notice has been read.
+const TRIPS_NOTICE_KEY = 'crm-trips-notice-v1';
+// Set once the offer to turn pinned events into trips has been answered.
+const TRIPS_OFFER_KEY = 'crm-trips-events-offer-v1';
+// When a backup file was last downloaded, to say how old the newest one is.
+const BACKUP_AT_KEY = 'crm-backup-file-v1';
+
+const TRIP_TITLE_CAP = 200;
+const EXCERPT_CAP = 280;
+const TRIP_NOTES_CAP = 20000;
+const STOP_CAP = 50;
+const PHOTO_CAP = 30;
+const TAG_CAP = 20;
+
+const toCoord = (v) => (typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN);
+const round6 = (n) => Math.round(n * 1e6) / 1e6;
+const validLat = (n) => Number.isFinite(n) && Math.abs(n) <= 90;
+const validLng = (n) => Number.isFinite(n) && Math.abs(n) <= 180;
+const coordText = (lat, lng) => `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+
+const cleanStop = (raw) => {
+  if (!isPlainObject(raw)) return null;
+  const lat = toCoord(raw.lat);
+  const lng = toCoord(raw.lng ?? raw.lon);
+  if (!validLat(lat) || !validLng(lng)) return null;
+  const displayAddress = clip(raw.displayAddress, 300);
+  const name = clip(raw.name, 200) || clip(displayAddress.split(',')[0], 200) || coordText(lat, lng);
+  return { name, displayAddress, lat: round6(lat), lng: round6(lng) };
+};
+
+const idList = (v, cap) => [...new Set((Array.isArray(v) ? v : [])
+  .filter((x) => typeof x === 'string' && x && x.length <= 64))].slice(0, cap);
+
+// Tags compare without case, and keep the spelling they were first given.
+const cleanTags = (v) => {
+  const seen = new Set();
+  return (Array.isArray(v) ? v : []).map((x) => clip(x, 40)).filter((x) => {
+    const k = x.toLowerCase();
+    if (!x || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  }).slice(0, TAG_CAP);
+};
+
+const stampOr = (v) => (typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? v : null);
+
+// Every trip, typed in, saved, restored or shared, goes through here, so a
+// hand-edited or hostile file can only ever produce a well-formed trip. A trip
+// with no title, no usable place or no start date is not a trip: null.
+const cleanTrip = (raw) => {
+  if (!isPlainObject(raw)) return null;
+  const title = clip(raw.title, TRIP_TITLE_CAP);
+  const stops = (Array.isArray(raw.stops) ? raw.stops : []).map(cleanStop).filter(Boolean).slice(0, STOP_CAP);
+  let start = isDay(raw.startDate) ? raw.startDate : null;
+  let end = isDay(raw.endDate) ? raw.endDate : null;
+  if (!title || !stops.length || !start) return null;
+  if (end && end < start) [start, end] = [end, start];
+  if (end === start) end = null;
+  const createdAt = stampOr(raw.createdAt) || new Date().toISOString();
+  const trip = {
+    id: typeof raw.id === 'string' && raw.id && raw.id.length <= 64 ? raw.id : uid(),
+    createdAt,
+    updatedAt: stampOr(raw.updatedAt) || createdAt,
+    title,
+    stops,
+    startDate: start,
+    endDate: end,
+    rating: Number.isInteger(raw.rating) && raw.rating >= 1 && raw.rating <= 5 ? raw.rating : null,
+    excerpt: clip(raw.excerpt, EXCERPT_CAP),
+    notes: clip(raw.notes, TRIP_NOTES_CAP),
+    companions: idList(raw.companions, 500),
+    photoIds: idList(raw.photoIds, PHOTO_CAP),
+    tags: cleanTags(raw.tags),
+  };
+  if (typeof raw.fromEvent === 'string' && raw.fromEvent) trip.fromEvent = raw.fromEvent.slice(0, 64);
+  return trip;
+};
+
+// A saved or restored list of trips: bad records dropped, repeated ids kept once.
+const cleanTrips = (raw) => {
+  const seen = new Set();
+  return (Array.isArray(raw) ? raw : []).map(cleanTrip).filter((t) => {
+    if (!t || seen.has(t.id)) return false;
+    seen.add(t.id);
+    return true;
+  });
+};
+
+const tripWhen = (t) => eventWhen({ date: t.startDate, endDate: t.endDate });
+
+// Every year a trip touched, so New Year's in Lisbon counts for both.
+const tripYears = (t) => {
+  const a = Number(t.startDate.slice(0, 4));
+  const b = t.endDate ? Number(t.endDate.slice(0, 4)) : a;
+  const out = [];
+  for (let y = a; y <= b && out.length < 50; y += 1) out.push(y);
+  return out;
+};
+
+// Newest first: latest start, then the one written down last.
+const sortTrips = (trips) => [...trips].sort((a, b) =>
+  b.startDate.localeCompare(a.startDate) || (b.createdAt || '').localeCompare(a.createdAt || ''));
+
+const NO_TRIP_FILTER = Object.freeze({ year: '', minRating: 0, companion: '', tag: '' });
+
+const filterTrips = (trips, f) => trips.filter((t) =>
+  (!f.year || tripYears(t).includes(Number(f.year)))
+  && (!f.minRating || (t.rating || 0) >= f.minRating)
+  && (!f.companion || t.companions.includes(f.companion))
+  && (!f.tag || t.tags.some((g) => g.toLowerCase() === f.tag.toLowerCase())));
+
+const tripFilterOptions = (trips) => ({
+  years: [...new Set(trips.flatMap(tripYears))].sort((a, b) => b - a),
+  companions: [...new Set(trips.flatMap((t) => t.companions))],
+  tags: [...new Map(trips.flatMap((t) => t.tags).map((g) => [g.toLowerCase(), g])).values()]
+    .sort((a, b) => SHELF.compare(a, b)),
+});
+
+// Pins on the map run from red for a trip you would not repeat to deep green
+// for a favourite, with the rating written on each, so colour is never the
+// only way to tell. They sit on light map tiles in both themes, so these do
+// not change with the theme. Each carries white text at 4.5:1 or better.
+const RATING_COLORS = ['#56655C', '#B42318', '#B04A0C', '#8A6208', '#2C7A3B', '#145A32'];
+const ratingColor = (r) => RATING_COLORS[r || 0] || RATING_COLORS[0];
+
+// One point per stop.
+const tripPoints = (trips) => trips.flatMap((t) => t.stops.map((s, i) => ({
+  key: `${t.id}:${i}`,
+  tripId: t.id,
+  stop: i,
+  lat: s.lat,
+  lng: s.lng,
+  color: ratingColor(t.rating),
+  text: t.rating ? String(t.rating) : '',
+  label: t.stops.length > 1 ? `${t.title}: ${s.name}` : t.title,
+})));
+
+// Records from a backup are matched to what is here by id, so restoring the
+// same file twice adds nothing. A record only one side has is kept. When both
+// have it, the one changed more recently wins if both say when; otherwise the
+// one already here stays.
+const mergeById = (have, incoming, stampOf) => {
+  const byId = new Map(have.map((x) => [x.id, x]));
+  let added = 0;
+  let updated = 0;
+  incoming.forEach((x) => {
+    const mine = byId.get(x.id);
+    if (!mine) {
+      byId.set(x.id, x);
+      added += 1;
+      return;
+    }
+    const a = stampOf ? stampOf(mine) : '';
+    const b = stampOf ? stampOf(x) : '';
+    if (a && b && b > a) {
+      byId.set(x.id, x);
+      updated += 1;
+    }
+  });
+  return { list: [...byId.values()], added, updated };
+};
+
+// A pinned event, as a trip. The event itself stays on the timeline.
+const eventToTrip = (e) => cleanTrip({
+  title: e.title,
+  stops: [{ name: clip((e.place || '').split(',')[0], 200) || e.title, displayAddress: e.place || '', lat: e.lat, lng: e.lon }],
+  startDate: e.date,
+  endDate: e.endDate,
+  notes: e.note || '',
+  companions: e.people || [],
+  tags: e.kind && e.kind !== 'Other' && e.kind !== 'Trip' ? [e.kind] : [],
+  fromEvent: e.id,
+});
+
+/* ---------- trips: sharing ---------- */
+// Like a shared list, a trip without photos travels inside the link. It
+// carries the trip, never who went: that is yours, and their ids mean nothing
+// on anyone else's Orbit. Notes only go when you say so.
+const TRIP_SHARE_PREFIX = 'trip=';
+
+const tripShareCode = (t, { notes, by }) => toCode({
+  v: 1,
+  k: 'trip',
+  t: t.title,
+  s: t.stops.map((x) => [x.name, x.displayAddress, x.lat, x.lng]),
+  a: t.startDate,
+  ...(t.endDate ? { b: t.endDate } : {}),
+  ...(t.rating ? { r: t.rating } : {}),
+  ...(t.excerpt ? { x: t.excerpt } : {}),
+  ...(notes && t.notes ? { n: t.notes } : {}),
+  ...(t.tags.length ? { g: t.tags } : {}),
+  ...(by ? { by } : {}),
+});
+
+// A trip arriving from someone else: always a new one, never tied to anyone here.
+const sharedTrip = (raw) => {
+  const t = cleanTrip({ ...raw, id: undefined, createdAt: undefined, updatedAt: undefined, fromEvent: undefined });
+  return t ? { ...t, companions: [], photoIds: [] } : null;
+};
+
+// Accepts the whole link or just the code after it.
+const readSharedTrip = (text) => {
+  const s = String(text || '').trim();
+  const m = s.match(/(?:^|[#&?])trip=([A-Za-z0-9_-]+)/) || s.match(/^([A-Za-z0-9_-]{16,})$/);
+  if (!m) return null;
+  try {
+    const o = fromCode(m[1]);
+    if (!isPlainObject(o) || o.v !== 1 || o.k !== 'trip' || !Array.isArray(o.s)) return null;
+    const trip = sharedTrip({
+      title: o.t,
+      stops: o.s.filter(Array.isArray).map((x) => ({ name: x[0], displayAddress: x[1], lat: x[2], lng: x[3] })),
+      startDate: o.a, endDate: o.b, rating: o.r, excerpt: o.x, notes: o.n, tags: o.g,
+    });
+    return trip ? { trip, by: clip(o.by, 60), photos: [] } : null;
+  } catch {
+    return null;
+  }
+};
+
+const tripText = (t, { notes }) => {
+  const lines = [t.title, [tripWhen(t).text, t.rating ? stars(t.rating) : ''].filter(Boolean).join('  ')];
+  lines.push(t.stops.map((s) => s.displayAddress || s.name).join('\n'));
+  if (t.excerpt) lines.push(t.excerpt);
+  if (notes && t.notes) lines.push(t.notes);
+  if (t.tags.length) lines.push(t.tags.map((g) => `#${g.replace(/\s+/g, '')}`).join(' '));
+  return lines.filter(Boolean).join('\n\n');
+};
+
+/* ---------- trips: files ---------- */
+// Backups and trips shared with their photos are zip files: orbit.json with
+// the records, and each photo as a JPEG beside it (full size and thumbnail).
+// Photos are stored in the zip as they are; they are already compressed.
+const PACKAGE_JSON = 'orbit.json';
+const PHOTO_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const photoPath = (id, small) => `${small ? 'thumbs' : 'photos'}/${id}.jpg`;
+// Nothing in a real file comes near these; a hostile one cannot use them to
+// exhaust memory.
+const ENTRY_CAP = 40 * 1024 * 1024;
+const MANIFEST_CAP = 50 * 1024 * 1024;
+
+const approxBytes = (n) => {
+  if (n < 1000) return `${n} bytes`;
+  if (n < 1e6) return `${Math.round(n / 1e3)} KB`;
+  if (n < 1e9) return `${(n / 1e6).toFixed(n < 1e7 ? 1 : 0)} MB`;
+  return `${(n / 1e9).toFixed(1)} GB`;
+};
+
+// manifest: the records, and a photos list of { id, ... }. load(id) gives
+// { blob, thumb } for each photo, or null to leave it out. Returns a Blob.
+const packZip = async (manifest, load, onProgress) => {
+  const { Zip, ZipPassThrough, ZipDeflate, strToU8 } = await import('fflate');
+  const chunks = [];
+  let failed = null;
+  const zip = new Zip((err, chunk) => {
+    if (err) failed = err;
+    else chunks.push(chunk);
+  });
+  const put = (name, bytes, squeeze) => {
+    const entry = squeeze ? new ZipDeflate(name, { level: 6 }) : new ZipPassThrough(name);
+    zip.add(entry);
+    entry.push(bytes, true);
+  };
+  const kept = [];
+  const photos = manifest.photos || [];
+  for (let i = 0; i < photos.length; i += 1) {
+    const p = photos[i];
+    const got = PHOTO_ID.test(p.id || '') ? await load(p.id) : null;
+    if (got?.blob) {
+      put(photoPath(p.id), new Uint8Array(await got.blob.arrayBuffer()));
+      if (got.thumb) put(photoPath(p.id, true), new Uint8Array(await got.thumb.arrayBuffer()));
+      kept.push(got.width ? { ...p, width: got.width, height: got.height } : p);
+    }
+    onProgress?.(i + 1, photos.length);
+  }
+  put(PACKAGE_JSON, strToU8(JSON.stringify({ ...manifest, photos: kept })), true);
+  zip.end();
+  if (failed) throw failed;
+  return new Blob(chunks, { type: 'application/zip' });
+};
+
+// bytes -> { manifest, photos: [{ id, blob, thumb, width, height, tripId }] }.
+// A plain JSON file (a pasted-style backup saved to disk) reads too, without photos.
+const unpackFile = async (bytes) => {
+  const { unzipSync, strFromU8 } = await import('fflate');
+  if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
+    const files = unzipSync(bytes, {
+      filter: (f) => f.originalSize <= (f.name === PACKAGE_JSON ? MANIFEST_CAP : ENTRY_CAP)
+        && (f.name === PACKAGE_JSON || /^(photos|thumbs)\/[A-Za-z0-9_-]{1,64}\.jpg$/.test(f.name)),
+    });
+    if (!files[PACKAGE_JSON]) throw new Error('no manifest');
+    const manifest = JSON.parse(strFromU8(files[PACKAGE_JSON]));
+    const photos = (Array.isArray(manifest?.photos) ? manifest.photos : []).filter(isPlainObject).map((p) => {
+      if (!PHOTO_ID.test(p.id || '') || !files[photoPath(p.id)]) return null;
+      const small = files[photoPath(p.id, true)];
+      return {
+        id: p.id,
+        tripId: typeof p.tripId === 'string' ? p.tripId.slice(0, 64) : '',
+        blob: new Blob([files[photoPath(p.id)]], { type: 'image/jpeg' }),
+        thumb: small ? new Blob([small], { type: 'image/jpeg' }) : null,
+        width: fixNumber(p.width) ?? null,
+        height: fixNumber(p.height) ?? null,
+      };
+    }).filter(Boolean);
+    return { manifest, photos };
+  }
+  if (bytes.length > MANIFEST_CAP) throw new Error('too big');
+  return { manifest: JSON.parse(new TextDecoder().decode(bytes)), photos: [] };
+};
+
+// What a backup holds, each kind of record checked the same way the pasted
+// backup always has been. Older backups were a bare array of people.
+const backupParts = (parsed) => {
+  const list = (k) => (Array.isArray(parsed) ? [] : Array.isArray(parsed?.[k]) ? parsed[k] : []);
+  const rawPeople = Array.isArray(parsed) ? parsed : parsed?.people;
+  if (!Array.isArray(rawPeople) && !isPlainObject(parsed)) throw new Error('not a backup');
+  return {
+    people: cleanAll((Array.isArray(rawPeople) ? rawPeople : []).filter((r) => r && typeof r.name === 'string' && r.name.trim()), cleanPerson)
+      .map((r) => ({ ...r, id: r.id || uid() })),
+    events: cleanAll(list('events').filter((e) => e && e.title && e.date), cleanEvent).map((e) => ({ ...e, id: e.id || uid() })),
+    reminders: cleanAll(list('reminders').filter((r) => r && r.title && r.next), cleanReminder).map((r) => ({ ...r, id: r.id || uid() })),
+    collections: cleanCollections(list('collections')),
+    trips: cleanTrips(list('trips')),
+  };
+};
+
+// A file picked under Restore. Throws an Error whose message can be shown.
+const readBackupFile = async (file) => {
+  let got;
+  try {
+    got = await unpackFile(new Uint8Array(await file.arrayBuffer()));
+  } catch {
+    throw new Error('That file could not be read as an Orbit backup. Pick the .zip Orbit saved, as it was downloaded.');
+  }
+  if (got.manifest?.kind === 'orbit-trip') {
+    throw new Error('That is a shared trip, not a backup. Add it from Trips, under Add a shared trip.');
+  }
+  let parts;
+  try {
+    parts = backupParts(got.manifest);
+  } catch {
+    throw new Error('That file could not be read as an Orbit backup.');
+  }
+  if (Object.values(parts).every((x) => x.length === 0)) throw new Error('That backup has nothing in it.');
+  return { parts, photos: got.photos };
+};
+
+// A shared trip file. Returns { trip, by, photos } or throws a showable Error.
+const readTripFile = async (file) => {
+  let got;
+  try {
+    got = await unpackFile(new Uint8Array(await file.arrayBuffer()));
+  } catch {
+    throw new Error('That file could not be read as a shared trip.');
+  }
+  if (got.manifest?.kind !== 'orbit-trip') {
+    throw new Error(got.manifest?.kind === 'orbit-backup'
+      ? 'That is a full Orbit backup, not a shared trip. Restore it from Import instead.'
+      : 'That file could not be read as a shared trip.');
+  }
+  const trip = sharedTrip(got.manifest.trip);
+  if (!trip) throw new Error('That shared trip is missing its title, place or date.');
+  return { trip, by: clip(got.manifest.by, 60), photos: got.photos.slice(0, PHOTO_CAP) };
+};
+
+const tripPackage = (t, { notes, by }) => ({
+  kind: 'orbit-trip',
+  version: 1,
+  ...(by ? { by } : {}),
+  trip: { ...t, notes: notes ? t.notes : '', companions: [], fromEvent: undefined },
+  photos: t.photoIds.map((id) => ({ id })),
+});
+
+const fileSafe = (s) => (s || 'trip').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40).toLowerCase() || 'trip';
+
+const downloadBlob = (name, blob) => {
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    return true;
+  } catch {
+    return false;
   }
 };
 
@@ -3591,7 +4020,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
             : coords ? `Pinned at ${coords.lat.toFixed(3)}, ${coords.lon.toFixed(3)}.`
             : looking === 'picking' ? 'Pick the right one.'
             : looking === 'none' ? 'No match. Check the spelling, or try just the city on its own.'
-            : looking === 'offline' ? 'Could not reach either lookup service from here. Enter the coordinates below instead.'
+            : looking === 'offline' ? 'Could not reach the place search from here. Enter the coordinates below instead.'
             : 'Optional. Hit Find to drop a pin, or leave it as plain text.'}
         </span>
 
@@ -5441,90 +5870,1689 @@ function CollectionsView({ collections, look, incoming, onOpen, onNew, onTakeSha
   );
 }
 
-/* ---------- map ---------- */
-// No basemap here on purpose: tile servers are outside the sandbox allowlist,
-// so Leaflet would load and then render an empty grey square. The pins live
-// here; the Travel Log renders them.
-function MapView({ events, people }) {
-  const [copying, setCopying] = useState(false);
-  const pins = [...events]
-    .filter((e) => e.lat != null && e.lon != null)
-    .sort((a, b) => (a.date < b.date ? 1 : -1));
+/* ---------- trips: maps ---------- */
+// Leaflet is only fetched the first time a map is shown. A failed fetch
+// (offline, say) is not remembered, so Try again really tries again.
+let mapsModule = null;
+let mapsLoading = null;
+const loadMaps = () => {
+  if (!mapsLoading) {
+    mapsLoading = import('./TripMap.jsx')
+      .then((m) => { mapsModule = m; return m; })
+      .catch((e) => { mapsLoading = null; throw e; });
+  }
+  return mapsLoading;
+};
 
-  const payload = JSON.stringify(
-    pins.map((e) => ({
-      title: e.title,
-      place: e.place || '',
-      lat: e.lat,
-      lon: e.lon,
-      start: e.date,
-      end: e.endDate || e.date,
-      kind: e.kind || '',
-      notes: e.note || '',
-      people: (e.people || [])
-        .map((id) => people.find((x) => x.id === id))
-        .filter(Boolean)
-        .map((x) => x.name),
-    })),
-    null,
-    2
+// Anything going wrong inside the map stays inside its box.
+class MapBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { failed: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <MapNote height={this.props.height}>
+          The map ran into a problem.{' '}
+          <button className="crm-btn" onClick={() => this.setState({ failed: false })} style={textButton()}>Try again</button>
+        </MapNote>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function MapNote({ height, children }) {
+  return (
+    <div style={{
+      height, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20,
+      boxSizing: 'border-box', background: C.paper, textAlign: 'center',
+    }}>
+      <p role="status" style={{ margin: 0, fontSize: 13, color: C.muted, lineHeight: 1.5 }}>{children}</p>
+    </div>
   );
+}
+
+// render(module) draws the map once Leaflet has arrived.
+function MapSlot({ height, render }) {
+  const [mod, setMod] = useState(mapsModule);
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    if (mod) return undefined;
+    let live = true;
+    loadMaps().then((m) => { if (live) setMod(m); }).catch(() => { if (live) setFailed(true); });
+    return () => { live = false; };
+  }, [mod, attempt]);
+  if (failed) {
+    return (
+      <MapNote height={height}>
+        The map could not load. Check the connection.{' '}
+        <button className="crm-btn" onClick={() => { setFailed(false); setAttempt((n) => n + 1); }} style={textButton()}>
+          Try again
+        </button>
+      </MapNote>
+    );
+  }
+  if (!mod) return <MapNote height={height}>Loading the map…</MapNote>;
+  return <MapBoundary height={height}>{render(mod)}</MapBoundary>;
+}
+
+// A button that reads as a link in running text.
+const textButton = () => ({
+  font: 'inherit', fontSize: 'inherit', fontWeight: 600, color: C.ink, background: 'transparent',
+  border: 'none', padding: 0, cursor: 'pointer', textDecoration: 'underline',
+  textDecorationColor: C.faint, textUnderlineOffset: 3,
+});
+
+const mapFrame = () => ({
+  position: 'relative', borderRadius: 12, overflow: 'hidden', border: `1px solid ${C.line}`,
+  // Leaflet's layers carry z-indexes in the hundreds. Isolating them keeps
+  // them under the menu and anything else drawn over the page.
+  isolation: 'isolate',
+});
+
+function RatingLegend() {
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 14px', marginTop: 9, fontSize: 12, color: C.muted }}>
+      {[5, 4, 3, 2, 1, 0].map((r) => (
+        <span key={r} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <span aria-hidden="true" style={{
+            width: 18, height: 18, borderRadius: 18, background: ratingColor(r), color: '#fff',
+            fontSize: 10.5, fontWeight: 700, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          }}>{r || ''}</span>
+          {r ? `${r} star${r === 1 ? '' : 's'}` : 'Not rated'}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- trips: photos on screen ---------- */
+const photoAlt = (title, i) => `${title || 'Trip'}, photo ${i + 1}`;
+
+// An object URL for one stored photo, made when it is needed and revoked when
+// the thing showing it goes away, so browsing photos does not leak memory.
+const usePhotoUrl = (id, full) => {
+  const [got, setGot] = useState({ id: null, url: null, missing: false });
+  useEffect(() => {
+    if (!id) return undefined;
+    let live = true;
+    let made = null;
+    (full ? photoStore.get(id) : photoStore.getThumbnail(id))
+      .then((blob) => {
+        if (!live) return;
+        if (!blob) { setGot({ id, url: null, missing: true }); return; }
+        made = URL.createObjectURL(blob);
+        setGot({ id, url: made, missing: false });
+      })
+      .catch(() => { if (live) setGot({ id, url: null, missing: true }); });
+    return () => {
+      live = false;
+      if (made) URL.revokeObjectURL(made);
+    };
+  }, [id, full]);
+  return got.id === id ? got : { id, url: null, missing: false };
+};
+
+function PhotoThumb({ id, alt, style, empty }) {
+  const { url, missing } = usePhotoUrl(id, false);
+  return (
+    <div style={{ background: C.line, overflow: 'hidden', position: 'relative', ...style }}>
+      {url ? (
+        <img src={url} alt={alt} draggable={false}
+          style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+      ) : missing || !id ? (empty || (
+        <span style={{
+          position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 11, color: C.faint, textAlign: 'center', padding: 4,
+        }}>{id ? 'Photo missing' : ''}</span>
+      )) : null}
+    </div>
+  );
+}
+
+// Full size, one at a time. Arrow keys, swipes and the buttons all move
+// through them; Escape or Close ends it and puts focus back where it was.
+function Lightbox({ ids, start, title, onClose }) {
+  const [i, setI] = useState(Math.min(Math.max(0, start), ids.length - 1));
+  const n = ids.length;
+  const { url, missing } = usePhotoUrl(ids[i], true);
+  const box = useRef(null);
+  const closer = useRef(null);
+  const swipe = useRef(null);
+  const go = useCallback((d) => setI((x) => (x + d + n) % n), [n]);
+
+  useEffect(() => {
+    const before = document.activeElement;
+    const overflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    closer.current?.focus();
+    return () => {
+      document.body.style.overflow = overflow;
+      if (before && typeof before.focus === 'function') before.focus();
+    };
+  }, []);
+
+  useEffect(() => {
+    const key = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); onClose(); } else if (e.key === 'ArrowRight') go(1);
+      else if (e.key === 'ArrowLeft') go(-1);
+      else if (e.key === 'Tab' && box.current) {
+        // Keep Tab inside the viewer while it is open.
+        const all = [...box.current.querySelectorAll('button')];
+        if (!all.length) return;
+        const first = all[0];
+        const last = all[all.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    };
+    window.addEventListener('keydown', key);
+    return () => window.removeEventListener('keydown', key);
+  }, [go, onClose]);
+
+  const down = (e) => { swipe.current = { x: e.clientX, y: e.clientY }; };
+  const up = (e) => {
+    const s = swipe.current;
+    swipe.current = null;
+    if (!s || n < 2) return;
+    const dx = e.clientX - s.x;
+    if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(e.clientY - s.y)) go(dx < 0 ? 1 : -1);
+  };
+
+  const arrow = {
+    font: 'inherit', fontSize: 22, lineHeight: 1, width: 46, height: 46, borderRadius: 46, cursor: 'pointer',
+    background: 'rgba(0,0,0,0.55)', color: '#fff', border: '1px solid rgba(255,255,255,0.35)',
+    position: 'absolute', top: '50%', transform: 'translateY(-50%)',
+  };
+
+  return (
+    <div ref={box} role="dialog" aria-modal="true" aria-label={`${title || 'Trip'} photos`}
+      style={{ position: 'fixed', inset: 0, zIndex: 2000, background: 'rgba(5,8,12,0.94)', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', color: '#fff' }}>
+        <span aria-live="polite" style={{ fontSize: 13.5, flex: 1, minWidth: 0 }}>
+          {n > 1 ? `${i + 1} of ${n}` : ''}
+        </span>
+        <button ref={closer} className="crm-btn" onClick={onClose} style={{
+          font: 'inherit', fontSize: 14, fontWeight: 600, color: '#fff', background: 'transparent',
+          border: '1px solid rgba(255,255,255,0.45)', borderRadius: 7, padding: '7px 13px', cursor: 'pointer',
+        }}>Close</button>
+      </div>
+      <div
+        onPointerDown={down}
+        onPointerUp={up}
+        onPointerCancel={() => { swipe.current = null; }}
+        style={{ flex: 1, minHeight: 0, position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', touchAction: 'pan-y pinch-zoom', padding: '0 8px 16px' }}
+      >
+        {url ? (
+          <img src={url} alt={photoAlt(title, i)} draggable={false}
+            style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', userSelect: 'none' }} />
+        ) : (
+          <p style={{ color: '#ccc', fontSize: 14 }}>{missing ? 'This photo is missing from this browser.' : 'Loading…'}</p>
+        )}
+        {n > 1 && (
+          <>
+            <button className="crm-btn" aria-label="Previous photo" onClick={() => go(-1)} style={{ ...arrow, left: 10 }}>‹</button>
+            <button className="crm-btn" aria-label="Next photo" onClick={() => go(1)} style={{ ...arrow, right: 10 }}>›</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PhotoGrid({ ids, title, onOpen }) {
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(96px, 1fr))', gap: 6 }}>
+      {ids.map((id, i) => (
+        <button key={id} className="crm-btn" onClick={() => onOpen(i)}
+          aria-label={`Open ${photoAlt(title, i)}`}
+          style={{ padding: 0, border: 'none', background: 'none', cursor: 'zoom-in', borderRadius: 8, display: 'block' }}>
+          <PhotoThumb id={id} alt={photoAlt(title, i)} style={{ aspectRatio: '1 / 1', borderRadius: 8 }} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- trips: small pieces ---------- */
+function Stars({ n, size = 13.5 }) {
+  if (!n) return null;
+  return (
+    <span role="img" aria-label={`${n} out of 5 stars`}
+      style={{ color: C.soonBar, fontSize: size, letterSpacing: '0.06em', whiteSpace: 'nowrap' }}>
+      {stars(n)}
+    </span>
+  );
+}
+
+// Five radio buttons dressed as stars, so arrow keys and screen readers work
+// the way they do on any other choice. "Not rated" is a choice too.
+function StarInput({ value, onChange }) {
+  const [hover, setHover] = useState(0);
+  const name = useId();
+  const shown = hover || value || 0;
+  return (
+    <fieldset style={{ border: 'none', margin: '0 0 14px', padding: 0, minWidth: 0 }}>
+      <legend style={{ fontSize: 13, color: C.muted, marginBottom: 5, fontWeight: 500, padding: 0 }}>Rating</legend>
+      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 2 }} onMouseLeave={() => setHover(0)}>
+        {[1, 2, 3, 4, 5].map((n) => (
+          <label key={n} className="crm-star" onMouseEnter={() => setHover(n)} style={{ cursor: 'pointer', padding: '2px 3px', position: 'relative' }}>
+            <input type="radio" name={name} value={n} checked={value === n} onChange={() => onChange(n)}
+              className="crm-sr" aria-label={`${n} star${n === 1 ? '' : 's'}`} />
+            <span aria-hidden="true" style={{ display: 'inline-block', fontSize: 28, lineHeight: 1, color: n <= shown ? C.soonBar : C.line }}>★</span>
+          </label>
+        ))}
+        <label className="crm-star" style={{ cursor: 'pointer', marginLeft: 8, position: 'relative' }}>
+          <input type="radio" name={name} value="0" checked={!value} onChange={() => onChange(null)} className="crm-sr" />
+          <span style={{ ...filterChip(!value), display: 'inline-block' }}>Not rated</span>
+        </label>
+      </div>
+    </fieldset>
+  );
+}
+
+const iconButton = (disabled) => ({
+  font: 'inherit', fontSize: 15, lineHeight: 1, width: 36, height: 36, borderRadius: 7, flexShrink: 0,
+  cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.35 : 1,
+  background: 'transparent', color: C.ink, border: `1px solid ${C.line}`,
+});
+
+const labelText = () => ({ display: 'block', fontSize: 13, color: C.muted, marginBottom: 5, fontWeight: 500 });
+
+/* ---------- trips: adding a place ---------- */
+// Type to search. Waits for a pause in typing, and the search itself keeps to
+// Nominatim's one request a second.
+function PlaceSearch({ onPick }) {
+  const [q, setQ] = useState('');
+  const [found, setFound] = useState({ status: 'idle', results: [] });
+  const [active, setActive] = useState(-1);
+  const [open, setOpen] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const id = useId();
+
+  useEffect(() => {
+    const term = q.trim();
+    if (term.length < 3) {
+      setFound({ status: 'idle', results: [] });
+      return undefined;
+    }
+    const ctl = new AbortController();
+    setFound((f) => ({ ...f, status: 'searching' }));
+    const t = setTimeout(async () => {
+      const r = await searchPlaces(term, { signal: ctl.signal });
+      if (r.status === 'aborted' || ctl.signal.aborted) return;
+      setFound(r);
+      setActive(r.results.length ? 0 : -1);
+      setOpen(true);
+    }, 550);
+    return () => { clearTimeout(t); ctl.abort(); };
+  }, [q, attempt]);
+
+  const pick = (r) => {
+    onPick({ name: r.name, displayAddress: r.label, lat: r.lat, lng: r.lon });
+    setQ('');
+    setOpen(false);
+  };
+
+  const listed = open && found.status === 'ok' && found.results.length > 0;
+
+  const key = (e) => {
+    if (e.key === 'ArrowDown' && found.results.length) {
+      e.preventDefault();
+      setOpen(true);
+      setActive((a) => Math.min(found.results.length - 1, a + 1));
+    } else if (e.key === 'ArrowUp' && found.results.length) {
+      e.preventDefault();
+      setActive((a) => Math.max(0, a - 1));
+    } else if (isEnter(e)) {
+      e.preventDefault();
+      if (listed && found.results[active]) pick(found.results[active]);
+    } else if (e.key === 'Escape') {
+      setOpen(false);
+    }
+  };
+
+  const term = q.trim();
+  const status = found.status === 'searching' ? 'Looking…'
+    : found.status === 'ok' ? (listed ? `${countThings(found.results.length, 'place', 'places')} found. Pick one to add it.` : '')
+    : found.status === 'none' ? 'No match. Check the spelling, or try just the town or city.'
+    : found.status === 'offline' ? 'Could not reach the place search. Check the connection, or pick the spot on the map or enter coordinates instead.'
+    : term ? 'Keep typing…'
+    : 'A town, landmark or address. Results come from OpenStreetMap.';
 
   return (
     <div>
-      <h1 style={{ margin: '0 0 6px', fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>
-        {pins.length === 0 ? 'Nothing pinned yet' : `${countThings(pins.length, 'place', 'places')} pinned`}
-      </h1>
-      {pins.length === 0 && <EmptySky />}
-
-      <p style={{ margin: '0 0 20px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
-        {pins.length === 0
-          ? 'Add a place to an event and hit Find to pin it here.'
-          : 'Newest first. Send these to the Travel Log to see them on a map.'}
-      </p>
-
-      {pins.map((e) => (
-        <div key={e.id} style={{
-          display: 'flex', gap: 11, alignItems: 'baseline',
-          padding: '12px 0', borderBottom: `1px solid ${C.line}`,
+      <label htmlFor={`${id}q`} style={labelText()}>Search for a place</label>
+      <input
+        id={`${id}q`}
+        role="combobox"
+        aria-expanded={listed}
+        aria-controls={`${id}list`}
+        aria-autocomplete="list"
+        aria-activedescendant={listed && active >= 0 ? `${id}o${active}` : undefined}
+        autoComplete="off"
+        value={q}
+        onChange={(e) => { setQ(e.target.value); setOpen(true); }}
+        onKeyDown={key}
+        placeholder="Lisbon, Portugal"
+        style={inputStyle}
+      />
+      {listed && (
+        <ul id={`${id}list`} role="listbox" aria-label="Places found" style={{
+          listStyle: 'none', margin: '6px 0 0', padding: 0, border: `1px solid ${C.line}`,
+          borderRadius: 8, overflow: 'hidden', background: C.surface,
         }}>
-          <span style={{ width: 8, height: 8, borderRadius: 8, background: C.accent, flexShrink: 0 }} />
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 15, fontWeight: 600, color: C.ink, letterSpacing: '-0.02em' }}>
-              {e.title}
+          {found.results.map((r, i) => (
+            <li
+              key={`${r.lat},${r.lon},${i}`}
+              id={`${id}o${i}`}
+              role="option"
+              aria-selected={i === active}
+              onMouseDown={(e) => e.preventDefault()}
+              onMouseEnter={() => setActive(i)}
+              onClick={() => pick(r)}
+              style={{
+                padding: '9px 12px', cursor: 'pointer', fontSize: 13.5, color: C.ink,
+                background: i === active ? C.rowHover : C.surface,
+                borderTop: i ? `1px solid ${C.line}` : 'none',
+              }}
+            >
+              <span style={{ fontWeight: 600 }}>{r.name}</span>
+              <span style={{ display: 'block', fontSize: 12, color: C.faint, marginTop: 2, overflowWrap: 'anywhere' }}>{r.label}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <span aria-live="polite" style={hintStyle()}>
+        {status}
+        {found.status === 'offline' && (
+          <>
+            {' '}
+            <button className="crm-btn" onClick={() => setAttempt((n) => n + 1)} style={textButton()}>Try again</button>
+          </>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function PinDrop({ stops, onAdd }) {
+  const [pending, setPending] = useState(null);
+  const [name, setName] = useState('');
+  const pick = useCallback((p) => setPending(p), []);
+  const id = useId();
+
+  const add = () => {
+    if (!pending) return;
+    onAdd({ name: name.trim() || coordText(pending.lat, pending.lng), displayAddress: '', lat: pending.lat, lng: pending.lng });
+    setPending(null);
+    setName('');
+  };
+
+  return (
+    <div>
+      <div style={mapFrame()}>
+        <MapSlot height={300} render={(m) => (
+          <m.PickMap stops={stops} pending={pending} onPick={pick} stopColor={RATING_COLORS[5]} pendingColor={RATING_COLORS[1]} />
+        )} />
+      </div>
+      {pending ? (
+        <div style={{ marginTop: 10 }}>
+          <label htmlFor={`${id}n`} style={labelText()}>Name this place</label>
+          <input id={`${id}n`} value={name} onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (isEnter(e)) { e.preventDefault(); add(); } }}
+            placeholder="The cabin by the lake" style={inputStyle} />
+          <span style={hintStyle()}>
+            {`Pinned at ${coordText(pending.lat, pending.lng)}. Tap the map again to move it.`}
+          </span>
+          <div style={{ display: 'flex', gap: 8, marginTop: 9, flexWrap: 'wrap' }}>
+            <Button kind="solid" onClick={add} style={small}>Add this place</Button>
+            <Button onClick={() => { setPending(null); setName(''); }} style={small}>Clear the pin</Button>
+          </div>
+        </div>
+      ) : (
+        <span style={hintStyle()}>Tap the map where you went. Zoom in for a precise spot.</span>
+      )}
+    </div>
+  );
+}
+
+function CoordEntry({ onAdd }) {
+  const [name, setName] = useState('');
+  const [lat, setLat] = useState('');
+  const [lng, setLng] = useState('');
+  const [problem, setProblem] = useState('');
+  const id = useId();
+
+  const add = () => {
+    const a = toCoord(lat);
+    const b = toCoord(lng);
+    if (!validLat(a)) { setProblem('Latitude is a number from -90 to 90.'); return; }
+    if (!validLng(b)) { setProblem('Longitude is a number from -180 to 180.'); return; }
+    onAdd({ name: name.trim() || coordText(a, b), displayAddress: '', lat: a, lng: b });
+    setName('');
+    setLat('');
+    setLng('');
+    setProblem('');
+  };
+
+  const small2 = { ...inputStyle, minHeight: 40, fontSize: 14 };
+  return (
+    <div>
+      <label htmlFor={`${id}n`} style={labelText()}>Name</label>
+      <input id={`${id}n`} value={name} onChange={(e) => setName(e.target.value)} placeholder="Base camp" style={{ ...small2, marginBottom: 10 }} />
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <div style={{ flex: '1 1 130px' }}>
+          <label htmlFor={`${id}a`} style={labelText()}>Latitude</label>
+          <input id={`${id}a`} type="number" step="any" min="-90" max="90" value={lat}
+            onChange={(e) => setLat(e.target.value)} placeholder="38.7223" style={small2} />
+        </div>
+        <div style={{ flex: '1 1 130px' }}>
+          <label htmlFor={`${id}b`} style={labelText()}>Longitude</label>
+          <input id={`${id}b`} type="number" step="any" min="-180" max="180" value={lng}
+            onChange={(e) => setLng(e.target.value)} placeholder="-9.1393" style={small2} />
+        </div>
+      </div>
+      {problem && <p role="alert" style={{ margin: '8px 0 0', fontSize: 13, color: C.overdue }}>{problem}</p>}
+      <Button kind="solid" onClick={add} style={{ ...small, marginTop: 10 }}>Add this place</Button>
+    </div>
+  );
+}
+
+// Search over everyone on your lists; picked people show as chips.
+function CompanionPicker({ people, value, onChange }) {
+  const [q, setQ] = useState('');
+  const id = useId();
+  const chosen = value.map((x) => people.find((p) => p.id === x)).filter(Boolean);
+  const query = q.trim().toLowerCase();
+  const options = people
+    .filter((p) => !value.includes(p.id)
+      && (!query || `${p.name} ${(p.aka || []).join(' ')}`.toLowerCase().includes(query)))
+    .sort((a, b) => SHELF.compare(a.name, b.name))
+    .slice(0, 8);
+
+  if (people.length === 0) {
+    return (
+      <Group label="Who went with you">
+        <p style={{ margin: 0, fontSize: 13, color: C.faint }}>Nobody on your lists yet. Trips work fine without anyone attached.</p>
+      </Group>
+    );
+  }
+
+  return (
+    <Group label="Who went with you">
+      {chosen.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+          {chosen.map((p) => (
+            <button key={p.id} className="crm-btn" onClick={() => onChange(value.filter((x) => x !== p.id))}
+              aria-label={`Remove ${p.name}`} style={{ ...filterChip(true), display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+              {p.name}<span aria-hidden="true" style={{ fontSize: 14, lineHeight: 1 }}>×</span>
+            </button>
+          ))}
+        </div>
+      )}
+      <input
+        id={`${id}q`}
+        aria-label="Find someone to add"
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+        onKeyDown={(e) => {
+          if (isEnter(e)) {
+            e.preventDefault();
+            if (options[0]) { onChange([...value, options[0].id]); setQ(''); }
+          }
+        }}
+        placeholder="Type a name"
+        autoComplete="off"
+        style={{ ...inputStyle, minHeight: 40, fontSize: 14 }}
+      />
+      {(query || chosen.length === 0) && options.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+          {options.map((p) => (
+            <button key={p.id} className="crm-btn" onClick={() => { onChange([...value, p.id]); setQ(''); }}
+              style={filterChip(false)}>
+              + {p.name}
+            </button>
+          ))}
+        </div>
+      )}
+      {query && options.length === 0 && (
+        <span style={hintStyle()}>Nobody by that name on your lists.</span>
+      )}
+    </Group>
+  );
+}
+
+/* ---------- trips: the form ---------- */
+const withKey = (s) => ({ ...s, _k: uid() });
+
+function TripForm({ initial, people, onSave, onCancel }) {
+  // A new trip gets its id now, so its photos can be stored as they are added.
+  const [id] = useState(() => initial?.id || uid());
+  const [title, setTitle] = useState(initial?.title || '');
+  const [startDate, setStartDate] = useState(initial?.startDate || todayStr());
+  const [endDate, setEndDate] = useState(initial?.endDate || '');
+  const [stops, setStops] = useState(() => (initial?.stops || []).map(withKey));
+  const [how, setHow] = useState('search');
+  const [rating, setRating] = useState(initial?.rating || null);
+  const [excerpt, setExcerpt] = useState(initial?.excerpt || '');
+  const [notes, setNotes] = useState(initial?.notes || '');
+  const [companions, setCompanions] = useState(initial?.companions || []);
+  const [tags, setTags] = useState((initial?.tags || []).join(', '));
+  const [photoIds, setPhotoIds] = useState(initial?.photoIds || []);
+  const [busy, setBusy] = useState(null);
+  const [photoNotes, setPhotoNotes] = useState([]);
+  const [errors, setErrors] = useState([]);
+  const [viewing, setViewing] = useState(null);
+  const [said, setSaid] = useState('');
+  const errorBox = useRef(null);
+  const fid = useId();
+
+  // Photos added during this edit are stored straight away. If the edit is
+  // abandoned they are deleted again; photos taken off an existing trip are
+  // only deleted once the change is saved, so Cancel really cancels.
+  const fresh = useRef(new Set());
+  const removed = useRef(new Set());
+  const saved = useRef(false);
+  const alive = useRef(true);
+  useEffect(() => {
+    const added = fresh.current;
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      if (!saved.current && added.size) photoStore.deleteMany([...added]).catch(() => {});
+    };
+  }, []);
+
+  const dateProblem = startDate && endDate && endDate < startDate ? 'The trip cannot end before it starts.' : '';
+
+  const addStop = (s) => {
+    if (stops.length >= STOP_CAP) { setSaid(`A trip holds up to ${STOP_CAP} places.`); return; }
+    setStops((list) => [...list, withKey(s)]);
+    setSaid(`Added ${s.name} as place ${stops.length + 1}.`);
+  };
+  const moveStop = (i, d) => setStops((list) => {
+    const j = i + d;
+    if (j < 0 || j >= list.length) return list;
+    const next = [...list];
+    [next[i], next[j]] = [next[j], next[i]];
+    return next;
+  });
+  const dropStop = (i) => {
+    setSaid(`Removed ${stops[i]?.name || 'that place'}.`);
+    setStops((list) => list.filter((_, j) => j !== i));
+  };
+  const renameStop = (i, name) => setStops((list) => list.map((s, j) => (j === i ? { ...s, name } : s)));
+
+  const addFiles = async (files) => {
+    const notesOut = [];
+    const room = PHOTO_CAP - photoIds.length;
+    if (files.length > room) {
+      notesOut.push(room <= 0
+        ? `A trip holds up to ${PHOTO_CAP} photos, and this one is full.`
+        : `A trip holds up to ${PHOTO_CAP} photos, so only the first ${room} of these ${files.length} were added.`);
+    }
+    const take = files.slice(0, Math.max(0, room));
+    if (!take.length) { setPhotoNotes(notesOut); return; }
+    setPhotoNotes([]);
+    setBusy({ done: 0, total: take.length });
+    for (let i = 0; i < take.length; i += 1) {
+      const f = take[i];
+      try {
+        const prepared = await photoStore.processImage(f);
+        const pid = `${uid()}${uid()}`;
+        await photoStore.save({ id: pid, tripId: id, ...prepared });
+        if (!alive.current) {
+          // The form closed while this one was on its way in.
+          photoStore.deleteMany([pid]).catch(() => {});
+          return;
+        }
+        fresh.current.add(pid);
+        setPhotoIds((ids) => [...ids, pid]);
+      } catch (e) {
+        notesOut.push(e instanceof photoStore.PhotoError ? e.message : `${f.name || 'A photo'} could not be added.`);
+        if (e?.cause?.name === 'QuotaExceededError') break;
+      }
+      if (alive.current) setBusy({ done: i + 1, total: take.length });
+    }
+    if (!alive.current) return;
+    setBusy(null);
+    setPhotoNotes(notesOut);
+  };
+
+  const dropPhoto = (pid) => {
+    setPhotoIds((ids) => ids.filter((x) => x !== pid));
+    if (fresh.current.has(pid)) {
+      fresh.current.delete(pid);
+      photoStore.delete(pid).catch(() => {});
+    } else {
+      removed.current.add(pid);
+    }
+  };
+  const coverPhoto = (pid) => setPhotoIds((ids) => [pid, ...ids.filter((x) => x !== pid)]);
+
+  const save = () => {
+    const errs = [];
+    if (!title.trim()) errs.push('Give the trip a title.');
+    if (!startDate) errs.push('Add the day the trip started.');
+    if (dateProblem) errs.push(dateProblem);
+    if (!stops.length) errs.push('Add at least one place you went.');
+    if (busy) errs.push('Wait for the photos to finish, then save.');
+    if (errs.length) {
+      setErrors(errs);
+      requestAnimationFrame(() => errorBox.current?.focus());
+      return;
+    }
+    const now = new Date().toISOString();
+    const known = new Set(people.map((p) => p.id));
+    const trip = cleanTrip({
+      id,
+      createdAt: initial?.createdAt || now,
+      updatedAt: now,
+      title,
+      stops: stops.map(({ _k, ...s }) => s),
+      startDate,
+      endDate: endDate || null,
+      rating,
+      excerpt,
+      notes,
+      companions: companions.filter((c) => known.has(c)),
+      photoIds,
+      tags: splitTags(tags),
+      fromEvent: initial?.fromEvent,
+    });
+    if (!trip) {
+      setErrors(['That trip could not be saved. Check the dates and places.']);
+      return;
+    }
+    saved.current = true;
+    onSave(trip, [...removed.current]);
+  };
+
+  const section = { borderTop: `1px solid ${C.line}`, paddingTop: 14, marginTop: 4 };
+
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16, maxWidth: 720 }}>
+      <h1 style={{ margin: '0 0 16px', fontSize: 22, fontWeight: 600, letterSpacing: '-0.03em' }}>
+        {initial ? 'Edit trip' : 'Add a trip'}
+      </h1>
+
+      {errors.length > 0 && (
+        <div ref={errorBox} tabIndex={-1} role="alert" style={{
+          margin: '0 0 14px', padding: '10px 12px', borderRadius: 8, fontSize: 13, lineHeight: 1.5,
+          color: C.ink, background: C.overdueSoft, border: `1px solid ${C.overdueBar}`,
+        }}>
+          {errors.map((e) => <div key={e}>{e}</div>)}
+        </div>
+      )}
+
+      <Field label="Title">
+        <input style={inputStyle} value={title} maxLength={TRIP_TITLE_CAP}
+          onChange={(e) => setTitle(e.target.value)} placeholder="A week in Portugal" />
+      </Field>
+
+      <Group label="When">
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <div style={{ flex: '1 1 150px' }}>
+            <label htmlFor={`${fid}s`} style={{ display: 'block', fontSize: 12, color: C.faint, marginBottom: 4 }}>Started</label>
+            <input id={`${fid}s`} type="date" style={inputStyle} value={startDate} required
+              onChange={(e) => setStartDate(e.target.value)} />
+          </div>
+          <div style={{ flex: '1 1 150px' }}>
+            <label htmlFor={`${fid}e`} style={{ display: 'block', fontSize: 12, color: C.faint, marginBottom: 4 }}>Ended (optional)</label>
+            <input id={`${fid}e`} type="date" style={inputStyle} value={endDate} min={startDate || undefined}
+              aria-invalid={Boolean(dateProblem)} aria-describedby={dateProblem ? `${fid}ed` : undefined}
+              onChange={(e) => setEndDate(e.target.value)} />
+          </div>
+        </div>
+        {dateProblem && <span id={`${fid}ed`} style={{ ...hintStyle(), color: C.overdue }}>{dateProblem}</span>}
+      </Group>
+
+      <div style={section}>
+        <Group label="Where you went">
+          {stops.length === 0 ? (
+            <p style={{ margin: '0 0 10px', fontSize: 13, color: C.faint }}>No places yet. Add at least one below.</p>
+          ) : (
+            <ol style={{ listStyle: 'none', margin: '0 0 12px', padding: 0, display: 'grid', gap: 8 }}>
+              {stops.map((s, i) => (
+                <li key={s._k} style={{
+                  display: 'flex', gap: 9, alignItems: 'flex-start', border: `1px solid ${C.line}`,
+                  borderRadius: 10, padding: '9px 10px', background: C.paper,
+                }}>
+                  <span aria-hidden="true" style={{
+                    width: 24, height: 24, borderRadius: 24, flexShrink: 0, marginTop: 6, fontSize: 12, fontWeight: 700,
+                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center', background: RATING_COLORS[5], color: '#fff',
+                  }}>{i + 1}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <input aria-label={`Name of place ${i + 1}`} value={s.name} maxLength={200}
+                      onChange={(e) => renameStop(i, e.target.value)}
+                      style={{ ...inputStyle, minHeight: 36, padding: '6px 9px', fontSize: 14 }} />
+                    <span style={{ display: 'block', fontSize: 12, color: C.faint, marginTop: 4, overflowWrap: 'anywhere' }}>
+                      {s.displayAddress || coordText(s.lat, s.lng)}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+                    <button className="crm-btn" onClick={() => moveStop(i, -1)} disabled={i === 0}
+                      aria-label={`Move ${s.name || `place ${i + 1}`} earlier`} style={iconButton(i === 0)}>↑</button>
+                    <button className="crm-btn" onClick={() => moveStop(i, 1)} disabled={i === stops.length - 1}
+                      aria-label={`Move ${s.name || `place ${i + 1}`} later`} style={iconButton(i === stops.length - 1)}>↓</button>
+                    <button className="crm-btn" onClick={() => dropStop(i)}
+                      aria-label={`Remove ${s.name || `place ${i + 1}`}`} style={{ ...iconButton(false), color: C.overdue }}>✕</button>
+                  </div>
+                </li>
+              ))}
+            </ol>
+          )}
+
+          <div style={{ border: `1px solid ${C.line}`, borderRadius: 10, padding: 12 }}>
+            <p style={{ margin: '0 0 9px', fontSize: 13, fontWeight: 600, color: C.ink }}>
+              {stops.length ? 'Add another place' : 'Add a place'}
+            </p>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
+              {[['search', 'Search'], ['map', 'Pick on map'], ['coords', 'Coordinates']].map(([v, l]) => (
+                <button key={v} className="crm-btn" aria-pressed={how === v} onClick={() => setHow(v)}
+                  style={{ ...segment(how === v), fontSize: 12.5 }}>{l}</button>
+              ))}
             </div>
-            <div style={{ fontSize: 12.5, color: C.muted, marginTop: 2 }}>
-              {e.place || 'Unnamed place'}
-              <span style={{ color: C.faint }}>
-                {'  '}{e.lat.toFixed(3)}, {e.lon.toFixed(3)}
+            {how === 'search' && <PlaceSearch onPick={addStop} />}
+            {how === 'map' && <PinDrop stops={stops} onAdd={addStop} />}
+            {how === 'coords' && <CoordEntry onAdd={addStop} />}
+          </div>
+          <p aria-live="polite" className="crm-sr">{said}</p>
+        </Group>
+      </div>
+
+      <div style={section}>
+        <StarInput value={rating} onChange={setRating} />
+
+        <Field label="The highlight">
+          <textarea
+            className="crm-serif"
+            style={{ ...inputStyle, minHeight: 72, resize: 'vertical', lineHeight: 1.5 }}
+            value={excerpt}
+            maxLength={EXCERPT_CAP}
+            aria-describedby={`${fid}x`}
+            onChange={(e) => setExcerpt(e.target.value)}
+            placeholder="Pastéis de nata still warm at the counter, every single morning."
+          />
+          <span id={`${fid}x`} style={{ ...hintStyle(), display: 'flex', gap: 8 }}>
+            <span style={{ flex: 1 }}>Shows on the map and in the list.</span>
+            <span>{`${excerpt.length}/${EXCERPT_CAP}`}</span>
+          </span>
+        </Field>
+
+        <Field label="Notes">
+          <textarea
+            className="crm-serif"
+            style={{ ...inputStyle, minHeight: 140, resize: 'vertical', lineHeight: 1.6 }}
+            value={notes}
+            maxLength={TRIP_NOTES_CAP}
+            onChange={(e) => setNotes(e.target.value)}
+            placeholder="Write as much as you want. This is the part you will be glad you kept."
+          />
+        </Field>
+
+        <CompanionPicker people={people} value={companions} onChange={setCompanions} />
+
+        <Field label="Tags">
+          <input style={inputStyle} value={tags} onChange={(e) => setTags(e.target.value)} placeholder="beach, family, road trip" />
+          <span style={hintStyle()}>Separate them with commas.</span>
+        </Field>
+      </div>
+
+      <div style={section}>
+        <Group label={`Photos (${photoIds.length} of ${PHOTO_CAP})`}>
+          {photoIds.length > 0 && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(96px, 1fr))', gap: 8, marginBottom: 10 }}>
+              {photoIds.map((pid, i) => (
+                <div key={pid} style={{ position: 'relative' }}>
+                  <button className="crm-btn" onClick={() => setViewing(i)} aria-label={`View ${photoAlt(title, i)}`}
+                    style={{ padding: 0, border: 'none', background: 'none', width: '100%', display: 'block', cursor: 'zoom-in', borderRadius: 8 }}>
+                    <PhotoThumb id={pid} alt={photoAlt(title, i)} style={{ aspectRatio: '1 / 1', borderRadius: 8 }} />
+                  </button>
+                  <button className="crm-btn" onClick={() => dropPhoto(pid)} aria-label={`Remove photo ${i + 1}`} style={{
+                    position: 'absolute', top: 5, right: 5, width: 30, height: 30, borderRadius: 30, cursor: 'pointer',
+                    font: 'inherit', fontSize: 14, lineHeight: 1, color: '#fff', background: 'rgba(0,0,0,0.6)',
+                    border: '1px solid rgba(255,255,255,0.7)',
+                  }}>✕</button>
+                  {i === 0 ? (
+                    <span style={{ display: 'block', fontSize: 11.5, color: C.faint, padding: '5px 2px' }}>Cover photo</span>
+                  ) : (
+                    <button className="crm-btn" onClick={() => coverPhoto(pid)} aria-label={`Make photo ${i + 1} the cover`}
+                      style={{ ...textButton(), fontSize: 11.5, fontWeight: 500, color: C.muted, padding: '5px 2px' }}>Make cover</button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <label className="crm-file crm-btn" style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6, position: 'relative',
+            fontSize: 14, fontWeight: 600, padding: '9px 14px', borderRadius: 7,
+            border: `1px solid ${C.line}`, color: C.ink,
+            cursor: busy || photoIds.length >= PHOTO_CAP ? 'default' : 'pointer',
+            opacity: busy || photoIds.length >= PHOTO_CAP ? 0.55 : 1,
+          }}>
+            <input type="file" accept="image/*,.heic,.heif" multiple className="crm-sr"
+              disabled={Boolean(busy) || photoIds.length >= PHOTO_CAP}
+              onChange={(e) => {
+                const files = [...(e.target.files || [])];
+                e.target.value = '';
+                if (files.length) addFiles(files);
+              }} />
+            Add photos
+          </label>
+          <span style={hintStyle()}>
+            Resized to 1600 pixels and saved as JPEG. Where they were taken, and other camera details, are left out.
+          </span>
+
+          {busy && (
+            <div role="status" style={{ marginTop: 10 }}>
+              <progress value={busy.done} max={busy.total} aria-label="Preparing photos"
+                style={{ width: '100%', accentColor: C.accentDeep }} />
+              <span style={{ display: 'block', fontSize: 12.5, color: C.muted, marginTop: 4 }}>
+                {`Preparing photo ${Math.min(busy.done + 1, busy.total)} of ${busy.total}…`}
               </span>
             </div>
-          </div>
-          <span style={{ fontSize: 12.5, color: C.faint, flexShrink: 0 }}>{eventWhen(e).text}</span>
-        </div>
-      ))}
-
-      {pins.length > 0 && (
-        <div style={{ marginTop: 20 }}>
-          <Button kind="solid" onClick={() => setCopying(!copying)}>
-            {copying ? 'Hide the export' : 'Export for the Travel Log'}
-          </Button>
-          {copying && (
-            <div style={{ marginTop: 10 }}>
-              <p style={{ fontSize: 12.5, color: C.muted, margin: '0 0 6px', lineHeight: 1.5 }}>
-                Select all and copy, then paste into the Travel Log. Field names may need
-                mapping to match that file.
-              </p>
-              <textarea
-                readOnly
-                onFocus={(e) => e.target.select()}
-                value={payload}
-                style={{ ...inputStyle, minHeight: 150, fontSize: 12, lineHeight: 1.45, resize: 'vertical' }}
-              />
+          )}
+          {photoNotes.length > 0 && (
+            <div role="alert" style={{ marginTop: 10, fontSize: 13, lineHeight: 1.5, color: C.overdue }}>
+              {photoNotes.map((m, i) => <p key={i} style={{ margin: '0 0 4px' }}>{m}</p>)}
             </div>
+          )}
+        </Group>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+        <Button kind="solid" onClick={save} style={{ flex: 1 }} aria-disabled={Boolean(busy)}>
+          {initial ? 'Save changes' : 'Save trip'}
+        </Button>
+        <Button onClick={onCancel}>Cancel</Button>
+      </div>
+
+      {viewing !== null && photoIds.length > 0 && (
+        <Lightbox ids={photoIds} start={viewing} title={title} onClose={() => setViewing(null)} />
+      )}
+    </div>
+  );
+}
+
+/* ---------- trips: one trip ---------- */
+const TripSharePanel = memo(function TripSharePanel({ trip, people, owner }) {
+  const [notes, setNotes] = useState(false);
+  const [withPhotos, setWithPhotos] = useState(false);
+  const [to, setTo] = useState('');
+  const [said, setSaid] = useState('');
+  const [fallback, setFallback] = useState('');
+  const [size, setSize] = useState(null);
+  const [making, setMaking] = useState(null);
+  const [file, setFile] = useState(null);
+  const count = trip.photoIds.length;
+
+  const text = useMemo(() => tripText(trip, { notes }), [trip, notes]);
+  const link = useMemo(
+    () => `${window.location.origin}${window.location.pathname}#${TRIP_SHARE_PREFIX}${tripShareCode(trip, { notes, by: owner })}`,
+    [trip, notes, owner]);
+  const mailable = useMemo(() => people.filter((p) => (p.email || '').includes('@'))
+    .sort((a, b) => SHELF.compare(a.name, b.name)), [people]);
+  const who = mailable.find((p) => p.id === to) || mailable[0] || null;
+  const mail = who ? `mailto:${who.email}?subject=${encodeURIComponent(trip.title)}&body=${encodeURIComponent(text)}` : '';
+  const canShare = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
+
+  // A file made for one set of choices is not the file for another.
+  useEffect(() => { setFile(null); }, [notes, withPhotos, trip]);
+
+  useEffect(() => {
+    if (!withPhotos || size !== null) return undefined;
+    let live = true;
+    photoStore.listAll()
+      .then((all) => {
+        const mine = new Set(trip.photoIds);
+        if (live) setSize(all.filter((p) => mine.has(p.id)).reduce((n, p) => n + p.size + p.thumbSize, 0));
+      })
+      .catch(() => { if (live) setSize(0); });
+    return () => { live = false; };
+  }, [withPhotos, size, trip.photoIds]);
+
+  const copy = async (value, what) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setSaid(`${what} is copied. Paste it wherever you like.`);
+      setFallback('');
+    } catch {
+      setSaid('Copying was blocked here. Select the text below and copy it yourself.');
+      setFallback(value);
+    }
+  };
+
+  const sheet = async () => {
+    try {
+      await navigator.share({ title: trip.title, text });
+    } catch (e) {
+      if (e?.name !== 'AbortError') copy(text, 'The trip');
+    }
+  };
+
+  const make = async () => {
+    setSaid('');
+    setMaking({ done: 0, total: withPhotos ? count : 0 });
+    try {
+      const pkg = tripPackage(trip, { notes, by: owner });
+      if (!withPhotos) pkg.photos = [];
+      const blob = await packZip(pkg, (id) => photoStore.getRecord(id), (done, total) => setMaking({ done, total }));
+      setFile(new File([blob], `${fileSafe(trip.title)}.orbit-trip.zip`, { type: 'application/zip' }));
+    } catch {
+      setSaid('The file could not be made. Try again.');
+    } finally {
+      setMaking(null);
+    }
+  };
+
+  const sendFile = async () => {
+    if (!file) return;
+    if (navigator.canShare?.({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: trip.title });
+        return;
+      } catch (e) {
+        if (e?.name === 'AbortError') return;
+      }
+    }
+    if (downloadBlob(file.name, file)) setSaid(`Saved ${file.name}. Send it however you like.`);
+    else setSaid('The download was blocked here.');
+  };
+
+  const saveFile = () => {
+    if (file && downloadBlob(file.name, file)) setSaid(`Saved ${file.name}. Send it however you like.`);
+  };
+
+  return (
+    <div className="crm-open" style={{
+      background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12,
+      padding: '15px 15px 12px', margin: '16px 0 0',
+    }}>
+      <p style={{ margin: '0 0 11px', fontSize: 13, fontWeight: 600, color: C.ink }}>Send a copy of this trip</p>
+      <Check on={notes} onChange={setNotes} label="Include my notes"
+        hint="The highlight always goes. Who went with you always stays with you." />
+      {count > 0 && (
+        <Check on={withPhotos} onChange={setWithPhotos} label={`Include photos (${count})`}
+          hint="Photos make the copy a file to send rather than a link." />
+      )}
+
+      {!withPhotos ? (
+        <>
+          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap', marginTop: 4 }}>
+            <Button kind="solid" onClick={() => copy(text, 'The trip')} style={small}>Copy as text</Button>
+            {canShare && <Button onClick={sheet} style={small}>Share…</Button>}
+          </div>
+
+          {who && (
+            <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
+              <select className="crm-select" aria-label="Who to email it to" value={who.id} onChange={(e) => setTo(e.target.value)}
+                style={{ ...inputStyle, width: 'auto', flex: '1 1 170px', minHeight: 36, padding: '6px 11px', fontSize: 13 }}>
+                {mailable.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+              <a href={mail} className="crm-btn" style={{
+                fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.01em', color: C.ink, textDecoration: 'none',
+                padding: '7px 11px', borderRadius: 7, border: `1px solid ${C.line}`, whiteSpace: 'nowrap',
+              }}>Email it to {who.name.split(' ')[0]}</a>
+            </div>
+          )}
+
+          <div style={{ borderTop: `1px solid ${C.line}`, marginTop: 14, paddingTop: 12 }}>
+            <p style={{ margin: '0 0 9px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+              Sending it to someone else who uses Orbit? A link gives them their own copy of the trip,
+              without photos. They open it, or paste it under Add a shared trip.
+              {owner ? ` It tells them it is from ${owner}.` : ''}
+            </p>
+            <Button onClick={() => copy(link, 'The link')} style={small}>Copy Orbit link</Button>
+            {link.length > 4000 && (
+              <span style={hintStyle()}>
+                This is a long one. Some messaging apps trim long links, so if it arrives broken, send
+                the text instead.
+              </span>
+            )}
+          </div>
+        </>
+      ) : (
+        <div style={{ marginTop: 4 }}>
+          <p style={{ margin: '0 0 10px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+            {size === null ? 'Working out the size…' : `About ${approxBytes(size + 4000)} with ${countThings(count, 'photo', 'photos').toLowerCase()}. `}
+            They add it in Orbit under Trips, Add a shared trip.
+          </p>
+          {making ? (
+            <div role="status">
+              <progress value={making.done} max={making.total || 1} aria-label="Making the file" style={{ width: '100%', accentColor: C.accentDeep }} />
+              <span style={hintStyle()}>{`Packing photo ${Math.min(making.done + 1, making.total)} of ${making.total}…`}</span>
+            </div>
+          ) : file ? (
+            <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+              {canShare && <Button kind="solid" onClick={sendFile} style={small}>Share the file…</Button>}
+              <Button kind={canShare ? 'quiet' : 'solid'} onClick={saveFile} style={small}>Download the file</Button>
+            </div>
+          ) : (
+            <Button kind="solid" onClick={make} style={small}>Make the file</Button>
           )}
         </div>
       )}
+
+      <p aria-live="polite" style={{ margin: said ? '12px 0 0' : 0, fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+        {said}
+      </p>
+      {fallback && (
+        <textarea readOnly aria-label="Text to copy" onFocus={(e) => e.target.select()} value={fallback}
+          style={{ ...inputStyle, marginTop: 8, minHeight: 120, fontSize: 12, lineHeight: 1.45, resize: 'vertical' }} />
+      )}
+    </div>
+  );
+});
+
+const osmLink = (s) => `https://www.openstreetmap.org/?mlat=${s.lat}&mlon=${s.lng}#map=13/${s.lat}/${s.lng}`;
+
+function TripDetail({ trip, people, owner, onEdit, onRemove, onBack, onPerson }) {
+  const [confirm, setConfirm] = useState(false);
+  const [sharing, setSharing] = useState(false);
+  const [viewing, setViewing] = useState(null);
+  const who = trip.companions.map((id) => people.find((p) => p.id === id)).filter(Boolean);
+  const when = tripWhen(trip);
+  const heading = { margin: '0 0 7px', fontSize: 12.5, color: C.faint };
+
+  return (
+    <div style={{ maxWidth: 720 }}>
+      <button className="crm-btn" onClick={onBack} style={{ ...textButton(), textDecoration: 'none', color: C.muted, fontSize: 13, marginBottom: 14 }}>
+        ← All trips
+      </button>
+      <h1 style={{ margin: 0, fontSize: 27, lineHeight: 1.18, fontWeight: 600, letterSpacing: '-0.035em' }}>{trip.title}</h1>
+      <p style={{ margin: '6px 0 0', fontSize: 14, color: C.muted, display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'baseline' }}>
+        <span>{when.text}{when.days > 1 ? ` · ${when.days} days` : ''}</span>
+        <Stars n={trip.rating} size={16} />
+      </p>
+      {trip.tags.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
+          {trip.tags.map((g) => <span key={g} style={kindChip()}>{g}</span>)}
+        </div>
+      )}
+
+      {trip.excerpt && (
+        <p className="crm-serif" style={{ margin: '16px 0 0', fontSize: 18, lineHeight: 1.5, color: C.ink }}>{trip.excerpt}</p>
+      )}
+
+      <div style={{ marginTop: 20 }}>
+        <p style={heading}>{trip.stops.length === 1 ? 'Where' : `Where (${trip.stops.length} places)`}</p>
+        <ol style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+          {trip.stops.map((s, i) => (
+            <li key={`${i}-${s.lat}-${s.lng}`} style={{ display: 'flex', gap: 10, alignItems: 'baseline', padding: '7px 0', borderBottom: `1px solid ${C.line}` }}>
+              <span aria-hidden="true" style={{ fontSize: 12, fontWeight: 700, color: C.faint, width: 16, flexShrink: 0 }}>{i + 1}</span>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ fontSize: 14.5, fontWeight: 600, color: C.ink }}>{s.name}</span>
+                {s.displayAddress && s.displayAddress !== s.name && (
+                  <span style={{ display: 'block', fontSize: 12, color: C.faint, marginTop: 2, overflowWrap: 'anywhere' }}>{s.displayAddress}</span>
+                )}
+              </span>
+              <a href={osmLink(s)} target="_blank" rel="noopener noreferrer" style={{ ...linkStyle, fontSize: 12, flexShrink: 0 }}>
+                Map<span className="crm-sr">{` of ${s.name} (opens OpenStreetMap)`}</span>
+              </a>
+            </li>
+          ))}
+        </ol>
+      </div>
+
+      {who.length > 0 && (
+        <div style={{ marginTop: 18 }}>
+          <p style={heading}>With</p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {who.map((p) => (
+              <button key={p.id} className="crm-btn" onClick={() => onPerson(p.id)} style={filterChip(false)}>{p.name}</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {trip.photoIds.length > 0 && (
+        <div style={{ marginTop: 18 }}>
+          <p style={heading}>{`Photos (${trip.photoIds.length})`}</p>
+          <PhotoGrid ids={trip.photoIds} title={trip.title} onOpen={setViewing} />
+        </div>
+      )}
+
+      {trip.notes && (
+        <div style={{ marginTop: 18 }}>
+          <p style={heading}>Notes</p>
+          <p className="crm-serif" style={{ margin: 0, fontSize: 15.5, lineHeight: 1.65, color: C.ink, whiteSpace: 'pre-wrap' }}>{trip.notes}</p>
+        </div>
+      )}
+
+      {confirm ? (
+        <div role="alert" style={{
+          marginTop: 22, padding: '12px 14px', borderRadius: 10, fontSize: 13.5, lineHeight: 1.5,
+          color: C.ink, background: C.overdueSoft, border: `1px solid ${C.overdueBar}`,
+        }}>
+          <p style={{ margin: '0 0 10px' }}>
+            {trip.photoIds.length
+              ? `Delete this trip and its ${countThings(trip.photoIds.length, 'photo', 'photos').toLowerCase()}? This cannot be undone.`
+              : 'Delete this trip? This cannot be undone.'}
+          </p>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <Button onClick={onRemove} style={{ ...small, background: C.overdue, color: '#fff', borderColor: C.overdue }}>Delete trip</Button>
+            <Button onClick={() => setConfirm(false)} style={small}>Keep it</Button>
+          </div>
+        </div>
+      ) : (
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 22 }}>
+          <Button kind="solid" onClick={onEdit}>Edit</Button>
+          <Button onClick={() => setSharing(!sharing)} aria-expanded={sharing}>{sharing ? 'Hide sharing' : 'Send a copy'}</Button>
+          <Button kind="danger" onClick={() => setConfirm(true)}>Delete</Button>
+        </div>
+      )}
+
+      {sharing && <TripSharePanel trip={trip} people={people} owner={owner} />}
+
+      {viewing !== null && (
+        <Lightbox ids={trip.photoIds} start={viewing} title={trip.title} onClose={() => setViewing(null)} />
+      )}
+    </div>
+  );
+}
+
+/* ---------- trips: all of them ---------- */
+function TripPopup({ trip, stop, onOpen }) {
+  const s = trip.stops[stop] || trip.stops[0];
+  return (
+    <div style={{ width: 220, maxWidth: '100%' }}>
+      {trip.photoIds[0] && (
+        <PhotoThumb id={trip.photoIds[0]} alt={photoAlt(trip.title, 0)} style={{ height: 112, borderRadius: 6, marginBottom: 9 }} />
+      )}
+      <div style={{ fontSize: 15, fontWeight: 600, letterSpacing: '-0.02em', lineHeight: 1.25 }}>{trip.title}</div>
+      {trip.stops.length > 1 && (
+        <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>{`Place ${stop + 1} of ${trip.stops.length}: ${s.name}`}</div>
+      )}
+      <div style={{ fontSize: 12.5, color: C.muted, marginTop: 3, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline' }}>
+        <span>{tripWhen(trip).text}</span>
+        <Stars n={trip.rating} size={12.5} />
+      </div>
+      {trip.excerpt && (
+        <p className="crm-serif" style={{ margin: '7px 0 0', fontSize: 13.5, lineHeight: 1.45, color: C.ink }}>{trip.excerpt}</p>
+      )}
+      <button className="crm-btn" onClick={onOpen} style={{ ...textButton(), fontSize: 13, marginTop: 9 }}>Open trip</button>
+    </div>
+  );
+}
+
+const TripCard = memo(function TripCard({ trip, onOpen }) {
+  const places = trip.stops.map((s) => s.name).join(' → ');
+  return (
+    <button className="crm-btn crm-row" onClick={() => onOpen(trip.id)} style={{
+      display: 'flex', gap: 12, width: '100%', textAlign: 'left', font: 'inherit', color: C.ink,
+      background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 10,
+      cursor: 'pointer', alignItems: 'flex-start',
+    }}>
+      <PhotoThumb id={trip.photoIds[0]} alt={photoAlt(trip.title, 0)} style={{ width: 84, height: 84, borderRadius: 8, flexShrink: 0 }}
+        empty={(
+          <span aria-hidden="true" style={{
+            position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: C.paper,
+          }}>
+            <span style={{
+              width: 28, height: 28, borderRadius: 28, background: ratingColor(trip.rating), color: '#fff',
+              fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>{trip.rating || ''}</span>
+          </span>
+        )} />
+      <span style={{ display: 'block', minWidth: 0, flex: 1 }}>
+        <span style={{ display: 'block', fontSize: 15.5, fontWeight: 600, letterSpacing: '-0.02em', lineHeight: 1.25 }}>{trip.title}</span>
+        <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline', fontSize: 12.5, color: C.muted, marginTop: 3 }}>
+          <span>{tripWhen(trip).text}</span>
+          <Stars n={trip.rating} size={12.5} />
+        </span>
+        <span style={{ display: 'block', fontSize: 12, color: C.faint, marginTop: 3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{places}</span>
+        {trip.excerpt && (
+          <span className="crm-serif crm-clamp" style={{ display: '-webkit-box', fontSize: 13.5, lineHeight: 1.45, marginTop: 6, color: C.ink }}>{trip.excerpt}</span>
+        )}
+      </span>
+    </button>
+  );
+});
+
+function SharedTripOffer({ incoming, onTake, onDrop }) {
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState('');
+  const box = {
+    background: C.surface, border: `1px solid ${C.accent}`, borderRadius: 12, padding: '14px 15px', margin: '0 0 16px',
+  };
+  if (incoming.broken) {
+    return (
+      <div role="status" style={box}>
+        <p style={{ margin: '0 0 10px', fontSize: 14, color: C.ink }}>A shared trip arrived but could not be read. Ask for the link again.</p>
+        <Button onClick={onDrop} style={small}>OK</Button>
+      </div>
+    );
+  }
+  const t = incoming.trip;
+  const take = async () => {
+    setBusy(true);
+    setProblem('');
+    try {
+      await onTake(incoming);
+    } catch (e) {
+      setProblem(e?.message || 'That trip could not be added.');
+      setBusy(false);
+    }
+  };
+  return (
+    <div role="status" style={box}>
+      <p style={{ margin: '0 0 4px', fontSize: 13, color: C.muted }}>{`${incoming.by || 'Someone'} shared a trip with you`}</p>
+      <p style={{ margin: 0, fontSize: 17, fontWeight: 600, letterSpacing: '-0.02em' }}>{t.title}</p>
+      <p style={{ margin: '3px 0 0', fontSize: 12.5, color: C.muted }}>
+        {`${tripWhen(t).text} · ${t.stops.map((s) => s.name).join(' → ')}`}
+        {incoming.photos?.length ? ` · ${countThings(incoming.photos.length, 'photo', 'photos').toLowerCase()}` : ''}
+      </p>
+      {t.excerpt && <p className="crm-serif" style={{ margin: '8px 0 0', fontSize: 14, lineHeight: 1.5 }}>{t.excerpt}</p>}
+      {problem && <p role="alert" style={{ margin: '8px 0 0', fontSize: 13, color: C.overdue }}>{problem}</p>}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 12 }}>
+        <Button kind="solid" onClick={take} style={small} disabled={busy}>{busy ? 'Adding…' : 'Add it to my trips'}</Button>
+        <Button onClick={onDrop} style={small} disabled={busy}>No thanks</Button>
+      </div>
+    </div>
+  );
+}
+
+function EventsOffer({ events, onConvert, onDismiss }) {
+  const [picked, setPicked] = useState(() => new Set(events.map((e) => e.id)));
+  const toggle = (id, on) => setPicked((s) => {
+    const next = new Set(s);
+    if (on) next.add(id); else next.delete(id);
+    return next;
+  });
+  const n = events.filter((e) => picked.has(e.id)).length;
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '14px 15px 8px', margin: '0 0 16px' }}>
+      <p style={{ margin: '0 0 4px', fontSize: 14, fontWeight: 600 }}>
+        {`${countThings(events.length, 'event has', 'events have')} a place pinned`}
+      </p>
+      <p style={{ margin: '0 0 11px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+        Turn them into trips to see them on the map here. The events stay on your timeline as they are.
+      </p>
+      <div style={{ maxHeight: 190, overflowY: 'auto', marginBottom: 8 }}>
+        {events.map((e) => (
+          <Check key={e.id} on={picked.has(e.id)} onChange={(v) => toggle(e.id, v)}
+            label={e.title} hint={`${eventWhen(e).text}${e.place ? ` · ${e.place}` : ''}`} />
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+        <Button kind="solid" style={small} disabled={!n} onClick={() => onConvert(events.filter((e) => picked.has(e.id)))}>
+          {n === 1 ? 'Turn it into a trip' : `Turn ${n} into trips`}
+        </Button>
+        <Button style={small} onClick={onDismiss}>No thanks</Button>
+      </div>
+    </div>
+  );
+}
+
+function AddSharedTrip({ onGot }) {
+  const [open, setOpen] = useState(false);
+  const [paste, setPaste] = useState('');
+  const [problem, setProblem] = useState('');
+  const id = useId();
+
+  const takePaste = () => {
+    const got = readSharedTrip(paste);
+    if (!got) {
+      setProblem('That does not look like a shared trip. Paste the whole link, or the code at the end of it.');
+      return;
+    }
+    onGot(got);
+    setPaste('');
+    setOpen(false);
+    setProblem('');
+  };
+
+  const takeFile = async (file) => {
+    setProblem('');
+    try {
+      onGot(await readTripFile(file));
+      setOpen(false);
+    } catch (e) {
+      setProblem(e.message);
+    }
+  };
+
+  if (!open) {
+    return (
+      <button className="crm-btn" onClick={() => setOpen(true)} style={{ ...textButton(), fontSize: 13, color: C.muted }}>
+        Add a shared trip
+      </button>
+    );
+  }
+  return (
+    <div className="crm-open" style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 14, maxWidth: 560 }}>
+      <label htmlFor={`${id}p`} style={labelText()}>Paste a trip link</label>
+      <textarea id={`${id}p`} value={paste} onChange={(e) => setPaste(e.target.value)} placeholder="https://…#trip=…"
+        style={{ ...inputStyle, minHeight: 64, fontSize: 13, resize: 'vertical' }} />
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+        <Button kind="solid" onClick={takePaste} style={small}>Look at it</Button>
+        <label className="crm-file crm-btn" style={{
+          ...small, display: 'inline-flex', alignItems: 'center', position: 'relative', fontWeight: 600,
+          borderRadius: 7, border: `1px solid ${C.line}`, color: C.ink, cursor: 'pointer',
+        }}>
+          <input type="file" accept=".zip,application/zip" className="crm-sr"
+            onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) takeFile(f); }} />
+          Or open a trip file
+        </label>
+        <Button onClick={() => { setOpen(false); setProblem(''); }} style={small}>Cancel</Button>
+      </div>
+      {problem && <p role="alert" style={{ margin: '9px 0 0', fontSize: 13, color: C.overdue, lineHeight: 1.5 }}>{problem}</p>}
+    </div>
+  );
+}
+
+function TripsView({
+  trips, people, look, incoming, offer, notice,
+  onOpen, onNew, onTakeShared, onGotShared, onDropShared, onConvert, onDismissOffer, onDismissNotice, onBackup,
+}) {
+  const [mode, setMode] = useState(look.current.mode);
+  const [f, setF] = useState(look.current.filter);
+  useEffect(() => { look.current = { mode, filter: f }; }, [look, mode, f]);
+
+  const opts = useMemo(() => tripFilterOptions(trips), [trips]);
+  const names = useMemo(() => new Map(people.map((p) => [p.id, p.name])), [people]);
+  // A filter left pointing at something no longer there (a tag nobody has
+  // now, a person deleted) is quietly dropped rather than hiding everything.
+  const live = useMemo(() => ({
+    year: opts.years.includes(Number(f.year)) ? f.year : '',
+    minRating: f.minRating,
+    companion: opts.companions.includes(f.companion) && names.has(f.companion) ? f.companion : '',
+    tag: opts.tags.find((g) => g.toLowerCase() === (f.tag || '').toLowerCase()) || '',
+  }), [f, opts, names]);
+  const narrowed = Boolean(live.year || live.minRating || live.companion || live.tag);
+  const shown = useMemo(() => sortTrips(filterTrips(trips, live)), [trips, live]);
+  const byId = useMemo(() => new Map(trips.map((t) => [t.id, t])), [trips]);
+  const points = useMemo(() => tripPoints(shown), [shown]);
+  const places = useMemo(() => new Set(trips.flatMap((t) => t.stops.map((s) => `${s.lat.toFixed(2)},${s.lng.toFixed(2)}`))).size, [trips]);
+
+  const set = (k, v) => setF({ ...live, [k]: v });
+  const pick = { ...inputStyle, width: 'auto', flex: '1 1 140px', minHeight: 36, padding: '6px 11px', fontSize: 13 };
+  const companionOptions = opts.companions.filter((id) => names.has(id))
+    .sort((a, b) => SHELF.compare(names.get(a), names.get(b)));
+  const mapHeight = 'min(62vh, 560px)';
+
+  let head = 'No trips yet';
+  let sub = 'The places you have been, when, who with, and what made them worth remembering.';
+  if (trips.length) {
+    head = narrowed
+      ? `${countThings(shown.length, 'trip', 'trips')} of ${trips.length}`
+      : `${countThings(trips.length, 'trip', 'trips')}, ${countThings(places, 'place', 'places').toLowerCase()}`;
+    sub = mode === 'map' ? 'Tap a pin for the trip. Pins close together gather into a circle; tap it to zoom in.' : 'Newest first.';
+  }
+
+  return (
+    <div>
+      <h1 style={{ margin: 0, fontSize: 27, lineHeight: 1.18, fontWeight: 600, letterSpacing: '-0.035em' }}>{head}</h1>
+      <p style={{ margin: '8px 0 18px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>{sub}</p>
+
+      {notice && (
+        <div role="note" style={{
+          background: C.surface, border: `1px solid ${C.soonBar}`, borderRadius: 12, padding: '13px 15px', margin: '0 0 16px',
+        }}>
+          <p style={{ margin: '0 0 10px', fontSize: 13.5, color: C.ink, lineHeight: 1.55 }}>
+            Trips and their photos are kept in this browser, on this device only. Nothing is uploaded, so
+            clearing this site&apos;s data, or losing the device, loses them. Download a backup file every so
+            often and keep it somewhere safe.
+          </p>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <Button kind="solid" onClick={onBackup} style={small}>Back up now</Button>
+            <Button onClick={onDismissNotice} style={small}>Got it</Button>
+          </div>
+        </div>
+      )}
+
+      {incoming && <SharedTripOffer incoming={incoming} onTake={onTakeShared} onDrop={onDropShared} />}
+      {offer.length > 0 && <EventsOffer events={offer} onConvert={onConvert} onDismiss={onDismissOffer} />}
+
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', margin: '0 0 12px' }}>
+        {trips.length > 0 && (
+          <div role="group" aria-label="Show trips as" style={{ display: 'flex', gap: 6, flex: '0 1 220px' }}>
+            {[['map', 'Map'], ['list', 'List']].map(([v, l]) => (
+              <button key={v} className="crm-btn" aria-pressed={mode === v} onClick={() => setMode(v)} style={segment(mode === v)}>{l}</button>
+            ))}
+          </div>
+        )}
+        <Button kind="solid" onClick={onNew} style={{ marginLeft: 'auto' }}>Add a trip</Button>
+      </div>
+
+      {trips.length > 0 && (
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '0 0 12px' }}>
+          <select className="crm-select" aria-label="Year" value={live.year} onChange={(e) => set('year', e.target.value)} style={pick}>
+            <option value="">Any year</option>
+            {opts.years.map((y) => <option key={y} value={y}>{y}</option>)}
+          </select>
+          <select className="crm-select" aria-label="Rating" value={live.minRating} onChange={(e) => set('minRating', Number(e.target.value))} style={pick}>
+            <option value={0}>Any rating</option>
+            {[1, 2, 3, 4].map((r) => <option key={r} value={r}>{`${r} star${r === 1 ? '' : 's'} and up`}</option>)}
+            <option value={5}>5 stars only</option>
+          </select>
+          {companionOptions.length > 0 && (
+            <select className="crm-select" aria-label="Went with" value={live.companion} onChange={(e) => set('companion', e.target.value)} style={pick}>
+              <option value="">With anyone</option>
+              {companionOptions.map((id) => <option key={id} value={id}>{`With ${names.get(id)}`}</option>)}
+            </select>
+          )}
+          {opts.tags.length > 0 && (
+            <select className="crm-select" aria-label="Tag" value={live.tag} onChange={(e) => set('tag', e.target.value)} style={pick}>
+              <option value="">Any tag</option>
+              {opts.tags.map((g) => <option key={g} value={g}>{g}</option>)}
+            </select>
+          )}
+          {narrowed && <Button onClick={() => setF(NO_TRIP_FILTER)} style={small}>Clear filters</Button>}
+        </div>
+      )}
+
+      {(mode === 'map' || trips.length === 0) ? (
+        <>
+          <div style={mapFrame()}>
+            <MapSlot height={mapHeight} render={(m) => (
+              <m.TripsMap
+                points={points}
+                height={mapHeight}
+                renderPopup={(p) => {
+                  const t = byId.get(p.tripId);
+                  return t ? <TripPopup trip={t} stop={p.stop} onOpen={() => onOpen(t.id)} /> : null;
+                }}
+              />
+            )} />
+            {shown.length === 0 && (
+              <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, pointerEvents: 'none', zIndex: 1000 }}>
+                <div style={{
+                  pointerEvents: 'auto', background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12,
+                  padding: '16px 18px', maxWidth: 300, textAlign: 'center', boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
+                }}>
+                  {trips.length === 0 ? (
+                    <>
+                      <p style={{ margin: '0 0 12px', fontSize: 14, color: C.ink, lineHeight: 1.5 }}>
+                        Add the first place you have been, and it lands on the map.
+                      </p>
+                      <Button kind="solid" onClick={onNew}>Add your first trip</Button>
+                    </>
+                  ) : (
+                    <>
+                      <p style={{ margin: '0 0 12px', fontSize: 14, color: C.ink }}>No trips match these filters.</p>
+                      <Button onClick={() => setF(NO_TRIP_FILTER)} style={small}>Clear filters</Button>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+          {trips.length > 0 && <RatingLegend />}
+        </>
+      ) : shown.length === 0 ? (
+        <div style={{ padding: '18px 16px', border: `1px solid ${C.line}`, borderRadius: 12, background: C.surface }}>
+          <p style={{ margin: '0 0 10px', fontSize: 14, color: C.muted }}>No trips match these filters.</p>
+          <Button onClick={() => setF(NO_TRIP_FILTER)} style={small}>Clear filters</Button>
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 10 }}>
+          {shown.map((t) => <TripCard key={t.id} trip={t} onOpen={onOpen} />)}
+        </div>
+      )}
+
+      <div style={{ marginTop: 22 }}>
+        <AddSharedTrip onGot={onGotShared} />
+      </div>
+    </div>
+  );
+}
+
+/* ---------- backup file ---------- */
+// The one copy that holds everything, photos included. The pasted backup
+// under People still works, but has no room for photos.
+function BackupView({ people, events, reminders, collections, trips, lastBackup, onDownloaded, onRestore, onClose }) {
+  const [plan, setPlan] = useState(null);
+  const [stage, setStage] = useState('');
+  const [progress, setProgress] = useState(null);
+  const [note, setNote] = useState('');
+  const [restoring, setRestoring] = useState(false);
+  const [restored, setRestored] = useState(null);
+  const [usage, setUsage] = useState(null);
+
+  useEffect(() => {
+    let live = true;
+    photoStore.estimate().then((u) => { if (live) setUsage(u); });
+    return () => { live = false; };
+  }, [restored]);
+
+  const records = () => ({
+    kind: 'orbit-backup', version: 1, exportedAt: new Date().toISOString(),
+    people, events, reminders, collections, trips,
+  });
+
+  const size = async () => {
+    setStage('sizing');
+    setNote('');
+    const all = await photoStore.listAll().catch(() => []);
+    const wanted = new Set(trips.flatMap((t) => t.photoIds));
+    const mine = all.filter((p) => wanted.has(p.id));
+    const bytes = JSON.stringify(records()).length + mine.reduce((n, p) => n + p.size + p.thumbSize + 300, 0);
+    setPlan({ bytes, photos: mine });
+    setStage('ready');
+  };
+
+  const build = async () => {
+    setStage('building');
+    setProgress({ done: 0, total: plan.photos.length });
+    try {
+      const m = { ...records(), photos: plan.photos.map((p) => ({ id: p.id, tripId: p.tripId })) };
+      const blob = await packZip(m, (id) => photoStore.getRecord(id), (done, total) => setProgress({ done, total }));
+      const name = `orbit-backup-${todayStr()}.zip`;
+      if (downloadBlob(name, blob)) {
+        setNote(`Saved ${name} (${approxBytes(blob.size)}). Keep it somewhere other than this device.`);
+        onDownloaded();
+      } else {
+        setNote('The download was blocked here.');
+      }
+    } catch {
+      setNote('The backup file could not be made. There may not be enough memory or space; close other tabs and try again.');
+    } finally {
+      setStage('');
+      setPlan(null);
+      setProgress(null);
+    }
+  };
+
+  const restore = async (file) => {
+    setRestoring(true);
+    setRestored(null);
+    try {
+      setRestored({ ok: true, text: await onRestore(file) });
+    } catch (e) {
+      setRestored({ ok: false, text: e?.message || 'That backup could not be restored.' });
+    } finally {
+      setRestoring(false);
+    }
+  };
+
+  const box = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '15px 15px 14px', marginBottom: 12 };
+  const photoCount = trips.reduce((n, t) => n + t.photoIds.length, 0);
+
+  return (
+    <div style={{ maxWidth: 640 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 6, flexWrap: 'wrap' }}>
+        <h1 style={{ margin: 0, fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Backup file</h1>
+        <Button onClick={onClose} style={{ marginLeft: 'auto' }}>Done</Button>
+      </div>
+      <p style={{ margin: '0 0 20px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
+        Everything Orbit keeps, photos included, in one file. Orbit only lives in this browser, so this
+        file is the copy that survives losing it.
+      </p>
+
+      <div style={box}>
+        <p style={{ margin: '0 0 6px', fontSize: 13, fontWeight: 600, color: C.ink }}>Download a backup</p>
+        <p style={{ margin: '0 0 12px', fontSize: 12.5, color: C.faint, lineHeight: 1.5 }}>
+          {lastBackup ? `Your last backup file from here was made ${prettyDate(lastBackup)}.` : 'No backup file has been made from this browser yet.'}
+        </p>
+        {stage === 'ready' && plan ? (
+          <div role="status">
+            <p style={{ margin: '0 0 10px', fontSize: 13.5, color: C.ink, lineHeight: 1.5 }}>
+              {`The file will be about ${approxBytes(plan.bytes)}`}
+              {plan.photos.length ? `, most of it your ${countThings(plan.photos.length, 'photo', 'photos').toLowerCase()}.` : '.'}
+              {plan.bytes > 150e6 ? ' That is a big file: make sure there is room for it, and keep this tab open while it is made.' : ''}
+            </p>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <Button kind="solid" onClick={build} style={small}>Download it</Button>
+              <Button onClick={() => { setStage(''); setPlan(null); }} style={small}>Cancel</Button>
+            </div>
+          </div>
+        ) : stage === 'building' ? (
+          <div role="status">
+            <progress value={progress?.done || 0} max={progress?.total || 1} aria-label="Making the backup file" style={{ width: '100%', accentColor: C.accentDeep }} />
+            <span style={hintStyle()}>
+              {progress?.total ? `Adding photo ${Math.min(progress.done + 1, progress.total)} of ${progress.total}…` : 'Making the file…'}
+            </span>
+          </div>
+        ) : (
+          <Button kind="solid" onClick={size} style={small} disabled={stage === 'sizing'}>
+            {stage === 'sizing' ? 'Working out the size…' : 'Make a backup file'}
+          </Button>
+        )}
+        {note && <p aria-live="polite" style={{ margin: '10px 0 0', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>{note}</p>}
+      </div>
+
+      <div style={box}>
+        <p style={{ margin: '0 0 6px', fontSize: 13, fontWeight: 600, color: C.ink }}>Restore from a backup file</p>
+        <p style={{ margin: '0 0 12px', fontSize: 12.5, color: C.faint, lineHeight: 1.5 }}>
+          Adds anything missing here, and brings trips and lists up to date where the file has a newer
+          version. Nothing here is deleted, and restoring the same file twice adds nothing twice.
+        </p>
+        <label className="crm-file crm-btn" style={{
+          ...small, display: 'inline-flex', alignItems: 'center', position: 'relative', fontWeight: 600,
+          borderRadius: 7, border: `1px solid ${C.line}`, color: C.ink, cursor: restoring ? 'default' : 'pointer',
+          opacity: restoring ? 0.55 : 1,
+        }}>
+          <input type="file" accept=".zip,.json,application/zip,application/json" className="crm-sr" disabled={restoring}
+            onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ''; if (f) restore(f); }} />
+          {restoring ? 'Restoring…' : 'Choose a backup file'}
+        </label>
+        {restored && (
+          <p role={restored.ok ? 'status' : 'alert'} style={{ margin: '10px 0 0', fontSize: 13, lineHeight: 1.5, color: restored.ok ? C.ink : C.overdue }}>
+            {restored.text}
+          </p>
+        )}
+      </div>
+
+      <div style={box}>
+        <p style={{ margin: '0 0 6px', fontSize: 13, fontWeight: 600, color: C.ink }}>Space used</p>
+        <p style={{ margin: 0, fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+          {usage
+            ? `Orbit is using about ${approxBytes(usage.usage)} of this browser's storage${usage.quota ? `, out of roughly ${approxBytes(usage.quota)} it allows` : ''}.`
+            : 'This browser does not say how much space Orbit is using.'}
+          {photoCount ? ` That includes ${countThings(photoCount, 'photo', 'photos').toLowerCase()}.` : ''}
+        </p>
+      </div>
     </div>
   );
 }
@@ -6654,6 +8682,18 @@ export default function PersonalCRM({ account = null } = {}) {
   const [addTarget, setAddTarget] = useState('');
   const friendsOn = Boolean(account?.friends && account.profile && 'visibility' in account.profile);
   const listsLook = useRef({ q: '', kind: 'All', order: 'recent' });
+  const [trips, setTrips] = useState([]);
+  const [tripOpen, setTripOpen] = useState(null);
+  const [tripDraft, setTripDraft] = useState(null);
+  const [incomingTrip, setIncomingTrip] = useState(null);
+  const tripsLook = useRef({ mode: 'map', filter: NO_TRIP_FILTER });
+  // Flags read from storage: whether the device-only notice and the offer to
+  // turn pinned events into trips have been answered. Both start answered so
+  // neither flashes up before storage has been read.
+  const [tripNoticeSeen, setTripNoticeSeen] = useState(true);
+  const [tripOfferDone, setTripOfferDone] = useState(true);
+  const [lastBackup, setLastBackup] = useState('');
+  const [storageUse, setStorageUse] = useState(null);
   // Saved lists that could not be read as they were: their original text,
   // shown in a warning with a way to download it.
   const [setAsideText, setSetAsideText] = useState(null);
@@ -6694,7 +8734,31 @@ export default function PersonalCRM({ account = null } = {}) {
       // Lists are rebuilt by their own cleaner, so only a list that would not
       // parse or lost records counts as damaged.
       await load(COLLECTIONS_KEY, cleanCollections, false, setCollections);
+      // Trips are rebuilt by their own cleaner, like lists.
+      let tripsRead = null;
+      await load(TRIPS_KEY, cleanTrips, false, (list) => { tripsRead = list; setTrips(list); });
       if (Object.keys(aside).length) setSetAsideText(aside);
+      // Photos no trip refers to any more (a trip deleted while its photos
+      // could not be, a form closed mid-upload) are cleared away, but only
+      // when the saved trips were read exactly as saved, and only photos
+      // older than a day, so an upload in progress in another tab is safe.
+      if (tripsRead && !aside[TRIPS_KEY]) {
+        const keep = new Set(tripsRead.flatMap((t) => t.photoIds));
+        const cutoff = new Date(Date.now() - 86400000).toISOString();
+        photoStore.listAll()
+          .then((all) => photoStore.deleteMany(all.filter((x) => !keep.has(x.id) && (x.savedAt || '') < cutoff).map((x) => x.id)))
+          .catch(() => { /* the photo store is out of reach; nothing to tidy */ });
+      }
+      try {
+        const [seen, offered, backedUp] = await Promise.all([
+          window.storage.get(TRIPS_NOTICE_KEY), window.storage.get(TRIPS_OFFER_KEY), window.storage.get(BACKUP_AT_KEY),
+        ]);
+        setTripNoticeSeen(Boolean(seen?.value));
+        setTripOfferDone(Boolean(offered?.value));
+        if (backedUp?.value) setLastBackup(backedUp.value);
+      } catch {
+        /* storage is out of reach; leave the notices unshown */
+      }
       try {
         const t = await window.storage.get(THEME_KEY);
         if (t?.value && THEMES[t.value]) { applyTheme(t.value); setTheme(t.value); }
@@ -6744,6 +8808,13 @@ export default function PersonalCRM({ account = null } = {}) {
         window.history.replaceState(null, '', window.location.pathname + window.location.search);
         setAddTarget(add[1].toLowerCase());
         setView('friends');
+        return;
+      }
+      if (hash.startsWith(`#${TRIP_SHARE_PREFIX}`)) {
+        const got = readSharedTrip(hash);
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+        setIncomingTrip(got || { broken: true });
+        if (arriving) setView('trips');
         return;
       }
       if (!hash.startsWith(`#${SHARE_PREFIX}`)) return;
@@ -6957,27 +9028,157 @@ export default function PersonalCRM({ account = null } = {}) {
     openCollectionById(named.id);
   };
 
+  const persistTrips = async (next) => {
+    setTrips(next);
+    if (holdBack(TRIPS_KEY)) return false;
+    try {
+      await window.storage.set(TRIPS_KEY, JSON.stringify(next));
+      setError('');
+      return true;
+    } catch {
+      setError('That trip is showing here but did not save. Try again.');
+      return false;
+    }
+  };
+
+  const openTripById = useCallback((id) => {
+    setTripOpen(id);
+    setTripDraft(null);
+    window.scrollTo(0, 0);
+  }, []);
+
+  // removedPhotos: photos taken off the trip in the form, deleted only now
+  // that the change has been kept.
+  const saveTrip = async (t, removedPhotos = []) => {
+    const exists = trips.some((x) => x.id === t.id);
+    const ok = await persistTrips(exists ? trips.map((x) => (x.id === t.id ? t : x)) : [...trips, t]);
+    openTripById(t.id);
+    if (ok && removedPhotos.length) photoStore.deleteMany(removedPhotos).catch(() => {});
+  };
+
+  // The trip goes first. Its photos are only deleted once that has saved,
+  // so a failed save never leaves a trip pointing at photos that are gone.
+  const removeTrip = async (t) => {
+    const ok = await persistTrips(trips.filter((x) => x.id !== t.id));
+    setTripOpen(null);
+    if (!ok) return;
+    try {
+      await photoStore.deleteMany(t.photoIds);
+      await photoStore.deleteForTrip(t.id);
+    } catch {
+      /* anything left behind is tidied away on a later visit */
+    }
+  };
+
+  // A trip someone shared: always a new trip here, with new ids for it and
+  // its photos, so taking the same one twice never overwrites anything.
+  const takeSharedTrip = async ({ trip, by, photos = [] }) => {
+    const id = uid();
+    const kept = [];
+    let problem = '';
+    for (const ph of photos.slice(0, PHOTO_CAP)) {
+      const pid = `${uid()}${uid()}`;
+      try {
+        await photoStore.save({ id: pid, tripId: id, blob: ph.blob, thumb: ph.thumb, width: ph.width, height: ph.height });
+        kept.push(pid);
+      } catch (e) {
+        problem = e instanceof photoStore.PhotoError ? e.message : 'Some of its photos could not be kept.';
+        break;
+      }
+    }
+    const now = new Date().toISOString();
+    const clash = trips.some((x) => x.startDate === trip.startDate && x.title.toLowerCase() === trip.title.toLowerCase());
+    const t = {
+      ...trip, id, createdAt: now, updatedAt: now, companions: [], photoIds: kept,
+      title: clash ? `${trip.title} (from ${by || 'a friend'})`.slice(0, TRIP_TITLE_CAP) : trip.title,
+    };
+    await persistTrips([...trips, t]);
+    setIncomingTrip(null);
+    setView('trips');
+    openTripById(id);
+    if (problem) setError(`${problem} The trip itself was added.`);
+  };
+
+  const convertEvents = async (list) => {
+    const made = list.map(eventToTrip).filter(Boolean);
+    await persistTrips([...trips, ...made]);
+    dismissTripOffer();
+  };
+
+  const dismissTripOffer = () => {
+    setTripOfferDone(true);
+    window.storage.set(TRIPS_OFFER_KEY, todayStr()).catch(() => { /* asked again next visit */ });
+  };
+
+  const dismissTripNotice = () => {
+    setTripNoticeSeen(true);
+    window.storage.set(TRIPS_NOTICE_KEY, todayStr()).catch(() => { /* shown again next visit */ });
+  };
+
+  const backedUp = () => {
+    const today = todayStr();
+    setLastBackup(today);
+    dismissTripNotice();
+    window.storage.set(BACKUP_AT_KEY, today).catch(() => { /* not fatal */ });
+  };
+
+  // A backup file is merged in rather than replacing anything: records are
+  // matched by id (see mergeById), and photos are added only when missing.
+  // Photos go in before the trips that point at them.
+  const restoreFile = async (file) => {
+    const { parts, photos } = await readBackupFile(file);
+    const P = mergeById(people, parts.people);
+    const E = mergeById(events, parts.events);
+    const R = mergeById(reminders, parts.reminders);
+    const L = mergeById(collections, parts.collections, (c) => c.updatedAt || '');
+    const T = mergeById(trips, parts.trips, (t) => t.updatedAt || '');
+    const ownerOf = new Map();
+    T.list.forEach((t) => t.photoIds.forEach((pid) => ownerOf.set(pid, t.id)));
+    let put = 0;
+    let photoProblem = '';
+    for (const ph of photos) {
+      if (!ownerOf.has(ph.id)) continue;
+      try {
+        if (await photoStore.has(ph.id)) continue;
+        await photoStore.save({ ...ph, tripId: ownerOf.get(ph.id) });
+        put += 1;
+      } catch (e) {
+        photoProblem = e instanceof photoStore.PhotoError ? e.message : 'Some photos could not be stored.';
+        break;
+      }
+    }
+    const changed = (m) => m.added + m.updated > 0;
+    const writes = [];
+    if (changed(P)) writes.push(persist(P.list));
+    if (changed(E)) writes.push(persistEvents(E.list));
+    if (changed(R)) writes.push(persistReminders(R.list));
+    if (changed(L)) writes.push(persistCollections(L.list));
+    if (changed(T)) writes.push(persistTrips(T.list));
+    const saved = await Promise.all(writes);
+    const said = [
+      [T, 'trip', 'trips'], [P, 'person', 'people'], [E, 'event', 'events'],
+      [R, 'reminder', 'reminders'], [L, 'list', 'lists'],
+    ].filter(([m]) => changed(m)).map(([m, one, many]) => `${m.added + m.updated} ${m.added + m.updated === 1 ? one : many}`
+      + (m.updated ? ` (${m.updated} updated)` : ''));
+    if (put) said.push(`${put} photo${put === 1 ? '' : 's'}`);
+    if (!saved.every(Boolean)) throw new Error('Part of that backup is showing here but did not save. Try again.');
+    const head = said.length ? `Restored ${said.join(', ')}.` : 'Everything in that backup is already here.';
+    return photoProblem ? `${head} ${photoProblem}` : head;
+  };
+
   const restore = async () => {
     let parts;
+    // A pasted backup from before trips existed leaves trips alone. It has no
+    // photos either way, so replacing trips with nothing would lose them.
+    let hasTrips;
     try {
       const parsed = JSON.parse(paste);
       // Older backups were a bare array of people.
-      const rawPeople = Array.isArray(parsed) ? parsed : parsed.people;
-      const rawEvents = Array.isArray(parsed) ? [] : parsed.events || [];
-      const rawReminders = Array.isArray(parsed) ? [] : parsed.reminders || [];
-      const rawCollections = Array.isArray(parsed) ? [] : parsed.collections || [];
-      if (!Array.isArray(rawPeople)) throw new Error('not a backup');
+      if (!Array.isArray(Array.isArray(parsed) ? parsed : parsed.people)) throw new Error('not a backup');
       // The same records are kept as ever; each is then repaired, so one
       // field of the wrong shape cannot take the app down.
-      const clean = cleanAll(rawPeople.filter((r) => r && typeof r.name === 'string' && r.name.trim()), cleanPerson);
-      parts = {
-        people: clean.map((r) => ({ ...r, id: r.id || uid() })),
-        events: cleanAll((Array.isArray(rawEvents) ? rawEvents : []).filter((e) => e && e.title && e.date), cleanEvent)
-          .map((e) => ({ ...e, id: e.id || uid() })),
-        reminders: cleanAll((Array.isArray(rawReminders) ? rawReminders : []).filter((r) => r && r.title && r.next), cleanReminder)
-          .map((r) => ({ ...r, id: r.id || uid() })),
-        collections: cleanCollections(rawCollections),
-      };
+      parts = backupParts(parsed);
+      hasTrips = !Array.isArray(parsed) && Array.isArray(parsed.trips);
       // Someone can keep lists and nobody on them, so an empty people list is
       // only a bad backup when there is nothing else in it either.
       if (Object.values(parts).every((x) => x.length === 0)) throw new Error('nothing in it');
@@ -6992,7 +9193,7 @@ export default function PersonalCRM({ account = null } = {}) {
     // not, and the restore would look complete when it was partial.
     const saved = await Promise.all([
       persist(parts.people), persistEvents(parts.events), persistReminders(parts.reminders),
-      persistCollections(parts.collections),
+      persistCollections(parts.collections), ...(hasTrips ? [persistTrips(parts.trips)] : []),
     ]);
     setBackup('');
     setPaste('');
@@ -7100,6 +9301,29 @@ export default function PersonalCRM({ account = null } = {}) {
   const sharedWaiting = Boolean(incoming)
     && !(view === 'collections' && !collectionDraft && !openCollection);
 
+  const openTrip = trips.find((x) => x.id === tripOpen) || null;
+  const tripWaiting = Boolean(incomingTrip) && !(view === 'trips' && !tripDraft && !openTrip);
+  // Pinned events not yet made into trips, for the one-time offer.
+  const pinnedEvents = useMemo(() => {
+    if (tripOfferDone) return [];
+    const done = new Set(trips.map((t) => t.fromEvent).filter(Boolean));
+    return events.filter((e) => typeof e.lat === 'number' && typeof e.lon === 'number' && !done.has(e.id))
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
+  }, [tripOfferDone, trips, events]);
+  const selectedTripsId = selectedPerson?.id;
+  const myTrips = useMemo(() => (selectedTripsId
+    ? sortTrips(trips.filter((t) => t.companions.includes(selectedTripsId)))
+    : []), [trips, selectedTripsId]);
+
+  // How much of the browser's storage Orbit is using, for the settings at
+  // the foot of the People list. Checked again whenever trips change.
+  useEffect(() => {
+    if (view !== 'list') return undefined;
+    let live = true;
+    photoStore.estimate().then((u) => { if (live) setStorageUse(u); });
+    return () => { live = false; };
+  }, [view, trips]);
+
   const list = filtering
     ? everyone.filter((p) =>
         tagFilter.kind === 'family'
@@ -7195,6 +9419,35 @@ export default function PersonalCRM({ account = null } = {}) {
           background-repeat: no-repeat; background-position: right 11px center; background-size: 12px;
           padding-right: 32px;
         }
+        /* Hidden from sight, still there for keyboards and screen readers. */
+        .crm-sr {
+          position: absolute !important; width: 1px; height: 1px; margin: -1px; padding: 0;
+          overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+        }
+        .crm-star input:focus-visible + span, .crm-file:focus-within {
+          outline: 2px solid ${C.ink}; outline-offset: 2px; border-radius: 6px;
+        }
+        .crm-clamp { -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+        /* Maps. The tiles are light in both themes; popups follow the theme. */
+        /* OpenStreetMap's sea colour, so any gap around the world reads as ocean. */
+        .orbit-map { font-family: inherit; background: #AAD3DF; }
+        .orbit-map .leaflet-popup-content-wrapper, .orbit-map .leaflet-popup-tip {
+          background: ${C.surface}; color: ${C.ink}; box-shadow: 0 6px 22px rgba(0,0,0,0.28);
+        }
+        .orbit-map .leaflet-popup-content { margin: 12px 14px; font-size: 13px; line-height: 1.4; }
+        .orbit-map a.leaflet-popup-close-button { color: ${C.muted}; }
+        .orbit-pin, .orbit-cluster { background: none; border: none; }
+        .orbit-pin span, .orbit-cluster span {
+          display: flex; align-items: center; justify-content: center; box-sizing: border-box;
+          border-radius: 50%; color: #fff; font-weight: 700; font-family: system-ui, sans-serif;
+        }
+        .orbit-pin span { width: 28px; height: 28px; font-size: 13px; border: 2px solid #fff; box-shadow: 0 1px 5px rgba(0,0,0,0.45); }
+        .orbit-cluster span {
+          width: 38px; height: 38px; font-size: 13px; background: #15211B;
+          border: 3px solid #72DE88; box-shadow: 0 1px 6px rgba(0,0,0,0.4);
+        }
+        .orbit-pin:focus-visible, .orbit-cluster:focus-visible { outline: none; }
+        .orbit-pin:focus-visible span, .orbit-cluster:focus-visible span { outline: 3px solid #15211B; outline-offset: 2px; }
         .crm-open { animation: crmIn .16s ease-out; }
         @keyframes crmIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
         @media (prefers-reduced-motion: reduce) { .crm-open { animation: none; } }
@@ -7236,7 +9489,7 @@ export default function PersonalCRM({ account = null } = {}) {
           {!loading && (
             <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
               {[['list', 'People'], ['events', 'Events'], ['reminders', 'Reminders'],
-                ['collections', 'Lists'], ['map', 'Map'], ['recap', 'Recap']].map(([v, l]) => {
+                ['collections', 'Lists'], ['trips', 'Trips'], ['recap', 'Recap']].map(([v, l]) => {
                 const on = view === v;
                 return (
                   <button
@@ -7245,6 +9498,7 @@ export default function PersonalCRM({ account = null } = {}) {
                     onClick={() => {
                       setView(v); setEventDraft(null); setReminderDraft(null);
                       setCollectionDraft(null); setCollectionOpen(null);
+                      setTripDraft(null); setTripOpen(null);
                     }}
                     style={{
                       font: 'inherit', fontSize: 12.5, fontWeight: 600, cursor: 'pointer',
@@ -7294,13 +9548,13 @@ export default function PersonalCRM({ account = null } = {}) {
                       boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
                     }}
                   >
-                    {[...(friendsOn ? [['friends', friendCount ? `Friends (${friendCount})` : 'Friends']] : []), ['settings', 'Settings'], ['import', 'Import'], ['export', 'Export']].map(([v, l], i) => (
+                    {[...(friendsOn ? [['friends', friendCount ? `Friends (${friendCount})` : 'Friends']] : []), ['settings', 'Settings'], ['import', 'Import'], ['export', 'Export'], ['backup', 'Backup file']].map(([v, l], i) => (
                       <button
                         key={v}
                         className="crm-btn"
                         onClick={() => {
                           setView(v); setMenuOpen(false); setEventDraft(null); setReminderDraft(null);
-                          setCollectionDraft(null);
+                          setCollectionDraft(null); setTripDraft(null);
                         }}
                         style={{
                           display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
@@ -7366,7 +9620,7 @@ export default function PersonalCRM({ account = null } = {}) {
           <p style={{ margin: '12px 0 0', fontSize: 13, color: C.overdue }}>{error}</p>
         )}
         {setAsideText && (() => {
-          const names = { [STORE_KEY]: 'people', [EVENTS_KEY]: 'events', [REMINDERS_KEY]: 'reminders', [COLLECTIONS_KEY]: 'lists' };
+          const names = { [STORE_KEY]: 'people', [EVENTS_KEY]: 'events', [REMINDERS_KEY]: 'reminders', [COLLECTIONS_KEY]: 'lists', [TRIPS_KEY]: 'trips' };
           const which = Object.keys(setAsideText).map((k) => names[k]).join(', ');
           const held = Object.keys(setAsideText).filter((k) => heldBack.current.has(k)).map((k) => names[k]).join(', ');
           return (
@@ -7405,6 +9659,17 @@ export default function PersonalCRM({ account = null } = {}) {
               ? 'A shared list arrived but could not be read.'
               : `${incoming.by || 'Someone'} shared a list with you: ${incoming.c.name}.`}
             <button className="crm-btn" onClick={() => { setView('collections'); setCollectionOpen(null); setCollectionDraft(null); }}
+              style={{ font: 'inherit', fontSize: 13, fontWeight: 600, color: C.ink, background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textDecoration: 'underline' }}>
+              See it
+            </button>
+          </p>
+        )}
+        {tripWaiting && (
+          <p role="status" style={{ margin: '12px 0 0', fontSize: 13, color: C.ink, display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
+            {incomingTrip.broken
+              ? 'A shared trip arrived but could not be read.'
+              : `${incomingTrip.by || 'Someone'} shared a trip with you: ${incomingTrip.trip.title}.`}
+            <button className="crm-btn" onClick={() => { setView('trips'); setTripOpen(null); setTripDraft(null); }}
               style={{ font: 'inherit', fontSize: 13, fontWeight: 600, color: C.ink, background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textDecoration: 'underline' }}>
               See it
             </button>
@@ -7563,9 +9828,66 @@ export default function PersonalCRM({ account = null } = {}) {
           </div>
         )}
 
-        {view === 'map' && (
+        {view === 'trips' && (
           <div className="crm-full">
-            <MapView events={events} people={people} />
+            {loading ? (
+              <p style={{ fontSize: 14, color: C.muted }}>One moment.</p>
+            ) : tripDraft ? (
+              <TripForm
+                initial={tripDraft.trip}
+                people={people}
+                onSave={saveTrip}
+                onCancel={() => setTripDraft(null)}
+              />
+            ) : openTrip ? (
+              <TripDetail
+                key={openTrip.id}
+                trip={openTrip}
+                people={people}
+                owner={owner}
+                onEdit={() => { setTripDraft({ trip: openTrip }); window.scrollTo(0, 0); }}
+                onRemove={() => removeTrip(openTrip)}
+                onBack={() => setTripOpen(null)}
+                onPerson={(id) => {
+                  setView('list'); setCircleTab('all'); setOpenId(id);
+                  setEditing(null); setAdding(false); setQ(''); setTagFilter(null);
+                }}
+              />
+            ) : (
+              <TripsView
+                trips={trips}
+                people={people}
+                look={tripsLook}
+                incoming={incomingTrip}
+                offer={pinnedEvents}
+                notice={!tripNoticeSeen}
+                onOpen={openTripById}
+                onNew={() => { setTripDraft({ trip: null }); window.scrollTo(0, 0); }}
+                onTakeShared={takeSharedTrip}
+                onGotShared={setIncomingTrip}
+                onDropShared={() => setIncomingTrip(null)}
+                onConvert={convertEvents}
+                onDismissOffer={dismissTripOffer}
+                onDismissNotice={dismissTripNotice}
+                onBackup={() => setView('backup')}
+              />
+            )}
+          </div>
+        )}
+
+        {view === 'backup' && (
+          <div className="crm-full">
+            <BackupView
+              people={people}
+              events={events}
+              reminders={reminders}
+              collections={collections}
+              trips={trips}
+              lastBackup={lastBackup}
+              onDownloaded={backedUp}
+              onRestore={restoreFile}
+              onClose={() => setView('list')}
+            />
           </div>
         )}
 
@@ -7666,11 +9988,12 @@ export default function PersonalCRM({ account = null } = {}) {
           </div>
         )}
 
-        {!loading && people.length + events.length + reminders.length + collections.length > 0 && (
+        {!loading && people.length + events.length + reminders.length + collections.length + trips.length > 0 && (
           <div style={{ marginTop: 18, borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
             <p style={{ fontSize: 12, color: C.faint, margin: '0 0 10px', lineHeight: 1.5 }}>
               Saved locally, in this browser on this device. Only you can see it. It will not
               follow you to another browser or computer — back up before you switch.
+              {storageUse ? ` Orbit is using about ${approxBytes(storageUse.usage)} of this browser's storage.` : ''}
             </p>
 
             <p style={{ fontSize: 12, color: C.faint, margin: '0 0 7px' }}>Theme</p>
@@ -7698,7 +10021,12 @@ export default function PersonalCRM({ account = null } = {}) {
               <Button onClick={() => { setBackup(backup === 'in' ? '' : 'in'); setPaste(''); }}>
                 {backup === 'in' ? 'Cancel restore' : 'Restore'}
               </Button>
+              <Button onClick={() => setView('backup')}>Backup file, with photos</Button>
             </div>
+            <p style={{ ...hintStyle(), marginTop: 8 }}>
+              {lastBackup ? `Last backup file made ${prettyDate(lastBackup)}. ` : ''}
+              Back up and Restore copy text without photos. The backup file keeps everything.
+            </p>
 
             {backup === 'out' && (
               <div style={{ marginTop: 10 }}>
@@ -7708,7 +10036,7 @@ export default function PersonalCRM({ account = null } = {}) {
                 <textarea
                   readOnly
                   onFocus={(e) => e.target.select()}
-                  value={JSON.stringify({ people, events, reminders, collections })}
+                  value={JSON.stringify({ people, events, reminders, collections, trips })}
                   style={{ ...inputStyle, minHeight: 92, fontSize: 12, lineHeight: 1.4, resize: 'vertical' }}
                 />
               </div>
@@ -7718,7 +10046,8 @@ export default function PersonalCRM({ account = null } = {}) {
               <div style={{ marginTop: 10 }}>
                 <p style={{ fontSize: 12, color: C.muted, margin: '0 0 6px' }}>
                   Paste a backup. This replaces everything saved here now: people, events,
-                  reminders and lists.
+                  reminders, lists and trips. Photos are not in a pasted backup; the ones already
+                  here stay with their trips.
                 </p>
                 <textarea
                   value={paste}
@@ -7770,6 +10099,8 @@ export default function PersonalCRM({ account = null } = {}) {
                 .filter((r) => (r.people || []).includes(selectedPerson.id))
                 .sort(byDue)}
               myRecs={myRecs}
+              myTrips={myTrips}
+              onTrip={(id) => { setView('trips'); openTripById(id); }}
               onList={(id) => { setView('collections'); openCollectionById(id); }}
               onLog={logTouch}
               onEditLog={editLog}

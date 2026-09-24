@@ -32,8 +32,8 @@ export default async function data({ newPage, check, shots }) {
   // ---- backup ----
   await page.getByRole('button', { name: 'Back up' }).click();
   const backup = JSON.parse(await page.locator('textarea[readonly]').inputValue());
-  check('a backup holds people, events, reminders and lists, and not the name or theme',
-    JSON.stringify(Object.keys(backup)) === '["people","events","reminders","collections"]'
+  check('a backup holds people, events, reminders, lists and trips, and not the name or theme',
+    JSON.stringify(Object.keys(backup)) === '["people","events","reminders","collections","trips"]'
       && backup.people.length === 1 && backup.events.length === 1 && backup.reminders.length === 1 && backup.collections.length === 1);
   await page.getByRole('button', { name: 'Hide backup' }).click();
 

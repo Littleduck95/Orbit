@@ -1,4 +1,4 @@
-// Events and the Map. "CURRENT:" checks record behaviour the audit flagged.
+// Events, and pinned events offered as trips. "CURRENT:" checks record behaviour the audit flagged.
 export default async function events({ newPage, check }) {
   const { page, open, stored, done } = await newPage({
     seed: { 'crm-people-v1': [{ id: 'dana', name: 'Dana Whitfield', circle: 'friend', tier: 'friend', cadence: 30, log: [] }] },
@@ -13,7 +13,7 @@ export default async function events({ newPage, check }) {
   await page.getByLabel('When', { exact: true }).fill('2026-06-03');
   await page.getByPlaceholder('Cincinnati, Ohio').fill('Denver');
   await page.getByRole('button', { name: 'Find', exact: true }).click();
-  await page.waitForSelector('text=Could not reach either lookup service from here');
+  await page.waitForSelector('text=Could not reach the place search from here');
   check('place search reports it cannot reach its service', true);
   const dana = page.locator('button', { hasText: 'Dana Whitfield' });
   check('the "Who was there" heading is not the first chip\'s name (fixed, M6)',
@@ -61,9 +61,9 @@ export default async function events({ newPage, check }) {
   check('CURRENT: the order menu has no label for screen readers',
     (await page.locator('.crm-full select').evaluate((el) => el.labels.length + (el.getAttribute('aria-label') ? 1 : 0))) === 0);
 
-  // ---- map ----
-  await page.getByRole('button', { name: 'Map', exact: true }).click();
-  check('the map lists pinned events only', await page.getByRole('heading', { name: 'One place pinned' }).isVisible());
+  // ---- pinned events, offered as trips ----
+  await page.getByRole('button', { name: 'Trips', exact: true }).click();
+  check('Trips offers pinned events only', await page.getByText('One event has a place pinned').isVisible());
   await page.getByRole('button', { name: 'Events', exact: true }).click();
 
   // ---- edit, coordinates cleared, remove ----

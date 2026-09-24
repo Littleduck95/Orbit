@@ -32,6 +32,9 @@ const findPlaywright = () => {
 export const NOW = new Date('2026-09-22T12:00:00-05:00');
 export const TODAY = '2026-09-22';
 
+// A 1x1 light grey PNG.
+const BLANK_TILE = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVQI12P4//8/AAX+Av7czFnnAAAAAElFTkSuQmCC', 'base64');
+
 const pw = findPlaywright();
 if (!pw) {
   console.error('Playwright is not installed. Install it (npm i -D playwright) or globally, then run again.');
@@ -76,8 +79,11 @@ const newPage = async ({ seed = {}, width = 1200, height = 900, clipboard = true
     if (/fonts\.googleapis|ERR_|Failed to load resource/.test(t)) return;
     problems.push(`${m.type()}: ${t}`);
   });
-  // Place search calls an outside service; make it fail the same way every run.
-  await page.route('https://api.anthropic.com/**', (r) => r.abort());
+  // Place search calls an outside service; make it fail the same way every
+  // run. A scenario that wants answers routes it again (the newest route wins).
+  await page.route('https://nominatim.openstreetmap.org/**', (r) => r.abort());
+  // Map tiles: a blank tile, so maps draw without reaching the internet.
+  await page.route('https://tile.openstreetmap.org/**', (r) => r.fulfill({ contentType: 'image/png', body: BLANK_TILE }));
   await page.route('https://fonts.googleapis.com/**', (r) => r.abort());
   if (Object.keys(seed).length) {
     await page.addInitScript((s) => {

@@ -16,11 +16,16 @@
     "test:notify": "NODE_TLS_REJECT_UNAUTHORIZED=0 NO_PROXY=127.0.0.1 no_proxy=127.0.0.1 npx --yes deno@2 test --no-lock --node-modules-dir=none --allow-net --allow-env --allow-read --allow-write --allow-run=openssl --allow-sys tests/notify/"
   },
   "dependencies": {
+    "@react-leaflet/core": "^3.0.0",
     "@supabase/supabase-js": "^2.117.1",
+    "fflate": "^0.8.3",
+    "leaflet": "^1.9.4",
+    "leaflet.markercluster": "^1.5.3",
     "papaparse": "^5.7.0",
     "qrcode-generator": "^2.0.4",
     "react": "^19.3.0",
-    "react-dom": "^19.3.0"
+    "react-dom": "^19.3.0",
+    "react-leaflet": "^5.0.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

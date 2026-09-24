@@ -4,7 +4,8 @@
 // the real source with Vite's own transformer, appends an export of every
 // top-level name, and imports the result. The compiled copy is written under
 // node_modules/.cache (ignored by git) so that its imports of react and
-// papaparse resolve from this project.
+// papaparse resolve from this project; imports of the app's own modules are
+// pointed back at src/.
 //
 // Every test process runs in one fixed timezone so date logic is repeatable.
 // It is set here, before anything creates a Date.
@@ -37,7 +38,10 @@ export async function loadApp() {
   const code = compiled.replace(/from (['"])\.\/([^'"]+)\1/g, (m, q, f) => `from ${q}${srcDir}/${f}${q}`);
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const out = path.join(OUT_DIR, `app-${process.pid}.mjs`);
-  fs.writeFileSync(out, code);
+  // The compiled copy lives elsewhere, so its imports of the app's own
+  // modules (./photoStore.js and the like) are pointed back at src/.
+  const srcDir = pathToFileURL(path.dirname(SRC)).href;
+  fs.writeFileSync(out, code.replace(/((?:from|import)\s*\(?\s*)(['"])\.\//g, `$1$2${srcDir}/`));
   try {
     return await import(pathToFileURL(out).href);
   } finally {

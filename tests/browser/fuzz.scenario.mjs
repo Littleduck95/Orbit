@@ -70,7 +70,7 @@ export default async function fuzz({ newPage, check }) {
           await tap(page.getByRole('button', { name: 'Cancel', exact: true }));
         }],
       ]),
-      ...['Events', 'Reminders', 'Map', 'Recap', 'Lists'].map((t) => [`tab ${t}`, () => tap(page.getByRole('button', { name: t, exact: true }))]),
+      ...['Events', 'Reminders', 'Trips', 'Recap', 'Lists'].map((t) => [`tab ${t}`, () => tap(page.getByRole('button', { name: t, exact: true }))]),
       ['open a list', () => tap(page.getByText('List 0', { exact: true }))],
       ['export', async () => {
         await tap(page.getByRole('button', { name: 'More', exact: true }));
