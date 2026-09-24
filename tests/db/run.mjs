@@ -71,10 +71,30 @@ try {
   if (!stub.ok) throw new Error(`loading the Supabase stand-in failed: ${stub.err}`);
   // ORBIT_SCHEMA points at another copy, to check the tests catch a planted bug.
   const schema = fs.readFileSync(process.env.ORBIT_SCHEMA || path.join(root, 'supabase', 'schema.sql'), 'utf8');
+  // supabase/check.sql, the read-only setup check: on an empty database,
+  // then after each run below, it has to tell the truth.
+  const checkSql = fs.readFileSync(path.join(root, 'supabase', 'check.sql'), 'utf8');
+  const report = () => {
+    const r = psql(checkSql);
+    return r.ok ? r.out.split('\n').map((l) => l.split('|')) : [['check.sql failed', r.err]];
+  };
+  const before = report();
+  check('the setup check runs on an empty database and reports everything missing',
+    before.length === 15 && before.every(([, st]) => st.startsWith('MISSING')), before);
+  // Part 1 alone, as it was merged, before friends existed.
+  const partOne = schema.slice(0, schema.indexOf('-- Profiles as others see them.'));
+  if (partOne.length < schema.length) {
+    psql(`${partOne}\n`);
+    const mid = report();
+    check('after part 1 only, it reports part 1 OK and part 2 missing',
+      mid.slice(0, 8).every(([, st]) => st === 'OK') && mid.slice(8).every(([, st]) => st.startsWith('MISSING')), mid);
+  }
   const first = psql(schema);
   check('the schema runs', first.ok, first.err);
   const again = psql(schema);
   check('and runs again without harm, as its header promises', again.ok, again.err);
+  const after = report();
+  check('after the whole schema, the setup check says OK to everything', after.length === 15 && after.every(([, st]) => st === 'OK'), after);
 
   // ---- signing up ----
   check('a password sign-up makes the profile in the same step',
