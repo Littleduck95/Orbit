@@ -297,6 +297,31 @@ const scenarios = {
     await close();
   },
 
+  async 'trips save to the account; their photos stay on this device'() {
+    const { page, mine, problems, close } = await newPage({ signedIn: true, rows: { [USER.id]: { 'crm-owner-v1': 'Robin' } } });
+    await page.route('https://tile.openstreetmap.org/**', (r) => r.abort());
+    await page.goto(url);
+    await shown(page.getByText("Robin's Orbit"));
+    await page.getByRole('button', { name: 'Trips', exact: true }).click();
+    check('the notice says photos are the part that stays here',
+      await shown(page.getByText('Trips are saved to your account, but their photos are kept in this browser')));
+    await page.getByRole('button', { name: 'Got it' }).click();
+    await page.getByRole('button', { name: 'Add a trip' }).click();
+    await page.getByLabel('Title').fill('Lisbon');
+    await page.getByRole('button', { name: 'Coordinates' }).click();
+    await page.getByLabel('Latitude').fill('38.7');
+    await page.getByLabel('Longitude').fill('-9.1');
+    await page.getByRole('button', { name: 'Add this place' }).click();
+    await page.getByRole('button', { name: 'Save trip' }).click();
+    await shown(page.getByRole('heading', { name: 'Lisbon' }));
+    await page.waitForTimeout(300);
+    const saved = JSON.parse(mine().get('crm-trips-v1') || '[]');
+    check('the trip is saved to the account', saved.length === 1 && saved[0].title === 'Lisbon', saved);
+    check('the notice being read is saved there too', Boolean(mine().get('crm-trips-notice-v1')));
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
   async 'a shared-list link survives sign-in'() {
     const { page, close } = await newPage({
       signedIn: true,
