@@ -26,6 +26,7 @@ Then open http://localhost:5173.
 | `npm run lint` | ESLint over the project |
 | `npm test` | Logic, storage and account tests (Node's built-in runner, no extra installs) |
 | `npm run test:browser` | Drives the real app in Chromium; needs Playwright installed |
+| `npm run test:account` | Drives sign-in in Chromium against a stand-in for Supabase; needs Playwright |
 
 The tests are characterization tests: they pin down what the app does today,
 with the clock, timezone and locale fixed so dates are repeatable. Checks whose
@@ -49,7 +50,7 @@ supabase/schema.sql   the table and its access rules, run once in Supabase
 .env                  which Supabase project to use (public values)
 src/Recovery.jsx      shown instead of a blank page if drawing ever fails
 src/PersonalCRM.jsx   the app
-tests/                characterization tests (logic, storage, browser)
+tests/                characterization tests (logic, storage, account, browser)
 vite.config.js        build config
 eslint.config.js      lint config
 ```
@@ -131,6 +132,38 @@ their own copy can paste the link, or just the code at the end of it, under
 kept: only `http` and `https` links survive, and text is trimmed to sensible
 lengths.
 
+## Sharing people
+
+Anyone in Orbit can be sent to another Orbit user as a **copy**: the recipient
+gets their own card to keep and change, and nothing stays linked to the
+sender's. **Share** on a person's card opens a field picker:
+
+| Starts | Fields |
+| --- | --- |
+| Always sent | Name |
+| Ticked | Role and company, Also known as |
+| Unticked | Email, phone, address, birthday or age, other dates, partner, kids, socials, hobbies |
+| Unticked, marked private | Notes, "Knows" tags, family names, check-in cadence |
+| Never offered | Closeness, relation, check-in history, last contact, VIP, paused, circle |
+
+The share goes as a link (compressed into the part after `#`, which is never
+sent to the server), a `.orbit` file (the same content as readable JSON), or a
+QR code of the link for passing a card across a table. A link too long to
+arrive in one piece is only offered as a file.
+
+Opening a link, or pasting one or choosing a file under **Import**, shows
+exactly what arrived and who says they sent it, before anything is saved. If
+the person looks like someone already here (same name, a name either side
+also goes by, the same phone however it is written, or the same email), the
+choice is **Merge**, **Add as new**, or **Skip**. A merge lists every field
+that would change: blanks and additions start ticked, and anything that
+differs starts on keeping yours. New people go into the circle you pick. Each
+card can carry a small "From Brock · date" note, which can be taken off.
+
+Both ends go through one whitelist of fields, so a share can never carry more
+than the picker offered, and a hand-edited one cannot slip anything else in.
+Lists shared with the older links still open as before.
+
 ## Accounts
 
 Orbit asks people to sign in, by a link sent to their email or with Google,
@@ -140,7 +173,9 @@ so it is the same on every device they sign in on. The project is set in
 do what the row-level security in `supabase/schema.sql` allows, which is each
 signed-in person reading and writing their own rows. Leave either value empty
 and Orbit runs as it did before, saving only in the browser with no sign-in.
-The browser tests do exactly that.
+The browser tests do exactly that. `npm run test:account` covers signing in
+itself, against a stand-in that answers like Supabase, so it never touches the
+real project.
 
 Each of the app's keys (below) is one row in the `orbit_data` table, holding
 the same text the app always stored. The whole account is read once when it
