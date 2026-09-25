@@ -5242,6 +5242,14 @@ function CollectionForm({ initial, kind: startKind, mine, onSave, onCancel }) {
   const foldOnClick = (e) => { pressing.current = false; foldOnMoveOn(e); };
 
   const fromOwn = from?.id ? yours.find((c) => c.id === from.id) : null;
+  const templateValue = from?.kind ? `k:${from.kind}` : from?.id ? `l:${from.id}` : '';
+  const pickByValue = (v) => {
+    const t = v.startsWith('k:') && LIST_TEMPLATES.find((x) => x.kind === v.slice(2));
+    const c = v.startsWith('l:') && yours.find((x) => x.id === v.slice(2));
+    if (t) pickTemplate(t);
+    else if (c) pickOwn(c);
+    else startBlank();
+  };
   const fromName = from?.kind ? from.kind : fromOwn ? `like ${fromOwn.name}` : '';
 
   const k = kindOf(kind);
@@ -5270,7 +5278,29 @@ function CollectionForm({ initial, kind: startKind, mine, onSave, onCancel }) {
   return (
     <div onPointerDown={() => { pressing.current = true; }} onFocus={foldOnFocus} onClick={foldOnClick}
       style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
-      {!initial && (open ? (
+      {/* On a phone the cards would fill the screen, so the same choice is a
+          dropdown there, which opens the phone's own picker. */}
+      {!initial && (
+        <div className="crm-tpl-pick">
+          <Field label="Start from a template">
+            {/* The shared input style's background would paint over the arrow. */}
+            <select className="crm-select" value={templateValue}
+              style={{ ...inputStyle, background: undefined, backgroundColor: C.surface, paddingRight: 32 }} onChange={(e) => pickByValue(e.target.value)}>
+              <option value="">None, start blank</option>
+              <optgroup label="Templates">
+                {LIST_TEMPLATES.map((t) => <option key={t.kind} value={`k:${t.kind}`}>{t.kind}</option>)}
+              </optgroup>
+              {yours.length > 0 && (
+                <optgroup label="Like one of yours">
+                  {yours.map((c) => <option key={c.id} value={`l:${c.id}`}>{c.name}</option>)}
+                </optgroup>
+              )}
+            </select>
+            <span style={hintStyle()}>Optional. It fills in the words below, and every one of them can be changed.</span>
+          </Field>
+        </div>
+      )}
+      {!initial && <div className="crm-tpl-wide">{open ? (
         <div ref={templatesRef}>
           <Group label="Start from a template">
             <div role="group" aria-label="Templates" style={templateGrid}>
@@ -5311,7 +5341,7 @@ function CollectionForm({ initial, kind: startKind, mine, onSave, onCancel }) {
           </button>
           {from && <button className="crm-btn" onClick={startBlank} style={linkButton()}>Start blank</button>}
         </p>
-      ))}
+      )}</div>}
 
       <Field label="Name">
         <input ref={nameRef} style={inputStyle} value={name} maxLength={LIST_NAME_CAP}
@@ -10025,6 +10055,7 @@ export default function PersonalCRM({ account = null } = {}) {
         .crm-detail { display: none; }
         .crm-detail.is-open { display: block; }
         .crm-idle { display: none; }
+        .crm-tpl-wide { display: none; }
 
         /* Wide: list and detail side by side, detail pinned while the list scrolls. */
         @media (min-width: 880px) {
@@ -10040,6 +10071,8 @@ export default function PersonalCRM({ account = null } = {}) {
           .crm-detail { display: block; position: sticky; top: 20px; }
           .crm-back { display: none; }
           .crm-idle { display: block; }
+          .crm-tpl-wide { display: block; }
+          .crm-tpl-pick { display: none; }
         }
         .crm-person:last-child, .crm-entry:last-child { border-bottom: none !important; }
         /* A list can hold thousands of entries. Rows off screen are skipped

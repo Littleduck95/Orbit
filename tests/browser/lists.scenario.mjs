@@ -394,6 +394,26 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
   await phone.page.getByRole('button', { name: 'Reorder' }).click();
   await phone.page.screenshot({ path: `${OUT}/13-reorder-phone.png`, fullPage: true });
   check('no sideways scroll at phone width (reorder)', !(await phone.page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)));
+
+  // A phone picks a template from a dropdown rather than a screenful of cards.
+  await tab(phone.page, 'Lists');
+  await phone.page.getByRole('button', { name: 'New list' }).click();
+  const pick = phone.page.getByLabel('Start from a template');
+  check('a phone gets a template dropdown', await pick.isVisible());
+  check('and no template cards', (await phone.page.getByRole('group', { name: 'Templates' }).count()) === 0);
+  check('the dropdown starts blank', (await pick.inputValue()) === '');
+  check('the dropdown offers your own lists', (await pick.locator('optgroup[label="Like one of yours"] option').allTextContents()).includes('Shows to watch'));
+  await pick.selectOption({ label: 'Books' });
+  check('a dropdown template fills in the words', (await phone.page.getByLabel('Name', { exact: true }).inputValue()) === 'Books to read'
+    && (await phone.page.getByLabel('Name for the under way stage').inputValue()) === 'Reading');
+  await pick.selectOption({ label: 'Shows to watch' });
+  check('a dropdown own list copies its setup', (await phone.page.getByLabel('Name', { exact: true }).inputValue()) === ''
+    && (await phone.page.getByLabel('Name for the finished stage').inputValue()) === 'Watched');
+  await pick.selectOption('');
+  check('None clears the words again', (await phone.page.getByLabel('Name for the finished stage').inputValue()) === '');
+  await phone.page.screenshot({ path: `${OUT}/14-new-list-phone.png`, fullPage: true });
+  check('no sideways scroll at phone width (new list)', !(await phone.page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)));
+  await phone.page.getByRole('button', { name: 'Cancel', exact: true }).click();
   check('the phone browser stayed clean', phone.problems.length === 0, phone.problems.join(' | '));
 
   // ---- a browser that refuses the clipboard still lets you copy by hand ----
