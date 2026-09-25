@@ -5119,28 +5119,41 @@ function Progress({ c, n, thin }) {
 }
 
 /* ---------- lists: a new list, or changing one ---------- */
+// The ready-made lists offered when starting one. "Other" is not among them:
+// a blank form is already that.
+const LIST_TEMPLATES = COLLECTION_KINDS.filter((x) => x.kind !== 'Other');
+const BLANK_LABELS = Object.freeze({ want: '', doing: '', done: '' });
+
 function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
-  const first = kindOf(initial?.kind || startKind || 'Shows');
+  // A new list starts blank unless it was opened from one of the templates.
+  const first = kindOf(initial?.kind || startKind || 'Other');
+  const blank = !initial && first.kind === 'Other';
   const [kind, setKind] = useState(first.kind);
-  const [name, setName] = useState(initial ? initial.name : first.name);
+  const [name, setName] = useState(initial ? initial.name : blank ? '' : first.name);
   const [note, setNote] = useState(initial?.note || '');
   const [track, setTrack] = useState(initial ? initial.track : true);
   // The middle stage is the only one that may be blank, meaning "skip it".
   const [labels, setLabels] = useState(initial
     ? { want: stageLabel(initial, 'want'), doing: initial.labels?.doing || '', done: stageLabel(initial, 'done') }
-    : { ...first.labels });
-  const [detail, setDetail] = useState(initial ? initial.detail : first.detail);
+    : blank ? { ...BLANK_LABELS } : { ...first.labels });
+  const [detail, setDetail] = useState(initial ? initial.detail : blank ? '' : first.detail);
   const [missing, setMissing] = useState(false);
 
-  // A new kind brings its own words, but only into fields still holding the
-  // old kind's words. Anything typed in by hand stays as it was.
-  const pickKind = (k) => {
-    const was = kindOf(kind);
-    const now = kindOf(k);
-    setKind(now.kind);
-    if (!name.trim() || name === was.name) setName(now.name);
-    if (STAGES.every((s) => (labels[s] || '') === was.labels[s])) setLabels({ ...now.labels });
-    if (!detail.trim() || detail === was.detail) setDetail(now.detail);
+  // A template fills in every word it has, whatever was there before, so
+  // switching from one to another never leaves the last one's words behind.
+  // What the list is for is the owner's own, and no template touches it.
+  const pickTemplate = (t) => {
+    setKind(t.kind);
+    setName(t.name);
+    setLabels({ ...t.labels });
+    setDetail(t.detail);
+    setMissing(false);
+  };
+  const startBlank = () => {
+    setKind('Other');
+    setName('');
+    setLabels({ ...BLANK_LABELS });
+    setDetail('');
   };
 
   const k = kindOf(kind);
@@ -5168,24 +5181,47 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
 
   return (
     <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
-      <Group label="What kind of list">
-        <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
-          {COLLECTION_KINDS.map((x) => (
-            <button key={x.kind} className="crm-btn" onClick={() => pickKind(x.kind)}
-              aria-pressed={kind === x.kind} style={filterChip(kind === x.kind)}>
-              {x.kind}
-            </button>
-          ))}
-        </div>
-        <span style={hintStyle()}>Sets the starting words below. Every one of them can be changed.</span>
-      </Group>
+      {!initial && (
+        <Group label="Start from a template">
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(128px, 1fr))', gap: 7 }}>
+            {LIST_TEMPLATES.map((t) => {
+              const on = kind === t.kind;
+              return (
+                <button key={t.kind} className="crm-btn" onClick={() => pickTemplate(t)} aria-pressed={on} style={{
+                  font: 'inherit', textAlign: 'left', cursor: 'pointer', padding: '8px 11px', borderRadius: 9,
+                  display: 'flex', flexDirection: 'column', justifyContent: 'flex-start',
+                  background: on ? C.accentSoft : 'transparent',
+                  border: `1px solid ${on ? C.accent : C.line}`, color: C.ink,
+                }}>
+                  <span style={{ display: 'block', fontSize: 13.5, fontWeight: 600 }}>{t.kind}</span>
+                  <span style={{ display: 'block', fontSize: 11.5, color: C.faint, marginTop: 2, lineHeight: 1.4 }}>
+                    {STAGES.map((st) => t.labels[st]).filter(Boolean).join(' · ')}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <span style={hintStyle()}>
+            Optional. A template fills in the words below, and every one of them can be changed.
+            {kind !== 'Other' && (
+              <>
+                {' '}
+                <button className="crm-btn" onClick={startBlank} style={{
+                  font: 'inherit', fontSize: 'inherit', padding: 0, border: 0, background: 'none',
+                  color: C.accentDeep, textDecoration: 'underline', cursor: 'pointer',
+                }}>Start blank</button>
+              </>
+            )}
+          </span>
+        </Group>
+      )}
 
       <Field label="Name">
         <input style={inputStyle} value={name} maxLength={LIST_NAME_CAP}
           aria-invalid={missing || undefined}
           aria-describedby={missing ? 'crm-list-name-missing' : undefined}
           onChange={(e) => { setName(e.target.value); setMissing(false); }}
-          placeholder={k.name || 'Gift ideas for Mom'} />
+          placeholder={k.name || 'Gift ideas, trails to hike, records to find…'} />
       </Field>
       {/* Outside the label, or it would become part of the field's name. */}
       {missing && (
@@ -5201,7 +5237,7 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
           value={note}
           maxLength={LIST_NOTE_CAP}
           onChange={(e) => setNote(e.target.value)}
-          placeholder="Everything people keep telling me to watch."
+          placeholder="Everything I want to try this year."
         />
       </Field>
 
@@ -5225,7 +5261,7 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
                     value={labels[s]}
                     maxLength={LABEL_CAP}
                     aria-label={`Name for the ${cap.toLowerCase()} stage`}
-                    placeholder={s === 'doing' ? 'Empty skips it' : k.labels[s]}
+                    placeholder={s === 'doing' ? 'Optional' : k.labels[s]}
                     onChange={(e) => setLabels({ ...labels, [s]: e.target.value })}
                   />
                 </div>
@@ -5245,7 +5281,7 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
 
       <Field label="The line under each title">
         <input style={inputStyle} value={detail} maxLength={LABEL_CAP}
-          onChange={(e) => setDetail(e.target.value)} placeholder={k.detail} />
+          onChange={(e) => setDetail(e.target.value)} placeholder={kind === 'Other' ? 'e.g. Author, Where, Brand' : k.detail} />
         <span style={hintStyle()}>
           What each entry notes besides its name: the author, where to watch it, the set it
           belongs to. Leave it empty to skip it.
@@ -5735,7 +5771,7 @@ function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack, 
       </div>
 
       <p style={{ margin: '7px 0 0', fontSize: 13, color: C.muted, display: 'flex', gap: 8, alignItems: 'baseline' }}>
-        <span style={kindChip()}>{c.kind}</span>
+        {c.kind !== 'Other' && <span style={kindChip()}>{c.kind}</span>}
         <span>{items.length} {items.length === 1 ? k.one : k.many}</span>
       </p>
 
@@ -5877,7 +5913,7 @@ const CollectionCard = memo(function CollectionCard({ c, found, onOpen }) {
           flex: 1, minWidth: 0, fontSize: 16.5, fontWeight: 600, letterSpacing: '-0.02em',
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
         }}>{c.name}</span>
-        <span style={kindChip()}>{c.kind}</span>
+        {c.kind !== 'Other' && <span style={kindChip()}>{c.kind}</span>}
       </span>
       <span style={{ display: 'block', fontSize: 12.5, color: C.muted, marginTop: 3 }}>
         {n === 0 ? 'Nothing on it yet' : `${n} ${n === 1 ? k.one : k.many}`}

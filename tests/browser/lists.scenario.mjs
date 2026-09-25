@@ -31,21 +31,31 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
   check('empty state shows quick-start kinds', await page.getByRole('button', { name: 'Books', exact: true }).isVisible());
   await page.screenshot({ path: `${OUT}/01-empty-desktop.png`, fullPage: true });
 
-  // ---- create a Books list from the quick start, switch kind, custom labels kept ----
+  // ---- create a Books list from the quick start, then switch templates ----
   await page.getByRole('button', { name: 'Books', exact: true }).click();
   const nameBox = page.getByLabel('Name', { exact: true });
+  const template = (kind) => page.getByRole('button', { name: new RegExp(`^${kind} `) });
   check('quick start prefills the name', (await nameBox.inputValue()) === 'Books to read');
   check('quick start prefills stage words', (await page.getByLabel('Name for the under way stage').inputValue()) === 'Reading');
-  await page.getByRole('button', { name: 'Shows', exact: true }).click();
-  check('switching kind swaps untouched name', (await nameBox.inputValue()) === 'Shows to watch');
-  check('switching kind swaps untouched stage words', (await page.getByLabel('Name for the finished stage').inputValue()) === 'Watched');
+  check('quick start marks its template', (await template('Books').getAttribute('aria-pressed')) === 'true');
+  check('the form has no Other template', (await template('Other').count()) === 0);
+  await template('Shows').click();
+  check('switching template swaps the name', (await nameBox.inputValue()) === 'Shows to watch');
+  check('switching template swaps the stage words', (await page.getByLabel('Name for the finished stage').inputValue()) === 'Watched');
   await page.getByLabel('Name for the finished stage').fill('Seen it');
-  await nameBox.fill('Our shows');
-  await page.getByRole('button', { name: 'Books', exact: true }).click();
-  check('switching kind keeps a typed name', (await nameBox.inputValue()) === 'Our shows');
-  check('switching kind keeps typed stage words', (await page.getByLabel('Name for the finished stage').inputValue()) === 'Seen it');
-  await page.getByRole('button', { name: 'Shows', exact: true }).click();
-  await page.getByLabel('Name for the finished stage').fill('Watched');
+  await nameBox.fill('Shows to watchs');
+  await page.getByLabel('What it is for').fill('Kept as typed');
+  await template('Books').click();
+  check('switching template replaces an edited name', (await nameBox.inputValue()) === 'Books to read');
+  check('switching template replaces edited stage words', (await page.getByLabel('Name for the finished stage').inputValue()) === 'Read');
+  check('switching template replaces the line under each title', (await page.getByLabel('The line under each title').inputValue()) === 'Author');
+  check('switching template leaves what it is for', (await page.getByLabel('What it is for').inputValue()) === 'Kept as typed');
+  await page.getByRole('button', { name: 'Start blank' }).click();
+  check('Start blank empties the name', (await nameBox.inputValue()) === '');
+  check('Start blank empties the stage words', (await page.getByLabel('Name for the not started stage').inputValue()) === '');
+  check('Start blank empties the line under each title', (await page.getByLabel('The line under each title').inputValue()) === '');
+  check('Start blank unmarks the template', (await template('Books').getAttribute('aria-pressed')) === 'false');
+  await template('Shows').click();
   await page.getByLabel('What it is for').fill('Everything people keep telling me to watch.');
   // Empty-name guard
   await nameBox.fill('');
@@ -226,8 +236,10 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
   // ---- second list: plain, no stages ----
   await page.getByRole('button', { name: '← All lists' }).click();
   await page.getByRole('button', { name: 'New list' }).click();
-  await page.getByRole('button', { name: 'Other', exact: true }).click();
-  check('Other leaves the name for you', (await page.getByLabel('Name', { exact: true }).inputValue()) === '');
+  check('a new list starts blank', (await page.getByLabel('Name', { exact: true }).inputValue()) === ''
+    && (await page.getByLabel('The line under each title').inputValue()) === ''
+    && (await page.getByLabel('Name for the finished stage').inputValue()) === '');
+  check('a new list starts with no template chosen', (await template('Shows').getAttribute('aria-pressed')) === 'false');
   await page.getByLabel('Name', { exact: true }).fill('Gift ideas for Mom');
   await page.getByRole('button', { name: 'No, just a list' }).click();
   await page.getByLabel('The line under each title').fill('');
