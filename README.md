@@ -57,6 +57,7 @@ src/PersonalCRM.jsx   the app
 src/photoStore.js     trip photos in IndexedDB, and preparing uploads
 src/TripMap.jsx       the Leaflet maps, loaded only when a map is shown
 src/mapConfig.js      map tiles and place search: one entry each
+src/geo.js            country and US state outlines: which one a stop is in, and shading
 tests/                characterization tests (logic, storage, account, browser)
 vite.config.js        build config
 eslint.config.js      lint config
@@ -171,14 +172,53 @@ Both ends go through one whitelist of fields, so a share can never carry more
 than the picker offered, and a hand-edited one cannot slip anything else in.
 Lists shared with the older links still open as before.
 
+## Recap
+
+Recap shows a year: catch-ups, people added, events, reminders kept, lists
+crossed off, and **the year in trips**: how many, days away, countries, US
+states and places, the top-rated trip, a map of them all, the countries seen
+for the first time, and what is still planned for the rest of the year. The
+four latest years are buttons, and any before that are in an *Earlier* menu.
+When the year turns over while Orbit is open (or on coming back to it),
+Recap moves on to the new year by itself, unless an older one is being
+looked at on purpose.
+
 ## Trips
 
-The Trips tab keeps the places you have been: a title, one or more stops, the
-dates, a rating out of five stars in half steps, a short highlight, longer
-notes, who went with you, tags, and up to 30 photos. It shows them on a map
-with the trips as cards underneath, or as the cards alone, newest first, and
-filters by year, rating, companion and tag. "Add a shared trip" sits beside
-"Add a trip".
+The Trips tab keeps the places you have been, and the ones you mean to go: a
+title, one or more stops, the dates, a rating out of five stars in half steps,
+a short highlight, longer notes, who went with you, tags, and up to 30 photos.
+It shows them on a map with the trips as cards underneath, or as the cards
+alone, and filters by kind, year, rating, companion and tag. "Add a shared
+trip" sits beside "Add a trip". Tapping a card under the map finds that trip
+on the map.
+
+**Been, planned, someday.** A trip is one you took (it needs a start date), a
+planned one (dates optional), or a someday wish (no dates, no rating). Trips
+to come are hollow pins, a solid ring for planned and a dashed one for
+someday, and the cards fall into *Coming up* (soonest first), *Recent trips*
+(newest first) and *Someday*. Once a planned trip's dates have gone by, it
+asks "Did you go?", and one tap makes it a trip you took. An entry on a
+Places list has *Put it on the trip map*, which opens a new someday trip (or
+a been trip, if the entry is ticked off) with its name filled in and its
+place already being searched for. Only a trip still to come stores a
+`status`, so every trip saved before plans existed reads as it did.
+
+**Stats** across the top count, from the trips you took, the countries, US
+states and places you have been, the days away this year (each day once,
+however many trips it was part of, and only up to today), and the place you
+have been back to most. Stops within 15 km of each other count as one place.
+*Hide stats* puts them away, and that is remembered; Recap has the same
+numbers year by year either way.
+
+**Where a stop is** (its country, and its state in the US) is worked out on
+the device from Natural Earth and US Census outlines ([`src/geo.js`](src/geo.js)),
+not asked of a web service, so every stop counts however it was added and
+nothing about where you have been leaves the device. The outlines are about
+280 KB and load only when Trips or Recap first needs them. A stop just off
+the coast is given to the nearest country within about 30 km. *Shade
+countries I have been to*, beside the map's key, colours in those countries,
+and the US states, for the trips shown.
 
 **Ratings**, on trips and list entries alike, go from half a star to five in
 half steps. A whole number means what it always did, so ratings saved, backed

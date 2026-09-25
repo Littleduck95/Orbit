@@ -105,6 +105,7 @@ export default async function trips({ newPage, check, tab, shots }) {
   // ---- stop 3: pin on the map ----
   await page.getByRole('button', { name: 'Pick on map' }).click();
   await page.waitForSelector('.orbit-map');
+  await page.locator('.orbit-map').scrollIntoViewIfNeeded();
   const box = await page.locator('.orbit-map').boundingBox();
   await page.mouse.click(box.x + box.width * 0.55, box.y + box.height * 0.6);
   await page.getByLabel('Name this place').fill('Sintra');
