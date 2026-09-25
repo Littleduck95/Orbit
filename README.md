@@ -56,6 +56,7 @@ src/Recovery.jsx      shown instead of a blank page if drawing ever fails
 src/PersonalCRM.jsx   the app
 src/photoStore.js     trip photos in IndexedDB, and preparing uploads
 src/TripMap.jsx       the Leaflet maps, loaded only when a map is shown
+src/recapCard.js      draws Recap's share card on a canvas
 src/mapConfig.js      map tiles and place search: one entry each
 src/geo.js            country and US state outlines: which one a stop is in, and shading
 tests/                characterization tests (logic, storage, account, browser)
@@ -182,6 +183,39 @@ four latest years are buttons, and any before that are in an *Earlier* menu.
 When the year turns over while Orbit is open (or on coming back to it),
 Recap moves on to the new year by itself, unless an older one is being
 looked at on purpose.
+
+**The year in events** counts the concerts, games, shows and festivals that
+have happened, names the top-rated event of any kind, lists the outings with
+their stars, and says which are still to come. Tapping one opens it to edit.
+
+### Rated events
+
+Events can be a **Concert**, **Sports** (counted as games), **Theater**
+(counted as shows) or **Festival**, beside the kinds there were before. An
+event you went to can be rated in half stars, as trips are, once its day has
+come: concerts, games, shows, festivals, trips, celebrations and *Other*.
+Milestones, work and losses never are. The rating shows on the timeline, goes
+in and out of the events CSV (a `Rating` column), and carries over when a
+pinned event becomes a trip. Events saved before ratings existed read as they
+did.
+
+### Share your year
+
+**Share your year**, beside the year, makes a picture of it: 1080 × 1350, the
+shape of a phone screen and an Instagram post, in Orbit's night-sky colours
+whatever the theme. It has the year, a world map with the countries been to
+shaded and pins for outings that have a place, up to six numbers (trips,
+countries, concerts, games, days away, and so on), and the top-rated trip and
+event with their stars.
+
+It is drawn on a canvas on the device ([`src/recapCard.js`](src/recapCard.js)),
+so nothing is sent anywhere to make it. What goes on it is only ever counts,
+titles, places and ratings: never who anyone was with, never notes, and nothing
+from People but, when *Catch-ups* is ticked (it starts unticked), how many
+there were. Trips and Events can each be left off, and a name can go in the
+corner. **Share…** opens the device's share sheet with the picture where the
+browser can share files (phones, mostly); **Save image** downloads it as
+`orbit-<year>.png` everywhere.
 
 ## Trips
 

@@ -7,6 +7,7 @@ import {
 } from './accountApi.js';
 import * as photoStore from './photoStore.js';
 import { GEOCODER } from './mapConfig.js';
+import { CARD_W, CARD_H, drawRecapCard, cardBlob, cardFontsReady } from './recapCard.js';
 
 /* ---------- palette ---------- */
 const THEMES = {
@@ -2650,6 +2651,8 @@ const fixText = (v) => (v == null || typeof v === 'string' ? v : typeof v === 'n
 // The same, for fields every record has to have.
 const fixNeeded = (v) => fixText(v) ?? '';
 const fixNumber = (v) => (v == null || typeof v === 'number' ? v : null);
+// Half stars from 0.5 to 5; anything else is no rating.
+const fixRating = (v) => (v == null || isRating(v) ? v : null);
 const fixTextList = (v) => {
   if (!v) return v;
   if (!Array.isArray(v)) return [];
@@ -2710,6 +2713,7 @@ const EVENT_FIXES = [
   ...['endDate', 'kind', 'place', 'note', 'addedOn'].map((k) => [k, fixText]),
   ['people', fixTextList],
   ['lat', fixNumber], ['lon', fixNumber],
+  ['rating', fixRating],
 ];
 
 const REMINDER_FIXES = [
@@ -2825,6 +2829,7 @@ const EVENT_COLS = [
   { h: 'Start', get: (e) => e.date, set: (e, v) => { e.date = v; } },
   { h: 'End', get: (e) => e.endDate || '', set: (e, v) => { e.endDate = v || null; } },
   { h: 'Kind', get: (e) => e.kind || '', set: (e, v) => { e.kind = v || 'Other'; } },
+  { h: 'Rating', get: (e) => (e.rating ? String(e.rating) : ''), set: (e, v) => { if (v) e.rating = halfStep(v) || null; } },
   { h: 'Place', get: (e) => e.place || '', set: (e, v) => { e.place = v; } },
   { h: 'Latitude', get: (e) => (e.lat == null ? '' : String(e.lat)), set: (e, v) => { e.lat = v === '' ? null : Number(v); } },
   { h: 'Longitude', get: (e) => (e.lon == null ? '' : String(e.lon)), set: (e, v) => { e.lon = v === '' ? null : Number(v); } },
@@ -3406,10 +3411,225 @@ function RecapTrips({ trips, year, onTrip }) {
   );
 }
 
-function Recap({ people, year, years, onYear, eventCount, reminderCount, listCount, trips = [], onTrip }) {
+// What each kind of outing is called when counted: "3 concerts", "1 game".
+const OUTING_WORDS = { Concert: ['concert', 'concerts'], Sports: ['game', 'games'], Theater: ['show', 'shows'], Festival: ['festival', 'festivals'] };
+
+// A year of outings for Recap: the concerts, games, shows and festivals that
+// have happened, how many of each, the best-rated event of any kind, and the
+// outings still to come.
+const eventsYear = (events, year, today = todayStr()) => {
+  const mine = events.filter((e) => eventYear(e) === year);
+  const outings = mine.filter((e) => OUTING_KINDS.includes(e.kind));
+  const done = outings.filter((e) => e.date <= today).sort((a, b) => (a.date < b.date ? 1 : -1));
+  const counts = OUTING_KINDS.map((k) => ({ kind: k, n: done.filter((e) => e.kind === k).length })).filter((c) => c.n);
+  const best = mine.filter((e) => e.rating && e.date <= today)
+    .sort((a, b) => b.rating - a.rating || (a.date < b.date ? 1 : -1))[0] || null;
+  const ahead = outings.filter((e) => e.date > today).sort((a, b) => (a.date < b.date ? -1 : 1));
+  return { outings: done, counts, best, ahead };
+};
+
+function RecapEvents({ events, year, onEvent }) {
+  const y = useMemo(() => eventsYear(events, year), [events, year]);
+  if (!y.outings.length && !y.ahead.length && !y.best) return null;
+  const box = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, marginBottom: 12 };
+  return (
+    <section aria-labelledby="recap-events" style={{ marginTop: 22 }}>
+      <h2 id="recap-events" style={{ margin: '0 0 12px', fontSize: 20, fontWeight: 600, letterSpacing: '-0.03em' }}>{`${year} in events`}</h2>
+      {y.counts.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+          {y.counts.map((c, i) => (
+            <Stat key={c.kind} n={c.n} label={OUTING_WORDS[c.kind][c.n === 1 ? 0 : 1]} tone={i === 0 ? C.accentDeep : undefined} />
+          ))}
+        </div>
+      )}
+      {y.best && (
+        <button className="crm-btn crm-row" onClick={() => onEvent(y.best)} style={{
+          ...box, display: 'block', width: '100%', textAlign: 'left', font: 'inherit', color: C.ink, padding: 12, cursor: 'pointer',
+        }}>
+          <span style={{ display: 'block', fontSize: 13, color: C.muted }}>Top-rated event</span>
+          <span style={{ display: 'block', fontSize: 19, fontWeight: 600, letterSpacing: '-0.025em', marginTop: 2 }}>{y.best.title}</span>
+          <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline', fontSize: 12.5, color: C.muted, marginTop: 3 }}>
+            <span>{eventWhen(y.best).text}</span>
+            {y.best.place && <span>{y.best.place}</span>}
+            <Stars n={y.best.rating} size={12.5} />
+          </span>
+        </button>
+      )}
+      {y.outings.length > 0 && (
+        <div style={{ ...box, padding: '6px 15px' }}>
+          {y.outings.map((e) => (
+            <button key={e.id} className="crm-btn" onClick={() => onEvent(e)} style={{
+              display: 'flex', gap: 12, alignItems: 'baseline', width: '100%', textAlign: 'left', font: 'inherit',
+              padding: '11px 0', background: 'transparent', border: 'none', borderBottom: `1px solid ${C.line}`, cursor: 'pointer', color: C.ink,
+            }}>
+              <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600 }}>{e.title}</span>
+              <Stars n={e.rating} size={11.5} />
+              <span style={kindChip()}>{e.kind}</span>
+              <span style={{ fontSize: 12.5, color: C.muted, flexShrink: 0 }}>{eventWhen(e).text}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {y.ahead.length > 0 && (
+        <p style={{ margin: '0 0 12px', fontSize: 13.5, color: C.muted }}>
+          {`Still to come in ${year}: `}
+          {y.ahead.map((e, i) => (
+            <span key={e.id}>
+              {i > 0 && ', '}
+              <button className="crm-btn" onClick={() => onEvent(e)} style={{ ...textButton(), fontSize: 13.5 }}>{e.title}</button>
+            </span>
+          ))}
+        </p>
+      )}
+    </section>
+  );
+}
+
+// What goes on the year's share card (see recapCard.js): counts, titles and
+// ratings only. Who anyone was with, notes, and anything from People but the
+// number of catch-ups never go, and the catch-ups only when asked for.
+// include: { trips, events, people }. where: from useGeo, or null while the
+// outlines load (the card then has no countries).
+const recapCard = ({ people, events, trips, where, year, include, name = '', site = '', today = todayStr() }) => {
+  const t = include.trips ? tripYear(trips, where, year, today) : null;
+  const ev = include.events ? eventsYear(events, year, today) : null;
+  const catchUps = include.people ? buildRecap(people, year).total : 0;
+  const word = (n, one, many) => (n === 1 ? one : many);
+  const stats = [
+    t && { n: t.trips.length, label: word(t.trips.length, 'trip', 'trips') },
+    t && t.countries && { n: t.countries.size, label: word(t.countries.size, 'country', 'countries') },
+    ...(ev ? ev.counts.map((c) => ({ n: c.n, label: OUTING_WORDS[c.kind][c.n === 1 ? 0 : 1] })) : []),
+    t && { n: t.days, label: word(t.days, 'day away', 'days away') },
+    include.people && { n: catchUps, label: word(catchUps, 'catch-up', 'catch-ups') },
+    t && t.states && { n: t.states.size, label: word(t.states.size, 'US state', 'US states') },
+    t && { n: t.places, label: word(t.places, 'place', 'places') },
+  ].filter((x) => x && x.n > 0).slice(0, 6);
+  const highlights = [
+    t?.best && {
+      label: t.best.rating ? 'Top-rated trip' : 'Longest trip',
+      title: t.best.title, rating: t.best.rating || null, sub: tripWhen(t.best).text,
+    },
+    ev?.best && {
+      label: 'Top-rated event',
+      title: ev.best.title, rating: ev.best.rating, sub: [ev.best.place, eventWhen(ev.best).text].filter(Boolean).join(' · '),
+    },
+  ].filter(Boolean);
+  const hasTrips = Boolean(t?.trips.length);
+  const hasEvents = Boolean(ev && (ev.outings.length || ev.best));
+  return {
+    year,
+    name: clip(name.trim(), 60),
+    subtitle: hasTrips && hasEvents ? 'in trips & events' : hasTrips ? 'in trips' : hasEvents ? 'in events' : 'in review',
+    stats,
+    highlights,
+    countries: t?.countries ? [...t.countries].sort() : [],
+    pins: ev ? ev.outings.filter((e) => typeof e.lat === 'number' && typeof e.lon === 'number').map((e) => ({ lat: e.lat, lng: e.lon })) : [],
+    site,
+    empty: !stats.length && !highlights.length,
+  };
+};
+
+// The card in words, for the preview's label and for anyone sharing it as text.
+const recapCardText = (card) => [
+  `${card.year} ${card.subtitle}`,
+  card.stats.map((x) => `${x.n} ${x.label}`).join(', '),
+  ...card.highlights.map((h) => `${h.label}: ${h.title}${h.rating ? ` (${stars(h.rating)})` : ''}`),
+].filter(Boolean).join('\n');
+
+function RecapShare({ people, events, trips, year, owner }) {
+  const { geo, where } = useGeo();
+  const [include, setInclude] = useState({ trips: true, events: true, people: false });
+  const [by, setBy] = useState(owner || '');
+  const [said, setSaid] = useState('');
+  const canvas = useRef(null);
+  const site = typeof location === 'undefined' ? '' : location.host;
+  const card = useMemo(() => recapCard({ people, events, trips, where, year, include, name: by, site }),
+    [people, events, trips, where, year, include, by, site]);
+  // Which card the canvas holds, so nothing is sent from a picture of the
+  // choices made a moment before.
+  const [drawn, setDrawn] = useState(null);
+  useEffect(() => {
+    let live = true;
+    cardFontsReady().then(() => {
+      if (!live || !canvas.current) return;
+      drawRecapCard(canvas.current, card, geo);
+      setDrawn(card);
+    });
+    return () => { live = false; };
+  }, [card, geo]);
+  const ready = drawn === card && !card.empty;
+  const file = `orbit-${year}.png`;
+
+  const picture = async () => {
+    const blob = await cardBlob(canvas.current);
+    if (!blob) throw new Error('no picture');
+    return blob;
+  };
+  const save = async () => {
+    try {
+      const url = URL.createObjectURL(await picture());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setSaid('Saved the picture.');
+    } catch {
+      setSaid('The picture could not be made in this browser.');
+    }
+  };
+  const canSheet = typeof navigator !== 'undefined' && typeof navigator.canShare === 'function' && typeof File === 'function';
+  const sheet = async () => {
+    try {
+      const f = new File([await picture()], file, { type: 'image/png' });
+      if (!navigator.canShare({ files: [f] })) { await save(); return; }
+      await navigator.share({ files: [f], title: `My ${year} in Orbit` });
+    } catch (e) {
+      if (e?.name !== 'AbortError') setSaid('Sharing did not work here. Save the picture instead.');
+    }
+  };
+  const tick = (k) => (v) => setInclude({ ...include, [k]: v });
+
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+      <p style={{ margin: '0 0 3px', fontSize: 14, fontWeight: 600, color: C.ink }}>Share your {year}</p>
+      <p style={{ margin: '0 0 14px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+        A picture of the year, made on this device. Only counts, titles and ratings go on it: never who you were with, and never your notes.
+      </p>
+      <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+        <canvas ref={canvas} width={CARD_W} height={CARD_H} role="img" aria-label={recapCardText(card)}
+          style={{ width: '100%', maxWidth: 300, aspectRatio: `${CARD_W} / ${CARD_H}`, borderRadius: 10, border: `1px solid ${C.line}`, flex: '0 1 300px' }} />
+        <div style={{ flex: '1 1 220px', minWidth: 0 }}>
+          <Check on={include.trips} onChange={tick('trips')} label="Trips" hint="How many, where, days away, and the best one" />
+          <Check on={include.events} onChange={tick('events')} label="Events" hint="Concerts, games, shows and festivals, and the top-rated event" />
+          <Check on={include.people} onChange={tick('people')} label="Catch-ups" hint="Only how many. Never names." />
+          <Field label="Your name on it">
+            <input style={{ ...inputStyle, minHeight: 38 }} value={by} onChange={(e) => setBy(e.target.value)} placeholder="Optional" />
+          </Field>
+          {card.empty ? (
+            <p style={{ margin: 0, fontSize: 13, color: C.muted, lineHeight: 1.5 }}>Nothing from {year} to put on it with these ticked.</p>
+          ) : (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {canSheet && <Button kind="solid" disabled={!ready} onClick={sheet}>{ready ? 'Share…' : 'Getting it ready…'}</Button>}
+              <Button kind={canSheet ? 'quiet' : 'solid'} disabled={!ready} onClick={save}>Save image</Button>
+            </div>
+          )}
+          {said && <p role="status" style={{ margin: '10px 0 0', fontSize: 12.5, color: C.muted }}>{said}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Recap({ people, year, years, onYear, eventCount, reminderCount, listCount, trips = [], onTrip, events = [], onEvent, owner }) {
   const r = buildRecap(people, year);
   const maxMonth = Math.max(1, ...r.months);
   const tripCount = trips.filter((t) => tripYears(t).includes(year)).length;
+  const [sharing, setSharing] = useState(false);
+  const outings = eventsYear(events, year);
+  const shareable = Boolean(tripCount || outings.outings.length || outings.best || r.total);
 
   return (
     <div>
@@ -3418,7 +3638,13 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
           {year} in review
         </h1>
         <YearPicker year={year} years={years} onYear={onYear} />
+        {shareable && (
+          <Button onClick={() => setSharing(!sharing)} aria-expanded={sharing}
+            style={{ marginLeft: 'auto', ...(sharing ? { borderColor: C.accent } : null) }}>Share your year</Button>
+        )}
       </div>
+
+      {sharing && shareable && <RecapShare people={people} events={events} trips={trips} year={year} owner={owner} />}
 
       {r.total === 0 && r.added === 0 && !eventCount && !reminderCount && !listCount ? (tripCount ? null : (
         <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.6, margin: 0 }}>
@@ -3519,6 +3745,7 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
       )}
 
       {onTrip && <RecapTrips trips={trips} year={year} onTrip={onTrip} />}
+      {onEvent && <RecapEvents events={events} year={year} onEvent={onEvent} />}
     </div>
   );
 }
@@ -3886,6 +4113,7 @@ const eventToTrip = (e) => cleanTrip({
   endDate: e.endDate,
   notes: e.note || '',
   companions: e.people || [],
+  rating: e.rating || null,
   tags: e.kind && e.kind !== 'Other' && e.kind !== 'Trip' ? [e.kind] : [],
   fromEvent: e.id,
 });
@@ -4107,7 +4335,12 @@ const downloadBlob = (name, blob) => {
 
 /* ---------- events ---------- */
 const EVENTS_KEY = 'crm-events-v1';
-const EVENT_KINDS = ['Milestone', 'Trip', 'Celebration', 'Work', 'Loss', 'Other'];
+const EVENT_KINDS = ['Milestone', 'Trip', 'Celebration', 'Concert', 'Sports', 'Theater', 'Festival', 'Work', 'Loss', 'Other'];
+// Things you went to, rather than things that happened: these can be rated
+// once they have happened, and are what Recap counts as the year's outings.
+const OUTING_KINDS = ['Concert', 'Sports', 'Theater', 'Festival'];
+const RATED_EVENT_KINDS = [...OUTING_KINDS, 'Trip', 'Celebration', 'Other'];
+const canRateEvent = (kind, date, today = todayStr()) => RATED_EVENT_KINDS.includes(kind) && Boolean(date) && date <= today;
 
 const eventYear = (e) => Number(e.date.slice(0, 4));
 
@@ -4138,6 +4371,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
   const [title, setTitle] = useState(initial?.title || '');
   const [kind, setKind] = useState(initial?.kind || 'Milestone');
   const [note, setNote] = useState(initial?.note || '');
+  const [rating, setRating] = useState(initial?.rating || null);
   const [who, setWho] = useState(initial?.people || []);
   const [place, setPlace] = useState(initial?.place || '');
   const [coords, setCoords] = useState(
@@ -4184,6 +4418,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
       id: initial?.id || uid(),
       addedOn: initial?.addedOn || todayStr(),
       date: start, endDate: finish, title: t, kind, note: note.trim(), people: who,
+      rating: canRateEvent(kind, start) ? rating : null,
       place: place.trim(),
       lat: coords ? coords.lat : null,
       lon: coords ? coords.lon : null,
@@ -4228,6 +4463,8 @@ function EventForm({ initial, people, onSave, onCancel }) {
           {EVENT_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
         </select>
       </Field>
+
+      {canRateEvent(kind, date) && <StarInput label="How was it?" value={rating} onChange={setRating} />}
 
       <Field label="Where">
         <div style={{ display: 'flex', gap: 8 }}>
@@ -4380,6 +4617,7 @@ function EventCard({ e, people, onPerson, onEdit, onRemove }) {
           {when.days > 1 && (
             <span style={{ fontSize: 12, color: C.faint }}>{when.days} days</span>
           )}
+          <Stars n={e.rating} size={12.5} />
           {e.kind && (
             <span style={{
               fontSize: 11, fontWeight: 600, color: C.muted,
@@ -4486,7 +4724,7 @@ function EventsView({ events, people, onAdd, onEdit, onRemove }) {
 
       <p style={{ margin: '0 0 18px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
         {events.length === 0
-          ? 'Weddings, moves, births, losses, the trip you never want to forget.'
+          ? 'Weddings, moves, concerts, games, the trip you never want to forget.'
           : byAdded
           ? 'Most recently written down first.'
           : sort === 'oldest'
@@ -10637,6 +10875,9 @@ export default function PersonalCRM({ account = null } = {}) {
             <Recap people={people} year={year} years={years} onYear={setYear}
               trips={trips}
               onTrip={(id) => { setView('trips'); openTripById(id); }}
+              events={events}
+              onEvent={(e) => { setView('events'); setEventDraft(e); }}
+              owner={owner}
               eventCount={events.filter((e) => Number(e.date.slice(0, 4)) === year).length}
               reminderCount={reminders.reduce((n, r) => n + (r.history || [])
                 .filter((h) => h?.date && Number(h.date.slice(0, 4)) === year).length, 0)}
