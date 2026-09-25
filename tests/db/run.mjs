@@ -80,7 +80,7 @@ try {
   };
   const before = report();
   check('the setup check runs on an empty database and reports everything missing',
-    before.length === 24 && before.every(([, st]) => st.startsWith('MISSING')), before);
+    before.length === 25 && before.every(([, st]) => st.startsWith('MISSING')), before);
   // Part 1 alone, as it was merged, before friends existed.
   const partOne = schema.slice(0, schema.indexOf('-- Profiles as others see them.'));
   if (partOne.length < schema.length) {
@@ -94,7 +94,7 @@ try {
   const again = psql(schema);
   check('and runs again without harm, as its header promises', again.ok, again.err);
   const after = report();
-  check('after the whole schema, the setup check says OK to everything', after.length === 24 && after.every(([, st]) => st === 'OK'), after);
+  check('after the whole schema, the setup check says OK to everything', after.length === 25 && after.every(([, st]) => st === 'OK'), after);
 
   // ---- signing up ----
   check('a password sign-up makes the profile in the same step',
@@ -369,6 +369,47 @@ try {
     && psql(`select visibility ? 'trips' from public.profiles where id = '${A}'`).out === 'f');
   check('show trips to friends again, for deleting below', as(A, `update public.profiles set visibility = visibility || '{"trips":"friends"}'::jsonb where id = '${A}';`).ok
     && syncTrips(A, tripItems).out.split('\n').pop() === '1');
+
+  // ---- the friends feed ----
+  const feed = (who, lim = 30, cursor = null) => {
+    const r = as(who, `select public.friend_feed(${cursor ? `'${cursor.at}'` : 'null'}, ${cursor ? `'${cursor.id}'` : 'null'}, ${lim});`);
+    return r.ok ? r.out.split('\n').filter((l) => l.startsWith('{')).map(JSON.parse) : { error: r.err };
+  };
+  check('signed-out visitors have no feed', !as('anon', 'select public.friend_feed();').ok);
+  check('A shares one outing with everyone, one with friends, and a trip with friends', sync(A, items).ok && syncTrips(A, tripItems).ok);
+  const fb = feed(B);
+  check('a friend\'s feed has their outings, both kinds, and trips shown to friends', fb.length === 3
+    && fb.filter((x) => x.type === 'outing').map((x) => x.title).sort().join('|') === 'Chiefs vs Broncos|Rackets at the Record Bar'
+    && fb.some((x) => x.type === 'trip' && x.title === 'Lisbon' && x.highlight === 'Tram 28'), fb);
+  check('each says who and when, and what an outing links to', fb.every((x) => x.by.username === 'brock' && x.by.display_name && x.at && x.id)
+    && fb.find((x) => x.title === 'Chiefs vs Broncos').links.length === 2, fb);
+  check('a stranger\'s feed is empty, even of what is shared with everyone', feed(D).length === 0);
+  check('your own things are not in your feed', feed(A).length === 0);
+  const stamp = () => psql(`select created_at || '|' || updated_at from public.outings where user_id = '${A}' and event_id = 'e1'`).out;
+  const firstStamp = stamp();
+  check('sharing the same set again keeps when each was first shared, and when it last changed', sync(A, items).ok && stamp() === firstStamp, [firstStamp, stamp()]);
+  const changed = items.map((x) => (x.event_id === 'e1' ? { ...x, rating: 5 } : x));
+  check('a change moves only when it last changed', sync(A, changed).ok && stamp().split('|')[0] === firstStamp.split('|')[0]
+    && stamp().split('|')[1] !== firstStamp.split('|')[1], [firstStamp, stamp()]);
+  const broken = items.map((x) => (x.event_id === 'e1' ? { ...x, rating: 3.3 } : x));
+  check('an outing that goes wrong on a later sync is taken down, not left as it was', sync(A, broken).ok
+    && psql(`select count(*) from public.outings where user_id = '${A}' and event_id = 'e1'`).out === '0');
+  check('and comes back with the next good sync', sync(A, items).ok && feed(B).length === 3);
+  const tripStamp = () => psql(`select created_at from public.shared_trips where user_id = '${A}' and trip_id = 't1'`).out;
+  const t0 = tripStamp();
+  check('trips keep when they were first shown too', syncTrips(A, tripItems).ok && tripStamp() === t0);
+
+  const p1 = feed(B, 2);
+  const p2 = feed(B, 2, p1[1]);
+  check('the feed comes a page at a time, carrying on where it left off', p1.length === 2 && p2.length === 1
+    && new Set([...p1, ...p2].map((x) => x.id)).size === 3, [p1.map((x) => x.id), p2.map((x) => x.id)]);
+  const ordered = feed(B);
+  check('newest first', ordered.every((x, i) => i === 0 || x.at <= ordered[i - 1].at));
+  check('trips kept to only me leave the feed at once', as(A, `update public.profiles set visibility = visibility || '{"trips":"me"}'::jsonb where id = '${A}';`).ok
+    && feed(B).every((x) => x.type !== 'trip'));
+  as(A, `update public.profiles set visibility = visibility || '{"trips":"friends"}'::jsonb where id = '${A}';`);
+  check('a block ends the friendship, and with it the feed', call(B, `block_user('${A}')`).ok && feed(B).length === 0);
+  check('B unblocks A', call(B, `unblock_user('${A}')`).ok);
 
   // ---- deleting an account ----
   const anonDel = as('anon', 'select public.delete_my_account();');

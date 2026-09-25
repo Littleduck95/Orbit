@@ -548,6 +548,10 @@ create table if not exists public.outings (
   primary key (user_id, event_id)
 );
 
+-- When each outing was first shared, kept through every later sync, so a
+-- friend's feed can put the newest first (part 6).
+alter table public.outings add column if not exists created_at timestamptz not null default now();
+
 create table if not exists public.outing_links (
   user_id    uuid not null,
   event_id   text not null,
@@ -710,31 +714,43 @@ language plpgsql security definer set search_path = '' as $$
 declare
   me uuid := auth.uid();
   it jsonb;
+  eid text;
+  keep text[] := '{}';
   kept integer;
 begin
   if me is null then raise exception 'Not signed in'; end if;
   if not exists (select 1 from public.profiles where id = me) then raise exception 'Choose a username first'; end if;
   if jsonb_typeof(items) is distinct from 'array' then raise exception 'Expected a list'; end if;
   if jsonb_array_length(items) > 2000 then raise exception 'Too many to share at once'; end if;
-  delete from public.outings where user_id = me;
+  -- Each outing is updated where it is, so it keeps when it was first shared;
+  -- updated_at only moves when something about it changed.
   for it in select value from jsonb_array_elements(items) loop
     begin
       if jsonb_typeof(it) <> 'object' or (it ->> 'date')::date > current_date + 1 then continue; end if;
-      insert into public.outings (user_id, event_id, kind, title, on_date, rating, review, visibility)
-        values (me, it ->> 'event_id', it ->> 'kind', btrim(it ->> 'title'), (it ->> 'date')::date,
+      eid := it ->> 'event_id';
+      if eid is null or eid = any(keep) then continue; end if;
+      insert into public.outings as o (user_id, event_id, kind, title, on_date, rating, review, visibility)
+        values (me, eid, it ->> 'kind', btrim(it ->> 'title'), (it ->> 'date')::date,
                 (it ->> 'rating')::numeric, btrim(coalesce(it ->> 'review', '')), it ->> 'visibility')
-        on conflict do nothing;
-      if not found then continue; end if;
+        on conflict (user_id, event_id) do update set
+          kind = excluded.kind, title = excluded.title, on_date = excluded.on_date, rating = excluded.rating,
+          review = excluded.review, visibility = excluded.visibility,
+          updated_at = case when (o.kind, o.title, o.on_date, o.rating, o.review, o.visibility)
+            is distinct from (excluded.kind, excluded.title, excluded.on_date, excluded.rating, excluded.review, excluded.visibility)
+            then now() else o.updated_at end;
+      delete from public.outing_links where user_id = me and event_id = eid;
       insert into public.outing_links (user_id, event_id, catalog_id)
-        select me, it ->> 'event_id', c.id from public.catalog c
+        select me, eid, c.id from public.catalog c
         where c.id::text in (
           select jsonb_array_elements_text(case when jsonb_typeof(it -> 'links') = 'array' then it -> 'links' else '[]'::jsonb end) limit 10
         )
         on conflict do nothing;
+      keep := keep || eid;
     exception when others then
-      null; -- this one is left out; the rest still go
+      null; -- this one is left out (and taken down, if it was there); the rest still go
     end;
   end loop;
+  delete from public.outings where user_id = me and not (event_id = any(keep));
   -- An outing linking to nothing says nothing about the catalog.
   delete from public.outings o where o.user_id = me
     and not exists (select 1 from public.outing_links l where l.user_id = me and l.event_id = o.event_id);
@@ -782,6 +798,7 @@ create table if not exists public.shared_trips (
   updated_at timestamptz  not null default now(),
   primary key (user_id, trip_id)
 );
+alter table public.shared_trips add column if not exists created_at timestamptz not null default now();
 alter table public.shared_trips enable row level security;
 revoke all on public.shared_trips from anon, authenticated;
 
@@ -798,6 +815,8 @@ declare
   it jsonb;
   st jsonb;
   stops jsonb;
+  tid text;
+  keep text[] := '{}';
   kept integer;
 begin
   if me is null then raise exception 'Not signed in'; end if;
@@ -805,11 +824,16 @@ begin
   if vis is null then raise exception 'Choose a username first'; end if;
   if jsonb_typeof(items) is distinct from 'array' then raise exception 'Expected a list'; end if;
   if jsonb_array_length(items) > 1000 then raise exception 'Too many to share at once'; end if;
-  delete from public.shared_trips where user_id = me;
-  if vis = 'me' then return 0; end if;
+  if vis = 'me' then
+    delete from public.shared_trips where user_id = me;
+    return 0;
+  end if;
+  -- Updated where they are, as outings are, so each keeps when it was first shown.
   for it in select value from jsonb_array_elements(items) loop
     begin
       if jsonb_typeof(it) <> 'object' or (it ->> 'start')::date > current_date + 1 then continue; end if;
+      tid := it ->> 'trip_id';
+      if tid is null or tid = any(keep) then continue; end if;
       stops := '[]'::jsonb;
       for st in select value from jsonb_array_elements(case when jsonb_typeof(it -> 'stops') = 'array' then it -> 'stops' else '[]'::jsonb end) limit 50 loop
         if jsonb_typeof(st) = 'object' and (st ->> 'lat')::float8 between -90 and 90 and (st ->> 'lng')::float8 between -180 and 180 then
@@ -819,14 +843,21 @@ begin
             'country', left(coalesce(st ->> 'country', ''), 100), 'state', left(coalesce(st ->> 'state', ''), 100)));
         end if;
       end loop;
-      insert into public.shared_trips (user_id, trip_id, title, start_date, end_date, rating, highlight, stops)
-        values (me, it ->> 'trip_id', btrim(it ->> 'title'), (it ->> 'start')::date, (it ->> 'end')::date,
+      insert into public.shared_trips as t (user_id, trip_id, title, start_date, end_date, rating, highlight, stops)
+        values (me, tid, btrim(it ->> 'title'), (it ->> 'start')::date, (it ->> 'end')::date,
                 (it ->> 'rating')::numeric, left(btrim(coalesce(it ->> 'highlight', '')), 300), stops)
-        on conflict do nothing;
+        on conflict (user_id, trip_id) do update set
+          title = excluded.title, start_date = excluded.start_date, end_date = excluded.end_date, rating = excluded.rating,
+          highlight = excluded.highlight, stops = excluded.stops,
+          updated_at = case when (t.title, t.start_date, t.end_date, t.rating, t.highlight, t.stops)
+            is distinct from (excluded.title, excluded.start_date, excluded.end_date, excluded.rating, excluded.highlight, excluded.stops)
+            then now() else t.updated_at end;
+      keep := keep || tid;
     exception when others then
-      null; -- this one is left out; the rest still go
+      null; -- this one is left out (and taken down, if it was there); the rest still go
     end;
   end loop;
+  delete from public.shared_trips where user_id = me and not (trip_id = any(keep));
   select count(*) into kept from public.shared_trips where user_id = me;
   return kept;
 end $$;
@@ -897,6 +928,60 @@ revoke all on function public.sync_trips(jsonb) from public, anon;
 revoke all on function public.public_profile(text, integer) from public;
 grant execute on function public.sync_trips(jsonb) to authenticated;
 grant execute on function public.public_profile(text, integer) to anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Part 6: the friends feed. What your friends have been to and where they
+-- have been, newest first by when each was first shared: their outings
+-- (whether set to Everyone or Friends, since you are a friend) and the trips
+-- they show to friends or everyone. Never anyone who is not a friend, and
+-- friendship already ends at a block.
+--
+-- Many things can be shared at the same moment (someone linking a year of
+-- concerts at once), so the order is by that moment and then by id, and a
+-- page carries on from the last item seen: (p_before_at, p_before_id).
+
+create index if not exists outings_created on public.outings (user_id, created_at desc);
+create index if not exists shared_trips_created on public.shared_trips (user_id, created_at desc);
+
+create or replace function public.friend_feed(p_before_at timestamptz default null, p_before_id text default null, lim integer default 30)
+returns setof jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  n integer := least(greatest(coalesce(lim, 30), 1), 100);
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  return query
+    with friends as (
+      select case when f.requester = me then f.addressee else f.requester end as id
+      from public.friendships f
+      where f.status = 'accepted' and me in (f.requester, f.addressee)
+    ), items as (
+      select o.created_at as at, o.user_id::text || ':o:' || o.event_id as id, jsonb_build_object(
+        'type', 'outing', 'kind', o.kind, 'title', o.title, 'date', o.on_date, 'rating', o.rating, 'review', o.review,
+        'links', coalesce((
+          select jsonb_agg(public.catalog_entry(c) order by c.kind, c.name)
+          from public.outing_links l join public.catalog c on c.id = l.catalog_id
+          where l.user_id = o.user_id and l.event_id = o.event_id
+        ), '[]'::jsonb)) as body, o.user_id
+      from public.outings o join friends fr on fr.id = o.user_id
+      union all
+      select t.created_at, t.user_id::text || ':t:' || t.trip_id, jsonb_build_object(
+        'type', 'trip', 'title', t.title, 'start', t.start_date, 'end', t.end_date, 'rating', t.rating,
+        'highlight', t.highlight, 'stops', t.stops), t.user_id
+      from public.shared_trips t join friends fr on fr.id = t.user_id
+      join public.profiles tp on tp.id = t.user_id
+      where coalesce(tp.visibility ->> 'trips', 'me') in ('everyone', 'friends')
+    )
+    select i.body || jsonb_build_object('id', i.id, 'at', i.at,
+      'by', jsonb_build_object('username', p.username, 'display_name', p.display_name))
+    from items i join public.profiles p on p.id = i.user_id
+    where p_before_at is null or (i.at, i.id) < (p_before_at, coalesce(p_before_id, ''))
+    order by i.at desc, i.id desc
+    limit n;
+end $$;
+revoke all on function public.friend_feed(timestamptz, text, integer) from public, anon;
+grant execute on function public.friend_feed(timestamptz, text, integer) to authenticated;
 
 -- Tell the API about the table now. Without this it can briefly answer
 -- "Could not find the table 'public.orbit_data' in the schema cache".

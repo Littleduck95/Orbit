@@ -50,6 +50,9 @@ from (values
                                                 and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.shared_trips')), false)
                                                 and to_regprocedure('public.sync_trips(jsonb)') is not null),
   (24, 'Part 5: public pages',                 case when to_regprocedure('public.public_profile(text, integer)') is null then false
-                                                else has_function_privilege('anon', to_regprocedure('public.public_profile(text, integer)')::oid, 'execute') end)
+                                                else has_function_privilege('anon', to_regprocedure('public.public_profile(text, integer)')::oid, 'execute') end),
+  (25, 'Part 6: the friends feed',             to_regprocedure('public.friend_feed(timestamptz, text, integer)') is not null
+                                                and exists (select 1 from information_schema.columns
+                                                  where table_schema = 'public' and table_name = 'outings' and column_name = 'created_at'))
 ) as t(n, item, ok)
 order by n;

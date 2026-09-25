@@ -5286,6 +5286,141 @@ function CatalogPage({ api, id, onOpen, onPerson }) {
   );
 }
 
+/* ---------- the friends feed ---------- */
+// How long ago something was shared, in words.
+const ago = (at, now = Date.now()) => {
+  const t = Date.parse(at);
+  if (Number.isNaN(t)) return '';
+  const min = Math.max(0, Math.round((now - t) / 60000));
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min} min ago`;
+  const h = Math.round(min / 60);
+  if (h < 24) return `${h} h ago`;
+  const d = Math.round(h / 24);
+  if (d === 1) return 'yesterday';
+  if (d < 7) return `${d} days ago`;
+  return formatDay(new Date(t), 'full');
+};
+
+// Runs of things one friend shared at once (a year of concerts linked in one
+// go) are gathered, so they do not bury everyone else. Returns groups of
+// consecutive items by the same person shared within two minutes of each
+// other, in the feed's order.
+const groupFeed = (items) => {
+  const out = [];
+  items.forEach((x) => {
+    const last = out[out.length - 1];
+    const prev = last?.items[last.items.length - 1];
+    if (last && last.by.username === x.by.username && Math.abs(Date.parse(prev.at) - Date.parse(x.at)) <= 120000) {
+      last.items.push(x);
+    } else {
+      out.push({ key: x.id, by: x.by, items: [x] });
+    }
+  });
+  return out;
+};
+const GROUP_SHOWN = 3;
+
+function FeedItem({ x, onCatalog }) {
+  const trip = x.type === 'trip' ? pageTrip({ ...x, id: x.id }) : null;
+  const verb = !trip && x.rating ? 'rated' : 'went to';
+  return (
+    <article style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '12px 15px', marginBottom: 10 }}>
+      <p style={{ margin: 0, fontSize: 13, color: C.muted, display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'baseline' }}>
+        <a href={profilePath(x.by.username)} style={{ fontWeight: 600, color: C.ink, textDecoration: 'none' }}>{x.by.display_name}</a>
+        <span>{verb}</span>
+        <span style={{ marginLeft: 'auto', color: C.faint, fontSize: 12 }}>{ago(x.at)}</span>
+      </p>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap', marginTop: 4 }}>
+        <span style={{ fontSize: 16.5, fontWeight: 600, letterSpacing: '-0.02em' }}>{x.title}</span>
+        {!trip && <span style={kindChip()}>{x.kind}</span>}
+        <span style={{ marginLeft: 'auto' }}><Stars n={x.rating} size={13} /></span>
+      </div>
+      <p style={{ margin: '3px 0 0', fontSize: 12.5, color: C.muted }}>
+        {trip ? tripWhen(trip).text : prettyDate(x.date)}
+        {trip && trip.stops.length > 0 && ` · ${[...new Set(trip.stops.map((st) => st.name).filter(Boolean))].join(' → ')}`}
+      </p>
+      {(x.review || x.highlight) && (
+        <p className="crm-serif" style={{ margin: '8px 0 0', fontSize: 15, lineHeight: 1.55 }}>{x.review || x.highlight}</p>
+      )}
+      {x.links?.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 9 }}>
+          {x.links.map((l) => (
+            <button key={l.id} className="crm-btn" onClick={() => onCatalog(l.id)} aria-label={`Open ${l.name}`}
+              style={{ ...filterChip(false), padding: '3px 10px', fontSize: 12 }}>{l.name}</button>
+          ))}
+        </div>
+      )}
+    </article>
+  );
+}
+
+// What friends have shared, newest first, a page at a time. onSeen gets the
+// newest item's time once it is showing.
+function FeedView({ api, onCatalog, onSeen, onFriends }) {
+  const [items, setItems] = useState(null);
+  const [more, setMore] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState('');
+  const [open, setOpen] = useState(() => new Set());
+  const PAGE = 30;
+  useEffect(() => {
+    let live = true;
+    api.feed(null, PAGE).then(
+      (rows) => { if (!live) return; setItems(rows); setMore(rows.length === PAGE); if (rows[0]) onSeen(rows[0].at); },
+      (e) => { if (live) { setItems([]); setProblem(e.message || 'The feed could not be loaded.'); } },
+    );
+    return () => { live = false; };
+  }, [api, onSeen]);
+  const loadMore = async () => {
+    setBusy(true);
+    try {
+      const rows = await api.feed(items[items.length - 1], PAGE);
+      setItems([...items, ...rows]);
+      setMore(rows.length === PAGE);
+    } catch (e) {
+      setProblem(e.message || 'More could not be loaded.');
+    }
+    setBusy(false);
+  };
+  const groups = useMemo(() => groupFeed(items || []), [items]);
+
+  return (
+    <div>
+      <h1 style={{ margin: '0 0 6px', fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Feed</h1>
+      <p style={{ margin: '0 0 18px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
+        The concerts, games and shows your friends went to, and the trips they have taken, as they share them.
+      </p>
+      {problem && <p role="alert" style={{ fontSize: 13.5, color: C.overdue }}>{problem}</p>}
+      {items === null && <p style={{ fontSize: 14, color: C.muted }}>Loading…</p>}
+      {items && items.length === 0 && !problem && (
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
+          <p style={{ margin: '0 0 10px', fontSize: 14, lineHeight: 1.55 }}>
+            Nothing from friends yet. When a friend rates a concert or a game, or shows their trips, it appears here.
+          </p>
+          {onFriends && <Button kind="solid" onClick={onFriends}>Find friends</Button>}
+        </div>
+      )}
+      {groups.map((g) => {
+        const shown = open.has(g.key) ? g.items : g.items.slice(0, GROUP_SHOWN);
+        const rest = g.items.length - shown.length;
+        return (
+          <div key={g.key}>
+            {shown.map((x) => <FeedItem key={x.id} x={x} onCatalog={onCatalog} />)}
+            {rest > 0 && (
+              <button className="crm-btn" onClick={() => setOpen(new Set([...open, g.key]))}
+                style={{ ...textButton(), fontSize: 13, margin: '0 0 14px 4px' }}>
+                {`${rest} more from ${g.by.display_name.split(' ')[0]}`}
+              </button>
+            )}
+          </div>
+        );
+      })}
+      {more && <Button onClick={busy ? undefined : loadMore}>{busy ? 'Loading…' : 'Load more'}</Button>}
+    </div>
+  );
+}
+
 /* ---------- public pages ---------- */
 // A shared trip as the rest of the app knows trips, so the same map, dates
 // and stars work on it.
@@ -9735,7 +9870,7 @@ function FriendsView({ account, startWith, onStarted, onSaveToPeople, onCount, o
 
 /* ---------- settings: preferences ---------- */
 const START_KEY = 'crm-start-v1';
-const START_VIEWS = [['list', 'People'], ['events', 'Events'], ['reminders', 'Reminders'], ['collections', 'Lists'], ['trips', 'Trips'], ['recap', 'Recap']];
+const START_VIEWS = [['list', 'People'], ['feed', 'Feed'], ['events', 'Events'], ['reminders', 'Reminders'], ['collections', 'Lists'], ['trips', 'Trips'], ['recap', 'Recap']];
 const hourLabel = (h) => `${h % 12 === 0 ? 12 : h % 12}${h < 12 ? 'am' : 'pm'}`;
 const HOURS = Array.from({ length: 24 }, (_, h) => [h, hourLabel(h)]);
 const BIRTHDAY_LEADS = [[0, 'On the day'], [1, 'The day before'], [3, '3 days before'], [7, 'A week before'], [14, 'Two weeks before']];
@@ -9793,7 +9928,7 @@ function PreferencesSettings({ account, theme, onTheme, start, onStart }) {
       </Group>
       <Field label="Open Orbit on">
         <select className="crm-select" value={start} onChange={(e) => onStart(e.target.value)} style={{ ...inputStyle, minHeight: 38, fontSize: 14 }}>
-          {START_VIEWS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          {START_VIEWS.filter(([v]) => v !== 'feed' || account?.profile).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
         </select>
       </Field>
     </div>
@@ -10622,6 +10757,34 @@ export default function PersonalCRM({ account = null } = {}) {
     return () => clearTimeout(t);
   }, [catalogOn, loading, sharedTrips, tripsShown, account]);
 
+  // The feed: whether friends have shared anything since you last looked.
+  // The newest item's time is read when Orbit opens, and the time of the
+  // newest you have seen is kept on this device.
+  const [feedNewest, setFeedNewest] = useState(null);
+  const [feedSeen, setFeedSeen] = useState(() => {
+    try { return account?.profile ? localStorage.getItem(`orbit-feed-seen:${account.profile.id}`) : null; } catch { return null; }
+  });
+  useEffect(() => {
+    if (!catalogOn) return undefined;
+    let live = true;
+    account.catalog.feed(null, 1).then((rows) => { if (live && rows[0]) setFeedNewest(rows[0].at); }, () => {});
+    return () => { live = false; };
+  }, [catalogOn, account]);
+  const feedFresh = Boolean(feedNewest && (!feedSeen || feedNewest > feedSeen));
+  const sawFeed = useCallback((at) => {
+    if (!at || !account?.profile) return;
+    setFeedNewest((n) => (n && n > at ? n : at));
+    setFeedSeen((was) => {
+      const next = was && was > at ? was : at;
+      try { localStorage.setItem(`orbit-feed-seen:${account.profile.id}`, next); } catch { /* the dot shows again next time */ }
+      return next;
+    });
+  }, [account]);
+  // A start view of Feed, where there is no feed (signed out, no username).
+  useEffect(() => {
+    if (!loading && view === 'feed' && !catalogOn) setView('list');
+  }, [loading, view, catalogOn]);
+
   // How many friend requests wait, read once when Orbit opens.
   useEffect(() => {
     if (!friendsOn) return undefined;
@@ -11149,9 +11312,10 @@ export default function PersonalCRM({ account = null } = {}) {
           )}
           {!loading && (
             <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
-              {[['list', 'People'], ['events', 'Events'], ['reminders', 'Reminders'],
+              {[['list', 'People'], ...(catalogOn ? [['feed', 'Feed']] : []), ['events', 'Events'], ['reminders', 'Reminders'],
                 ['collections', 'Lists'], ['trips', 'Trips'], ['recap', 'Recap']].map(([v, l]) => {
                 const on = view === v;
+                const fresh = v === 'feed' && feedFresh && !on;
                 return (
                   <button
                     key={v}
@@ -11166,9 +11330,14 @@ export default function PersonalCRM({ account = null } = {}) {
                       color: on ? C.onAccent : C.muted,
                       background: on ? C.accent : 'transparent',
                       border: `1px solid ${on ? C.accent : C.line}`,
-                      padding: '5px 11px', borderRadius: 20,
+                      padding: '5px 11px', borderRadius: 20, position: 'relative',
                     }}
-                  >{l}</button>
+                    aria-label={fresh ? `${l}, new from friends` : undefined}
+                  >{l}{fresh && (
+                    <span aria-hidden="true" style={{
+                      position: 'absolute', top: -2, right: -2, width: 8, height: 8, borderRadius: 8, background: C.overdueBar,
+                    }} />
+                  )}</button>
                 );
               })}
 
@@ -11364,6 +11533,14 @@ export default function PersonalCRM({ account = null } = {}) {
                 onExplore={catalogOn ? () => { setExplore([]); setView('explore'); } : null}
               />
             )}
+          </div>
+        )}
+
+        {view === 'feed' && catalogOn && (
+          <div className="crm-full">
+            <FeedView api={account.catalog} onSeen={sawFeed}
+              onCatalog={(id) => { setExplore([id]); setView('explore'); }}
+              onFriends={friendsOn ? () => setView('friends') : null} />
           </div>
         )}
 

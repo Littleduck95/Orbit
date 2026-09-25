@@ -499,6 +499,38 @@ engines see the generic page rather than the person. Proper previews need a
 host with rewrites and a server-rendered page or an Open Graph image per
 address.
 
+### The friends feed
+
+**Feed**, beside People once you are signed in with a username, is what your
+friends have been to and where they have been, newest first: every outing
+they share with Everyone or Friends ("Bea rated Chiefs vs Broncos", with the
+stars, what they thought, and the teams, artists and venues it links to),
+and the trips they show to friends or everyone (dates, places, highlight).
+Names link to that friend's page, and links to catalog pages. It comes 30 at
+a time, with *Load more*. Things one friend shared within two minutes of
+each other (a year of concerts linked in one go) are gathered: three show,
+then *N more from Bea*. With nothing in it yet, it says how it fills and
+offers *Find friends*.
+
+A red dot on the tab says friends have shared something since you last
+looked. The newest item's time is read when Orbit opens, and the newest you
+have seen is kept on this device (`orbit-feed-seen:<user id>`). Settings →
+Preferences can open Orbit on the feed.
+
+**Order.** The feed is ordered by when each thing was first shared, not by
+when it happened, the way a diary is. So the sharing functions now update
+each outing and trip where it is rather than replacing the lot: each keeps
+its `created_at` through every later sync, and `updated_at` only moves when
+something about it changed. Many things can be shared in the same moment,
+so pages carry on from the last item's time and id together, and nothing is
+skipped or repeated at a page break.
+
+**Who sees what.** Only friends' things, never a stranger's, even when
+shared with everyone (that is what Explore and pages are for), and never
+your own. A block ends the friendship and with it the feed; trips set back
+to Only me leave it at once. All of this is `friend_feed` in part 6 of
+`supabase/schema.sql`.
+
 ### Preferences and notifications
 
 **Settings → Preferences** holds the theme, which tab Orbit opens on, and

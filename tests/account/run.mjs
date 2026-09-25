@@ -67,7 +67,7 @@ const session = () => ({
  * already in use. Sign-ups, password logins, resets and profile changes are
  * all recorded on db for the checks to look at.
  */
-const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = signedIn ? PROFILE : null, taken = ['bea'], others = [], catalog = [], pages = {}, publicPages = {} } = {}) => {
+const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = signedIn ? PROFILE : null, taken = ['bea'], others = [], catalog = [], pages = {}, publicPages = {}, feed = [] } = {}) => {
   const db = {
     rows: new Map(Object.entries(rows).map(([u, kv]) => [u, new Map(Object.entries(kv))])), down: false, calls: [], profile, taken: new Set(taken),
     // Other people, as the friends functions hand them out: each with how
@@ -78,6 +78,8 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
     catalog: catalog.map((e) => ({ ...e })), pages: { ...pages }, synced: [], wikidata: [],
     // People's pages by username, and every set of trips the app has shown.
     publicPages: { ...publicPages }, tripsSynced: [], asked: [],
+    // Friends' outings and trips as friend_feed hands them out, newest first.
+    feed: feed.map((x) => ({ ...x })), feedAsked: [],
   };
   const mine = () => {
     if (!db.rows.has(USER.id)) db.rows.set(USER.id, new Map());
@@ -167,6 +169,12 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
       db.asked.push({ ...a, signedIn: Boolean(req.headers().authorization?.includes('test-access')) });
       const pg = db.publicPages[a.uname];
       return r.fulfill({ status: 200, headers, body: JSON.stringify(pg ? { ...pg, year: a.p_year } : null) });
+    }
+    if (u.pathname === '/rest/v1/rpc/friend_feed') {
+      const a = JSON.parse(req.postData() || '{}');
+      db.feedAsked.push(a);
+      const from = a.p_before_id ? db.feed.findIndex((x) => x.id === a.p_before_id) + 1 : 0;
+      return r.fulfill({ status: 200, headers, body: JSON.stringify(db.feed.slice(from, from + (a.lim || 30))) });
     }
     if (u.pathname === '/rest/v1/rpc/sync_trips') {
       db.tripsSynced.push(JSON.parse(req.postData()).items);
@@ -281,6 +289,72 @@ const localKeys = (page) => page.evaluate(() => Object.keys(localStorage).filter
 const shown = (loc) => loc.waitFor({ timeout: 8000 }).then(() => true, () => false);
 
 const scenarios = {
+  async 'the friends feed'() {
+    const CHIEFS = { id: '00000000-0000-4000-8000-00000000c41f', kind: 'team', name: 'Kansas City Chiefs', about: 'NFL team', source: 'wikidata', source_id: 'Q223455' };
+    const at = (min) => new Date(Date.now() - min * 60000).toISOString();
+    const bea = { username: 'bea', display_name: 'Bea Reads' };
+    const dora = { username: 'dora', display_name: 'Dora Diaz' };
+    const FEED = [
+      { id: 'b:o:1', type: 'outing', at: at(5), by: bea, kind: 'Sports', title: 'Chiefs vs Broncos', date: '2026-09-14', rating: 4.5, review: 'Loudest crowd yet.', links: [CHIEFS] },
+      // Dora linked a pile of old concerts at once.
+      ...Array.from({ length: 6 }, (_, i) => ({ id: `d:o:${i}`, type: 'outing', at: at(90), by: dora, kind: 'Concert', title: `Old show ${i + 1}`, date: '2019-06-01', rating: null, review: '', links: [] })),
+      { id: 'b:t:1', type: 'trip', at: at(60 * 30), by: bea, title: 'Lisbon', start: '2025-05-10', end: '2025-05-17', rating: 4, highlight: 'Tram 28 at dawn.',
+        stops: [{ name: 'Lisbon', lat: 38.72, lng: -9.14, country: 'Portugal', state: '' }] },
+      ...Array.from({ length: 30 }, (_, i) => ({ id: `b:o:old${i}`, type: 'outing', at: at(60 * 24 * 10 + i * 60), by: bea, kind: 'Theater', title: `Play ${i + 1}`, date: '2025-01-01', rating: 3, review: '', links: [] })),
+    ];
+    const { page, db, problems, close } = await newPage({
+      signedIn: true, profile: { ...PROFILE, visibility: {}, public_page: false },
+      rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } },
+      catalog: [CHIEFS], feed: FEED,
+    });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    const tab = page.getByRole('button', { name: 'Feed, new from friends' });
+    check('a Feed tab, marked when friends have shared something new', await shown(tab));
+    await tab.click();
+    check('the feed shows what friends rated, newest first', await shown(page.getByRole('heading', { name: 'Feed' }))
+      && (await page.locator('article').first().innerText()).includes('Chiefs vs Broncos'));
+    const first = (await page.locator('article').first().innerText()).replace(/\s+/g, ' ');
+    check('with who, what they did, when, the stars and what they thought', /Bea Reads rated/.test(first) && /5 min ago/.test(first)
+      && /Loudest crowd yet\./.test(first) && await page.locator('article').first().getByRole('img', { name: '4.5 out of 5 stars' }).isVisible(), first);
+    check('their name links to their page', (await page.getByRole('link', { name: 'Bea Reads' }).first().getAttribute('href')) === '/u/bea');
+    check('a pile shared at once is gathered: three, then the rest on asking', await page.getByText('Old show 3').isVisible()
+      && !(await page.getByText('Old show 4').isVisible()) && await page.getByRole('button', { name: '3 more from Dora' }).isVisible());
+    await page.getByRole('button', { name: '3 more from Dora' }).click();
+    check('which shows them', await page.getByText('Old show 6').isVisible());
+    const trip = (await page.locator('article', { hasText: 'Lisbon' }).innerText()).replace(/\s+/g, ' ');
+    check('trips show too, with their dates, places and highlight', /Bea Reads went to/.test(trip) && /May 10–17, 2025/.test(trip)
+      && /Tram 28 at dawn\./.test(trip) && /Lisbon/.test(trip), trip);
+    check('a page at a time', db.feedAsked[db.feedAsked.length - 1]?.lim === 30 && !(await page.getByText('Play 30').isVisible()));
+    await page.getByRole('button', { name: 'Load more' }).click();
+    check('Load more carries on from the last one', await shown(page.getByText('Play 30'))
+      && db.feedAsked[db.feedAsked.length - 1]?.p_before_id === FEED[29].id, db.feedAsked[db.feedAsked.length - 1]);
+    check('the mark goes once the feed has been seen', !(await page.getByRole('button', { name: 'Feed, new from friends' }).isVisible())
+      && await page.getByRole('button', { name: 'Feed', exact: true }).isVisible());
+    await page.getByRole('button', { name: 'Open Kansas City Chiefs' }).click();
+    check('a team links to its page', await shown(page.getByRole('heading', { name: 'Kansas City Chiefs', level: 1 })));
+    await page.reload();
+    await shown(page.getByText("Sam's Orbit"));
+    await page.waitForTimeout(500);
+    check('and stays gone after a reload', await page.getByRole('button', { name: 'Feed', exact: true }).isVisible()
+      && !(await page.getByRole('button', { name: 'Feed, new from friends' }).isVisible()));
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
+  async 'an empty feed'() {
+    const { page, problems, close } = await newPage({ signedIn: true, profile: { ...PROFILE, visibility: {}, public_page: false }, rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } } });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    await page.getByRole('button', { name: 'Feed', exact: true }).click();
+    check('says how the feed fills, and offers to find friends', await shown(page.getByText('Nothing from friends yet.', { exact: false }))
+      && await page.getByRole('button', { name: 'Find friends' }).isVisible());
+    await page.getByRole('button', { name: 'Find friends' }).click();
+    check('which opens Friends', await shown(page.getByRole('heading', { name: 'Friends' })));
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
   async 'a public page, signed out'() {
     const CHIEFS = { id: '00000000-0000-4000-8000-00000000c41f', kind: 'team', name: 'Kansas City Chiefs', about: 'NFL team', source: 'wikidata', source_id: 'Q223455' };
     const BROCK = {

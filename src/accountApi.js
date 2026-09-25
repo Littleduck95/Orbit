@@ -262,6 +262,11 @@ export const catalogApi = (client) => ({
   page: (id) => catalogRpc(client, 'catalog_page', { p_id: id }),
   sync: (items) => catalogRpc(client, 'sync_outings', { items }),
   syncTrips: (items) => catalogRpc(client, 'sync_trips', { items }),
+  // Friends' outings and trips, newest first (friend_feed, schema part 6).
+  // after: the last item of the page before, to carry on from it.
+  feed: async (after = null, lim = 30) => (await catalogRpc(client, 'friend_feed', {
+    p_before_at: after?.at || null, p_before_id: after?.id || null, lim,
+  })) || [],
 });
 
 // What anyone, signed in or not, can ask for: a person's page (see
