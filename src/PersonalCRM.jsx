@@ -10279,7 +10279,7 @@ function FriendsView({ account, startWith, onStarted, onSaveToPeople, onCount, o
 
 /* ---------- settings: preferences ---------- */
 const START_KEY = 'crm-start-v1';
-const START_VIEWS = [['list', 'People'], ['feed', 'Feed'], ['events', 'Events'], ['reminders', 'Reminders'], ['collections', 'Lists'], ['trips', 'Trips'], ['recap', 'Recap']];
+const START_VIEWS = [['feed', 'Feed'], ['list', 'People'], ['events', 'Events'], ['trips', 'Trips'], ['collections', 'Lists'], ['reminders', 'Reminders'], ['recap', 'Recap']];
 const hourLabel = (h) => `${h % 12 === 0 ? 12 : h % 12}${h < 12 ? 'am' : 'pm'}`;
 const HOURS = Array.from({ length: 24 }, (_, h) => [h, hourLabel(h)]);
 const BIRTHDAY_LEADS = [[0, 'On the day'], [1, 'The day before'], [3, '3 days before'], [7, 'A week before'], [14, 'Two weeks before']];
@@ -11155,6 +11155,10 @@ export default function PersonalCRM({ account = null } = {}) {
   // the last set sent is kept on this device so an unchanged set is not sent
   // again. A failure is quiet: the next change, or the next visit, tries again.
   const catalogOn = Boolean(account?.catalog && account.profile);
+  // The header reads as the account's first name when there is one, else the
+  // name typed for this device.
+  const accountName = (account?.profile?.display_name || '').trim().split(/\s+/)[0];
+  const titleName = accountName || owner;
   const sharedOutings = useMemo(() => JSON.stringify(outingsToShare(events, OUTING_KINDS, todayStr())), [events]);
   useEffect(() => {
     if (!catalogOn || loading || !eventsRead.current) return undefined;
@@ -11774,21 +11778,27 @@ export default function PersonalCRM({ account = null } = {}) {
           ) : (
             <button
               className="crm-btn"
-              onClick={() => setNamingOwner(true)}
-              title="Set your name"
+              onClick={() => {
+                // With an account the name is the account's, set in Settings,
+                // and your Orbit is your feed. Without one it names this device.
+                if (!accountName) { setNamingOwner(true); return; }
+                setView(catalogOn ? 'feed' : 'list'); setMenuOpen(false); setEventDraft(null); setReminderDraft(null);
+                setCollectionDraft(null); setCollectionOpen(null); setTripDraft(null); setTripOpen(null);
+              }}
+              title={accountName ? (catalogOn ? 'Your feed' : 'People') : 'Set your name'}
               style={{
                 font: 'inherit', fontSize: 14, fontWeight: 600, letterSpacing: '0.08em',
                 textTransform: 'uppercase', color: C.ink, background: 'transparent',
                 border: 'none', padding: 0, cursor: 'pointer',
               }}
             >
-              {owner ? `${owner}${/s$/i.test(owner) ? "'" : "'s"} Orbit` : 'Orbit'}
+              {titleName ? `${titleName}${/s$/i.test(titleName) ? "'" : "'s"} Orbit` : 'Orbit'}
             </button>
           )}
           {!loading && (
             <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
-              {[['list', 'People'], ...(catalogOn ? [['feed', 'Feed']] : []), ['events', 'Events'], ['reminders', 'Reminders'],
-                ['collections', 'Lists'], ['trips', 'Trips'], ['recap', 'Recap']].map(([v, l]) => {
+              {[...(catalogOn ? [['feed', 'Feed']] : []), ['list', 'People'], ['events', 'Events'], ['trips', 'Trips'],
+                ['collections', 'Lists'], ['reminders', 'Reminders'], ['recap', 'Recap']].map(([v, l]) => {
                 const on = view === v;
                 const fresh = v === 'feed' && feedFresh && !on;
                 return (
@@ -11853,24 +11863,8 @@ export default function PersonalCRM({ account = null } = {}) {
                       boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
                     }}
                   >
-                    {[...(friendsOn ? [['friends', friendCount ? `Friends (${friendCount})` : 'Friends']] : []), ['settings', 'Settings'], ['import', 'Import'], ['export', 'Export'], ['backup', 'Backup file'], ...(usageAdmin ? [['usage', 'Usage']] : [])].map(([v, l], i) => (
-                      <button
-                        key={v}
-                        className="crm-btn"
-                        onClick={() => {
-                          setView(v); setMenuOpen(false); setEventDraft(null); setReminderDraft(null);
-                          setCollectionDraft(null); setTripDraft(null);
-                        }}
-                        style={{
-                          display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
-                          fontSize: 13.5, fontWeight: 600, color: C.ink, cursor: 'pointer',
-                          padding: '10px 13px', background: 'transparent', border: 'none',
-                          borderTop: i ? `1px solid ${C.line}` : 'none',
-                        }}
-                      >{l}</button>
-                    ))}
                     {account && (
-                      <div style={{ borderTop: `1px solid ${C.line}` }}>
+                      <div style={{ borderBottom: `1px solid ${C.line}` }}>
                         <p style={{
                           margin: 0, padding: '9px 13px 0', fontSize: 12, color: C.muted,
                           maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
@@ -11891,6 +11885,22 @@ export default function PersonalCRM({ account = null } = {}) {
                         >Sign out</button>
                       </div>
                     )}
+                    {[...(friendsOn ? [['friends', friendCount ? `Friends (${friendCount})` : 'Friends']] : []), ['settings', 'Settings'], ['import', 'Import'], ['export', 'Export'], ['backup', 'Backup file'], ...(usageAdmin ? [['usage', 'Usage']] : [])].map(([v, l], i) => (
+                      <button
+                        key={v}
+                        className="crm-btn"
+                        onClick={() => {
+                          setView(v); setMenuOpen(false); setEventDraft(null); setReminderDraft(null);
+                          setCollectionDraft(null); setTripDraft(null);
+                        }}
+                        style={{
+                          display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
+                          fontSize: 13.5, fontWeight: 600, color: C.ink, cursor: 'pointer',
+                          padding: '10px 13px', background: 'transparent', border: 'none',
+                          borderTop: i ? `1px solid ${C.line}` : 'none',
+                        }}
+                      >{l}</button>
+                    ))}
                   </div>
                 )}
               </div>
