@@ -11866,23 +11866,14 @@ export default function PersonalCRM({ account = null } = {}) {
                     {account && (
                       <div style={{ borderBottom: `1px solid ${C.line}` }}>
                         <p style={{
-                          margin: 0, padding: '9px 13px 0', fontSize: 12, color: C.muted,
+                          margin: 0, padding: account.profile ? '9px 13px 0' : '9px 13px', fontSize: 12, color: C.muted,
                           maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                         }} title={account.email}>{account.profile ? `@${account.profile.username}` : account.email || 'Signed in'}</p>
                         {account.profile && (
                           <a href={profilePath(account.profile.username)} onClick={() => setMenuOpen(false)} style={{
-                            display: 'block', padding: '4px 13px 0', fontSize: 13.5, fontWeight: 600, color: C.ink, textDecoration: 'none',
+                            display: 'block', padding: '6px 13px 10px', fontSize: 13.5, fontWeight: 600, color: C.ink, textDecoration: 'none',
                           }}>Your page</a>
                         )}
-                        <button
-                          className="crm-btn"
-                          onClick={() => { setMenuOpen(false); account.signOut(); }}
-                          style={{
-                            display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
-                            fontSize: 13.5, fontWeight: 600, color: C.ink, cursor: 'pointer',
-                            padding: '4px 13px 10px', background: 'transparent', border: 'none',
-                          }}
-                        >Sign out</button>
                       </div>
                     )}
                     {[...(friendsOn ? [['friends', friendCount ? `Friends (${friendCount})` : 'Friends']] : []), ['settings', 'Settings'], ['import', 'Import'], ['export', 'Export'], ['backup', 'Backup file'], ...(usageAdmin ? [['usage', 'Usage']] : [])].map(([v, l], i) => (
@@ -11901,6 +11892,20 @@ export default function PersonalCRM({ account = null } = {}) {
                         }}
                       >{l}</button>
                     ))}
+                    {account && (
+                      // Kept apart from Your page, at the foot of the menu and in
+                      // red, so it is hard to hit by mistake.
+                      <button
+                        className="crm-btn"
+                        onClick={() => { setMenuOpen(false); account.signOut(); }}
+                        style={{
+                          display: 'block', width: '100%', textAlign: 'left', font: 'inherit',
+                          fontSize: 13.5, fontWeight: 600, color: C.overdue, cursor: 'pointer',
+                          padding: '10px 13px', marginTop: 6, background: 'transparent', border: 'none',
+                          borderTop: `1px solid ${C.line}`,
+                        }}
+                      >Sign out</button>
+                    )}
                   </div>
                 )}
               </div>
