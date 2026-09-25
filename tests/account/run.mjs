@@ -299,7 +299,7 @@ const scenarios = {
 
   async 'trips save to the account; their photos stay on this device'() {
     const { page, mine, problems, close } = await newPage({ signedIn: true, rows: { [USER.id]: { 'crm-owner-v1': 'Robin' } } });
-    await page.route('https://tile.openstreetmap.org/**', (r) => r.abort());
+    await page.route('https://tiles.stadiamaps.com/**', (r) => r.abort());
     await page.goto(url);
     await shown(page.getByText("Robin's Orbit"));
     await page.getByRole('button', { name: 'Trips', exact: true }).click();

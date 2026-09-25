@@ -90,7 +90,7 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
   // ---- edit an entry ----
   await page.getByRole('button', { name: /^Severance$/ }).click();
   await page.getByLabel('Where to watch').fill('Apple TV');
-  await page.getByRole('button', { name: '4 out of 5' }).click();
+  await page.getByRole('radio', { name: '4 stars' }).check({ force: true });
   await page.getByLabel('Recommended by').selectOption({ label: 'Dana Whitfield' });
   await page.getByLabel('Link').fill('javascript:alert(1)');
   await page.getByRole('button', { name: 'Save', exact: true }).click();

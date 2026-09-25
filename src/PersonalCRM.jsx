@@ -19,6 +19,7 @@ const THEMES = {
     overdue: '#A8362A', overdueBar: '#D2543F', overdueSoft: '#F8E5E1',
     rowHover: '#F2F9F4',
     sky: 'none',
+    dark: false,
   },
   // Deep space. The same green reads as telemetry against navy, and every
   // colour below was checked for contrast on the dark surface.
@@ -30,6 +31,7 @@ const THEMES = {
     soonText: '#F2C75C', soonBar: '#F2C75C',
     overdue: '#FF9585', overdueBar: '#FF6B57', overdueSoft: '#3A1D19',
     rowHover: '#17223A',
+    dark: true,
     sky: 'radial-gradient(1px 1px at 12% 18%, #ffffff55, transparent),'
        + 'radial-gradient(1px 1px at 34% 62%, #ffffff44, transparent),'
        + 'radial-gradient(1px 1px at 58% 12%, #ffffff55, transparent),'
@@ -2108,7 +2110,7 @@ const cleanItem = (raw, seen) => {
     title,
     detail: clip(raw.detail, TITLE_CAP),
     status,
-    rating: Math.min(5, Math.max(0, Math.round(Number(raw.rating) || 0))),
+    rating: halfStep(raw.rating),
     link: safeLink(raw.link),
     note: clip(raw.note, NOTE_CAP),
     from: clip(raw.from, 40) || null,
@@ -2198,7 +2200,18 @@ const withStatus = (it, status) => ({
   doneOn: status === 'done' ? (it.status === 'done' && it.doneOn ? it.doneOn : todayStr()) : null,
 });
 
-const stars = (n) => '★'.repeat(n) + '☆'.repeat(5 - n);
+// Ratings go from half a star to five in half steps: ten steps in all. A
+// whole number is a rating from before halves existed and means the same now,
+// so nothing saved, backed up or shared needs converting.
+const halfStep = (n) => Math.min(5, Math.max(0, Math.round((Number(n) || 0) * 2) / 2));
+const isRating = (n) => typeof n === 'number' && Number.isInteger(n * 2) && n >= 0.5 && n <= 5;
+const starWord = (n) => `${n} star${n === 1 ? '' : 's'}`;
+
+const stars = (n) => {
+  const full = Math.floor(n);
+  const half = n - full ? 1 : 0;
+  return '★'.repeat(full) + (half ? '½' : '') + '☆'.repeat(5 - full - half);
+};
 
 // Plain text anyone can read, for a message, an email or a note. Grouped by
 // stage when progress is included, because "Watched ★★★★★" is the part a
@@ -3522,7 +3535,7 @@ const cleanTrip = (raw) => {
     stops,
     startDate: start,
     endDate: end,
-    rating: Number.isInteger(raw.rating) && raw.rating >= 1 && raw.rating <= 5 ? raw.rating : null,
+    rating: isRating(raw.rating) ? raw.rating : null,
     excerpt: clip(raw.excerpt, EXCERPT_CAP),
     notes: clip(raw.notes, TRIP_NOTES_CAP),
     companions: idList(raw.companions, 500),
@@ -3575,10 +3588,12 @@ const tripFilterOptions = (trips) => ({
 
 // Pins on the map run from red for a trip you would not repeat to deep green
 // for a favourite, with the rating written on each, so colour is never the
-// only way to tell. They sit on light map tiles in both themes, so these do
-// not change with the theme. Each carries white text at 4.5:1 or better.
+// only way to tell. A half star shares its whole star's colour (4.5 is a 4),
+// and half a star counts with one. The white ring keeps them apart from light
+// and dark tiles alike, so these do not change with the theme. Each carries
+// white text at 4.5:1 or better.
 const RATING_COLORS = ['#56655C', '#B42318', '#B04A0C', '#8A6208', '#2C7A3B', '#145A32'];
-const ratingColor = (r) => RATING_COLORS[r || 0] || RATING_COLORS[0];
+const ratingColor = (r) => (r ? RATING_COLORS[Math.max(1, Math.floor(r))] || RATING_COLORS[0] : RATING_COLORS[0]);
 
 // One point per stop.
 const tripPoints = (trips) => trips.flatMap((t) => t.stops.map((s, i) => ({
@@ -4801,45 +4816,35 @@ function StageMark({ stage, size = 20 }) {
   );
 }
 
-function StarRow({ n, size = 11 }) {
+// How much of star i a rating of n fills: all, half or none.
+const starFill = (n, i) => (n >= i ? 1 : n >= i - 0.5 ? 0.5 : 0);
+
+// One star, whole, half or empty. A half star is the whole one's outline with
+// its left half filled in.
+function StarGlyph({ fill, size, on, off = on, stroke = 1.3 }) {
+  const shape = (filled) => (
+    <svg width={size} height={size} viewBox="0 0 16 16" style={{ display: 'block' }}>
+      <path d={STAR_PATH} fill={filled ? on : 'none'} stroke={fill ? on : off} strokeWidth={stroke} strokeLinejoin="round" />
+    </svg>
+  );
   return (
-    <span role="img" aria-label={`Rated ${n} of 5`}
-      style={{ display: 'inline-flex', gap: 1, color: C.soonText, flexShrink: 0 }}>
-      {[1, 2, 3, 4, 5].map((i) => (
-        <svg key={i} width={size} height={size} viewBox="0 0 16 16" aria-hidden="true">
-          <path d={STAR_PATH} fill={i <= n ? 'currentColor' : 'none'}
-            stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-        </svg>
-      ))}
+    <span aria-hidden="true" style={{ position: 'relative', display: 'inline-block', width: size, height: size, flexShrink: 0 }}>
+      {shape(fill === 1)}
+      {fill === 0.5 && (
+        <span style={{ position: 'absolute', left: 0, top: 0, width: size / 2, height: size, overflow: 'hidden' }}>
+          {shape(true)}
+        </span>
+      )}
     </span>
   );
 }
 
-function StarPicker({ value, onChange }) {
+function StarRow({ n, size = 11 }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap' }}>
-      {[1, 2, 3, 4, 5].map((i) => (
-        <button
-          key={i}
-          className="crm-btn"
-          onClick={() => onChange(i === value ? 0 : i)}
-          aria-label={`${i} out of 5`}
-          aria-pressed={i === value}
-          style={{
-            background: 'transparent', border: 'none', padding: 5, cursor: 'pointer', lineHeight: 0,
-            color: i <= value ? C.soonText : C.faint,
-          }}
-        >
-          <svg width="22" height="22" viewBox="0 0 16 16" aria-hidden="true">
-            <path d={STAR_PATH} fill={i <= value ? 'currentColor' : 'none'}
-              stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-          </svg>
-        </button>
-      ))}
-      <span style={{ fontSize: 12, color: C.faint, marginLeft: 8 }}>
-        {value ? 'Tap the same star again to clear it.' : 'Not rated.'}
-      </span>
-    </div>
+    <span role="img" aria-label={`Rated ${n} of 5`}
+      style={{ display: 'inline-flex', gap: 1, flexShrink: 0, alignSelf: 'center' }}>
+      {[1, 2, 3, 4, 5].map((i) => <StarGlyph key={i} fill={starFill(n, i)} size={size} on={C.soonText} />)}
+    </span>
   );
 }
 
@@ -5070,9 +5075,7 @@ function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
         </Group>
       )}
 
-      <Group label="Your rating">
-        <StarPicker value={rating} onChange={setRating} />
-      </Group>
+      <StarInput label="Your rating" value={rating || null} onChange={(v) => setRating(v || 0)} />
 
       {people.length > 0 && (
         <Field label="Recommended by">
@@ -5953,7 +5956,7 @@ function RatingLegend() {
             width: 18, height: 18, borderRadius: 18, background: ratingColor(r), color: '#fff',
             fontSize: 10.5, fontWeight: 700, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
           }}>{r || ''}</span>
-          {r ? `${r} star${r === 1 ? '' : 's'}` : 'Not rated'}
+          {r === 5 ? '5 stars' : r ? `${r === 1 ? 0.5 : r} to ${r + 0.5} stars` : 'Not rated'}
         </span>
       ))}
     </div>
@@ -6112,30 +6115,43 @@ function Stars({ n, size = 13.5 }) {
   if (!n) return null;
   return (
     <span role="img" aria-label={`${n} out of 5 stars`}
-      style={{ color: C.soonBar, fontSize: size, letterSpacing: '0.06em', whiteSpace: 'nowrap' }}>
-      {stars(n)}
+      style={{ display: 'inline-flex', gap: 1.5, alignSelf: 'center', whiteSpace: 'nowrap' }}>
+      {[1, 2, 3, 4, 5].map((i) => <StarGlyph key={i} fill={starFill(n, i)} size={Math.round(size * 0.92)} on={C.soonBar} />)}
     </span>
   );
 }
 
-// Five radio buttons dressed as stars, so arrow keys and screen readers work
-// the way they do on any other choice. "Not rated" is a choice too.
-function StarInput({ value, onChange }) {
+// Ten radio buttons dressed as five stars, the left half of each star for the
+// half step, so arrow keys and screen readers work the way they do on any
+// other choice. "Not rated" is a choice too, and gives back null.
+function StarInput({ value, onChange, label = 'Rating' }) {
   const [hover, setHover] = useState(0);
   const name = useId();
   const shown = hover || value || 0;
   return (
     <fieldset style={{ border: 'none', margin: '0 0 14px', padding: 0, minWidth: 0 }}>
-      <legend style={{ fontSize: 13, color: C.muted, marginBottom: 5, fontWeight: 500, padding: 0 }}>Rating</legend>
-      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 2 }} onMouseLeave={() => setHover(0)}>
-        {[1, 2, 3, 4, 5].map((n) => (
-          <label key={n} className="crm-star" onMouseEnter={() => setHover(n)} style={{ cursor: 'pointer', padding: '2px 3px', position: 'relative' }}>
-            <input type="radio" name={name} value={n} checked={value === n} onChange={() => onChange(n)}
-              className="crm-sr" aria-label={`${n} star${n === 1 ? '' : 's'}`} />
-            <span aria-hidden="true" style={{ display: 'inline-block', fontSize: 28, lineHeight: 1, color: n <= shown ? C.soonBar : C.line }}>★</span>
-          </label>
-        ))}
-        <label className="crm-star" style={{ cursor: 'pointer', marginLeft: 8, position: 'relative' }}>
+      <legend style={{ fontSize: 13, color: C.muted, marginBottom: 5, fontWeight: 500, padding: 0 }}>{label}</legend>
+      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 2 }}>
+        <span style={{ display: 'inline-flex', gap: 2 }} onMouseLeave={() => setHover(0)}>
+          {[1, 2, 3, 4, 5].map((i) => (
+            <span key={i} style={{ position: 'relative', display: 'inline-block', padding: '2px 3px' }}>
+              <StarGlyph fill={starFill(shown, i)} size={28} on={C.soonBar} off={C.faint} stroke={1.1} />
+              {[i - 0.5, i].map((v) => (
+                <label key={v} className="crm-star" onMouseEnter={() => setHover(v)} style={{
+                  position: 'absolute', top: 0, bottom: 0, left: v === i ? '50%' : 0, width: '50%', cursor: 'pointer',
+                }}>
+                  <input type="radio" name={name} value={v} checked={value === v} onChange={() => onChange(v)}
+                    className="crm-sr" aria-label={starWord(v)} />
+                  <span aria-hidden="true" style={{ display: 'block', height: '100%' }} />
+                </label>
+              ))}
+            </span>
+          ))}
+        </span>
+        <span aria-hidden="true" style={{ fontSize: 13, color: C.muted, minWidth: 34, marginLeft: 6, fontVariantNumeric: 'tabular-nums' }}>
+          {shown ? `${shown} / 5` : ''}
+        </span>
+        <label className="crm-star" style={{ cursor: 'pointer', marginLeft: 4, position: 'relative' }}>
           <input type="radio" name={name} value="0" checked={!value} onChange={() => onChange(null)} className="crm-sr" />
           <span style={{ ...filterChip(!value), display: 'inline-block' }}>Not rated</span>
         </label>
@@ -6286,7 +6302,7 @@ function PinDrop({ stops, onAdd }) {
     <div>
       <div style={mapFrame()}>
         <MapSlot height={300} render={(m) => (
-          <m.PickMap stops={stops} pending={pending} onPick={pick} stopColor={RATING_COLORS[5]} pendingColor={RATING_COLORS[1]} />
+          <m.PickMap stops={stops} pending={pending} onPick={pick} stopColor={RATING_COLORS[5]} pendingColor={RATING_COLORS[1]} dark={C.dark} />
         )} />
       </div>
       {pending ? (
@@ -7085,7 +7101,7 @@ const TripCard = memo(function TripCard({ trip, onOpen }) {
           }}>
             <span style={{
               width: 28, height: 28, borderRadius: 28, background: ratingColor(trip.rating), color: '#fff',
-              fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: Number.isInteger(trip.rating) ? 13 : 10.5, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center',
             }}>{trip.rating || ''}</span>
           </span>
         )} />
@@ -7180,20 +7196,22 @@ function EventsOffer({ events, onConvert, onDismiss }) {
 }
 
 // The same box Import has, since a trip arrives the same ways anything
-// shared does. Whatever is opened goes where its kind belongs.
-function AddSharedTrip({ onOpen }) {
-  const [open, setOpen] = useState(false);
-  if (!open) {
-    return (
-      <button className="crm-btn" onClick={() => setOpen(true)} style={{ ...textButton(), fontSize: 13, color: C.muted }}>
-        Add a shared trip
-      </button>
-    );
-  }
+// shared does. Whatever is opened goes where its kind belongs. Opened from
+// the button beside "Add a trip".
+function AddSharedTrip({ onOpen, onClose }) {
   return (
-    <div className="crm-open" style={{ maxWidth: 560 }}>
-      <OpenShared onOpen={(got) => { setOpen(false); onOpen(got); }} />
-      <Button onClick={() => setOpen(false)} style={{ ...small, marginTop: -8 }}>Cancel</Button>
+    <div id="add-shared-trip" className="crm-open" style={{ margin: '0 0 14px', maxWidth: 560 }}>
+      <OpenShared onOpen={(got) => { onClose(); onOpen(got); }} />
+      <Button onClick={onClose} style={{ ...small, marginTop: -8 }}>Cancel</Button>
+    </div>
+  );
+}
+
+// The trips as cards, newest first: under the map, or on their own as the list.
+function TripCards({ trips, onOpen }) {
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(300px, 100%), 1fr))', gap: 10 }}>
+      {trips.map((t) => <TripCard key={t.id} trip={t} onOpen={onOpen} />)}
     </div>
   );
 }
@@ -7204,6 +7222,7 @@ function TripsView({
 }) {
   const [mode, setMode] = useState(look.current.mode);
   const [f, setF] = useState(look.current.filter);
+  const [addingShared, setAddingShared] = useState(false);
   useEffect(() => { look.current = { mode, filter: f }; }, [look, mode, f]);
 
   const opts = useMemo(() => tripFilterOptions(trips), [trips]);
@@ -7234,7 +7253,9 @@ function TripsView({
     head = narrowed
       ? `${countThings(shown.length, 'trip', 'trips')} of ${trips.length}`
       : `${countThings(trips.length, 'trip', 'trips')}, ${countThings(places, 'place', 'places').toLowerCase()}`;
-    sub = mode === 'map' ? 'Tap a pin for the trip. Pins close together gather into a circle; tap it to zoom in.' : 'Newest first.';
+    sub = mode === 'map'
+      ? 'Tap a pin for the trip, or scroll down for your latest. Pins close together gather into a circle; tap it to zoom in.'
+      : 'Newest first.';
   }
 
   return (
@@ -7272,8 +7293,15 @@ function TripsView({
             ))}
           </div>
         )}
-        <Button kind="solid" onClick={onNew} style={{ marginLeft: 'auto' }}>Add a trip</Button>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginLeft: 'auto' }}>
+          <Button onClick={() => setAddingShared((o) => !o)} aria-expanded={addingShared} aria-controls="add-shared-trip">
+            Add a shared trip
+          </Button>
+          <Button kind="solid" onClick={onNew}>Add a trip</Button>
+        </div>
       </div>
+
+      {addingShared && <AddSharedTrip onOpen={onOpenShared} onClose={() => setAddingShared(false)} />}
 
       {trips.length > 0 && (
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '0 0 12px' }}>
@@ -7283,7 +7311,7 @@ function TripsView({
           </select>
           <select className="crm-select" aria-label="Rating" value={live.minRating} onChange={(e) => set('minRating', Number(e.target.value))} style={pick}>
             <option value={0}>Any rating</option>
-            {[1, 2, 3, 4].map((r) => <option key={r} value={r}>{`${r} star${r === 1 ? '' : 's'} and up`}</option>)}
+            {[1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5].map((r) => <option key={r} value={r}>{`${starWord(r)} and up`}</option>)}
             <option value={5}>5 stars only</option>
           </select>
           {companionOptions.length > 0 && (
@@ -7309,6 +7337,7 @@ function TripsView({
               <m.TripsMap
                 points={points}
                 height={mapHeight}
+                dark={C.dark}
                 renderPopup={(p) => {
                   const t = byId.get(p.tripId);
                   return t ? <TripPopup trip={t} stop={p.stop} onOpen={() => onOpen(t.id)} /> : null;
@@ -7339,6 +7368,14 @@ function TripsView({
             )}
           </div>
           {trips.length > 0 && <RatingLegend />}
+          {shown.length > 0 && (
+            <section aria-labelledby="recent-trips" style={{ marginTop: 26 }}>
+              <h2 id="recent-trips" style={{ margin: '0 0 10px', fontSize: 17, fontWeight: 600, letterSpacing: '-0.02em' }}>
+                {narrowed ? 'Matching trips' : 'Recent trips'}
+              </h2>
+              <TripCards trips={shown} onOpen={onOpen} />
+            </section>
+          )}
         </>
       ) : shown.length === 0 ? (
         <div style={{ padding: '18px 16px', border: `1px solid ${C.line}`, borderRadius: 12, background: C.surface }}>
@@ -7346,14 +7383,8 @@ function TripsView({
           <Button onClick={() => setF(NO_TRIP_FILTER)} style={small}>Clear filters</Button>
         </div>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 10 }}>
-          {shown.map((t) => <TripCard key={t.id} trip={t} onOpen={onOpen} />)}
-        </div>
+        <TripCards trips={shown} onOpen={onOpen} />
       )}
-
-      <div style={{ marginTop: 22 }}>
-        <AddSharedTrip onOpen={onOpenShared} />
-      </div>
     </div>
   );
 }
@@ -9449,9 +9480,21 @@ export default function PersonalCRM({ account = null } = {}) {
           outline: 2px solid ${C.ink}; outline-offset: 2px; border-radius: 6px;
         }
         .crm-clamp { -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-        /* Maps. The tiles are light in both themes; popups follow the theme. */
-        /* OpenStreetMap's sea colour, so any gap around the world reads as ocean. */
-        .orbit-map { font-family: inherit; background: #AAD3DF; }
+        /* Maps. Tiles, popups and controls all follow the theme. */
+        /* Close to the tiles' own sea, so any gap around the world reads as ocean. */
+        .orbit-map { font-family: inherit; background: ${C.dark ? '#1B1D20' : '#D6DCDE'}; }
+        .orbit-map .leaflet-bar { border: 1px solid ${C.line}; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.12); overflow: hidden; }
+        .orbit-map .leaflet-bar a {
+          width: 34px; height: 34px; line-height: 32px; font-size: 18px; font-weight: 500;
+          background: ${C.surface}; color: ${C.ink}; border-bottom: 1px solid ${C.line};
+        }
+        .orbit-map .leaflet-bar a:last-child { border-bottom: none; }
+        .orbit-map .leaflet-bar a:hover, .orbit-map .leaflet-bar a:focus-visible { background: ${C.rowHover}; color: ${C.ink}; }
+        .orbit-map .leaflet-bar a.leaflet-disabled { background: ${C.surface}; color: ${C.faint}; opacity: 0.5; }
+        .orbit-map .leaflet-control-attribution {
+          background: ${C.surface}cc; color: ${C.muted}; font-size: 10.5px; border-top-left-radius: 6px; padding: 1px 6px;
+        }
+        .orbit-map .leaflet-control-attribution a { color: ${C.muted}; }
         .orbit-map .leaflet-popup-content-wrapper, .orbit-map .leaflet-popup-tip {
           background: ${C.surface}; color: ${C.ink}; box-shadow: 0 6px 22px rgba(0,0,0,0.28);
         }

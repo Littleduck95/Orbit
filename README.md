@@ -174,13 +174,20 @@ Lists shared with the older links still open as before.
 ## Trips
 
 The Trips tab keeps the places you have been: a title, one or more stops, the
-dates, a rating out of five, a short highlight, longer notes, who went with
-you, tags, and up to 30 photos. It shows them on a map or as a list, newest
-first, and filters by year, rating, companion and tag.
+dates, a rating out of five stars in half steps, a short highlight, longer
+notes, who went with you, tags, and up to 30 photos. It shows them on a map
+with the trips as cards underneath, or as the cards alone, newest first, and
+filters by year, rating, companion and tag. "Add a shared trip" sits beside
+"Add a trip".
 
-**The map** is [Leaflet](https://leafletjs.com) with OpenStreetMap tiles and
-no API key. There is a pin for every stop, coloured by rating with the rating
-written on it, and nearby pins gather into numbered circles. Tapping a pin
+**Ratings**, on trips and list entries alike, go from half a star to five in
+half steps. A whole number means what it always did, so ratings saved, backed
+up or shared before halves existed read the same.
+
+**The map** is [Leaflet](https://leafletjs.com) with Stadia Maps' Alidade
+Smooth tiles, light or dark to match the theme. There is a pin for every stop,
+coloured by rating with the rating written on it (a half star shares its whole
+star's colour), and nearby pins gather into numbered circles. Tapping a pin
 opens the trip's title, dates, stars, highlight and first photo. The map frames
 every trip shown, and with none it shows the world and an offer to add one.
 
@@ -423,13 +430,16 @@ stays a number.
 
 ## Maps, place search, and cost
 
-Map tiles come from `tile.openstreetmap.org` and place search from
-`nominatim.openstreetmap.org`. Both are free and keyless, and both ask for
-light use: fine for one person's Orbit, but not for an app with many users.
-Each is one entry in [`src/mapConfig.js`](src/mapConfig.js). Moving to a
-commercial provider (MapTiler, Stadia Maps, LocationIQ, Geoapify all have
-free tiers and cheap paid plans) means changing that entry and adding the
-provider's key, restricted to the site's domain.
+Map tiles come from [Stadia Maps](https://stadiamaps.com) (Alidade Smooth,
+and Alidade Smooth Dark under the Orbit theme). Stadia recognises the live
+site by its domain, set on the property in the Stadia dashboard, so no key is
+in the code; `localhost` works without one. The free plan is for
+non-commercial use only; a commercial Orbit needs a paid plan.
+
+Place search still comes from `nominatim.openstreetmap.org`, which is free
+and keyless but asks for light use and no search-as-you-type: fine for one
+person's Orbit, but not for an app with many users. Both are entries in
+[`src/mapConfig.js`](src/mapConfig.js).
 
 When either service cannot be reached, the app says so and keeps working:
 place search points to the other two ways of adding a stop, and a map that

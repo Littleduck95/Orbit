@@ -83,7 +83,7 @@ const newPage = async ({ seed = {}, width = 1200, height = 900, clipboard = true
   // run. A scenario that wants answers routes it again (the newest route wins).
   await page.route('https://nominatim.openstreetmap.org/**', (r) => r.abort());
   // Map tiles: a blank tile, so maps draw without reaching the internet.
-  await page.route('https://tile.openstreetmap.org/**', (r) => r.fulfill({ contentType: 'image/png', body: BLANK_TILE }));
+  await page.route('https://tiles.stadiamaps.com/**', (r) => r.fulfill({ contentType: 'image/png', body: BLANK_TILE }));
   await page.route('https://fonts.googleapis.com/**', (r) => r.abort());
   if (Object.keys(seed).length) {
     await page.addInitScript((s) => {

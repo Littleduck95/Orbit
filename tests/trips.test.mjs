@@ -45,12 +45,21 @@ describe('the trip record', () => {
     assert.equal(trip({ endDate: 'soon' }).endDate, null);
   });
 
-  it('only keeps whole-star ratings from 1 to 5', () => {
+  it('keeps ratings from half a star to 5, in half steps', () => {
     assert.equal(trip({ rating: 0 }).rating, null);
     assert.equal(trip({ rating: 6 }).rating, null);
-    assert.equal(trip({ rating: 3.5 }).rating, null);
+    assert.equal(trip({ rating: 5.5 }).rating, null);
+    assert.equal(trip({ rating: 3.25 }).rating, null);
     assert.equal(trip({ rating: '4' }).rating, null);
-    assert.equal(trip({ rating: 5 }).rating, 5);
+    assert.equal(trip({ rating: 0.5 }).rating, 0.5);
+    assert.equal(trip({ rating: 3.5 }).rating, 3.5);
+    assert.equal(trip({ rating: 5 }).rating, 5, 'a whole-star rating from before halves reads the same');
+  });
+
+  it('writes half stars in plain text', () => {
+    assert.equal(A.stars(4.5), '★★★★½');
+    assert.equal(A.stars(0.5), '½☆☆☆☆');
+    assert.equal(A.stars(3), '★★★☆☆');
   });
 
   it('caps the highlight at 280 characters and a trip at 30 photos', () => {
@@ -113,6 +122,20 @@ describe('looking at trips', () => {
     assert.equal(pins.find((p) => p.tripId === 'a').color, A.RATING_COLORS[5]);
     assert.equal(porto[0].color, A.RATING_COLORS[0], 'unrated');
     assert.equal(porto[0].text, '');
+  });
+
+  it('gives a half star its whole star\'s colour, and half a star the colour of one', () => {
+    assert.equal(A.ratingColor(4.5), A.RATING_COLORS[4]);
+    assert.equal(A.ratingColor(1.5), A.RATING_COLORS[1]);
+    assert.equal(A.ratingColor(0.5), A.RATING_COLORS[1]);
+    assert.equal(A.ratingColor(null), A.RATING_COLORS[0]);
+    const half = A.tripPoints([trip({ id: 'h', rating: 3.5 })])[0];
+    assert.deepEqual([half.color, half.text], [A.RATING_COLORS[3], '3.5']);
+  });
+
+  it('filters by half-star minimum ratings', () => {
+    const rated = [trip({ id: 'x', rating: 4 }), trip({ id: 'y', rating: 4.5 })];
+    assert.equal(A.filterTrips(rated, { ...A.NO_TRIP_FILTER, minRating: 4.5 }).map((t) => t.id).join(), 'y');
   });
 
   it('says when a trip was, collapsing what repeats', () => {

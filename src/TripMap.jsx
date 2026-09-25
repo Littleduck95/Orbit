@@ -33,7 +33,8 @@ const pinIcon = (color, text, ring) => {
   if (!icons.has(key)) {
     icons.set(key, L.divIcon({
       className: 'orbit-pin',
-      html: `<span style="background:${escape(color)};${ring ? `box-shadow:0 0 0 3px ${escape(ring)};` : ''}">${escape(text)}</span>`,
+      // A half-star rating ("4.5") needs a smaller size to fit the pin.
+      html: `<span style="background:${escape(color)};${text.length > 2 ? 'font-size:10.5px;' : ''}${ring ? `box-shadow:0 0 0 3px ${escape(ring)};` : ''}">${escape(text)}</span>`,
       iconSize: [28, 28],
       iconAnchor: [14, 14],
       popupAnchor: [0, -14],
@@ -67,16 +68,18 @@ function FitToPoints({ points }) {
   return null;
 }
 
-function Tiles() {
-  return <TileLayer url={TILE_LAYER.url} attribution={TILE_LAYER.attribution} maxZoom={TILE_LAYER.maxZoom} />;
+// Light or dark tiles, following the app's theme.
+function Tiles({ dark }) {
+  return <TileLayer url={dark ? TILE_LAYER.dark : TILE_LAYER.light} attribution={TILE_LAYER.attribution} maxZoom={TILE_LAYER.maxZoom} />;
 }
 
 /*
  * points: [{ key, tripId, lat, lng, color, text, label }]
+ * dark: draw the dark tiles, for the Orbit theme.
  * renderPopup(point): the popup's contents. Only the open popup is drawn, so a
  * map with hundreds of pins does not load hundreds of thumbnails.
  */
-export function TripsMap({ points, renderPopup, height = 420, children }) {
+export function TripsMap({ points, renderPopup, height = 420, dark = false, children }) {
   const [openKey, setOpenKey] = useState(null);
   return (
     <MapContainer
@@ -87,7 +90,7 @@ export function TripsMap({ points, renderPopup, height = 420, children }) {
       style={{ height, width: '100%' }}
       className="orbit-map"
     >
-      <Tiles />
+      <Tiles dark={dark} />
       <FitToPoints points={points} />
       <ClusterGroup showCoverageOnHover={false} maxClusterRadius={46} iconCreateFunction={clusterIcon}>
         {points.map((p) => (
@@ -143,7 +146,7 @@ function FollowPending({ pending }) {
  * The trip form's map: tap anywhere to drop a pin. Stops already on the trip
  * show numbered; the pin being placed shows in the accent colour.
  */
-export function PickMap({ stops, pending, onPick, stopColor, pendingColor, height = 300 }) {
+export function PickMap({ stops, pending, onPick, stopColor, pendingColor, height = 300, dark = false }) {
   const numbered = useMemo(() => stops.map((s, i) => ({ ...s, n: i + 1 })), [stops]);
   return (
     <MapContainer
@@ -154,7 +157,7 @@ export function PickMap({ stops, pending, onPick, stopColor, pendingColor, heigh
       style={{ height, width: '100%', cursor: 'crosshair' }}
       className="orbit-map"
     >
-      <Tiles />
+      <Tiles dark={dark} />
       <FrameOnce stops={stops} />
       <FollowPending pending={pending} />
       <Picker onPick={onPick} />
