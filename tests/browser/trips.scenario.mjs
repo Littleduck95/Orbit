@@ -6,18 +6,20 @@ import path from 'node:path';
 const DANA = { id: 'dana', name: 'Dana Whitfield', circle: 'friend', tier: 'friend', cadence: 30, email: 'dana@example.com', log: [] };
 const SAM = { id: 'sam', name: 'Sam Ortiz', circle: 'friend', tier: 'friend', cadence: 30, log: [] };
 
+const place = (name, label, lat, lng) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [lng, lat] }, properties: { name, label } });
 const PLACES = {
-  lisbon: [{ name: 'Lisbon', display_name: 'Lisbon, Lisboa, Portugal', lat: '38.7077', lon: '-9.1365' }],
-  porto: [{ name: 'Porto', display_name: 'Porto, Portugal', lat: '41.1496', lon: '-8.6110' }],
+  lisbon: [place('Lisbon', 'Lisbon, Lisboa, Portugal', 38.7077, -9.1365)],
+  porto: [place('Porto', 'Porto, Portugal', 41.1496, -8.6110)],
 };
 
-// Answers place searches from PLACES and remembers when each was asked.
-const fakeNominatim = async (page) => {
+// Answers place searches from PLACES, the way Stadia's autocomplete does, and
+// remembers when each was asked.
+const fakeSearch = async (page) => {
   const asked = [];
-  await page.route('https://nominatim.openstreetmap.org/**', (r) => {
-    const q = new URL(r.request().url()).searchParams.get('q').toLowerCase();
+  await page.route('https://api.stadiamaps.com/geocoding/**', (r) => {
+    const q = new URL(r.request().url()).searchParams.get('text').toLowerCase();
     asked.push({ q, at: Date.now() });
-    r.fulfill({ contentType: 'application/json', body: JSON.stringify(PLACES[q.split(',')[0].trim()] || []) });
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ type: 'FeatureCollection', features: PLACES[q.split(',')[0].trim()] || [] }) });
   });
   return asked;
 };
@@ -56,7 +58,7 @@ export default async function trips({ newPage, check, tab, shots }) {
   const { page, ctx, open, stored, done, url } = await newPage({
     seed: { 'crm-people-v1': [DANA, SAM] },
   });
-  const asked = await fakeNominatim(page);
+  const asked = await fakeSearch(page);
   await open();
 
   // ---- empty ----
@@ -64,8 +66,9 @@ export default async function trips({ newPage, check, tab, shots }) {
   check('an empty Trips tab says so', await page.getByRole('heading', { name: 'No trips yet' }).isVisible());
   check('and offers to add the first one on the map', await page.getByRole('button', { name: 'Add your first trip' }).isVisible());
   await page.waitForSelector('.leaflet-container');
-  check('the map carries the OpenStreetMap credit',
-    (await page.locator('.leaflet-control-attribution').textContent()).includes('OpenStreetMap contributors'));
+  const credit = await page.locator('.leaflet-control-attribution').textContent();
+  check('the map carries the Stadia and OpenStreetMap credits',
+    credit.includes('Stadia Maps') && credit.includes('OpenStreetMap contributors'), credit);
   check('the device-only notice shows', await page.getByText('on this device only').isVisible());
   await page.getByRole('button', { name: 'Got it' }).click();
   check('the notice is remembered', Boolean(await page.evaluate(() => localStorage.getItem('orbit:crm-trips-notice-v1'))));
@@ -91,11 +94,11 @@ export default async function trips({ newPage, check, tab, shots }) {
   await search.fill('Porto');
   await page.getByRole('option', { name: /Porto/ }).click();
   check('two searches, two stops', await page.getByLabel('Name of place 2').inputValue() === 'Porto');
-  check('searches keep at least a second apart', asked.length === 2 && asked[1].at - asked[0].at >= 950,
+  check('searches keep a gap between them', asked.length === 2 && asked[1].at - asked[0].at >= 290,
     asked.map((a) => a.at - asked[0].at));
 
   // ---- offline search ----
-  await page.route('https://nominatim.openstreetmap.org/**', (r) => r.abort());
+  await page.route('https://api.stadiamaps.com/geocoding/**', (r) => r.abort());
   await search.fill('Faro');
   await page.getByText('Could not reach the place search').waitFor();
   check('a failed search says so and offers the other ways', await page.getByRole('button', { name: 'Try again' }).isVisible());
@@ -104,6 +107,7 @@ export default async function trips({ newPage, check, tab, shots }) {
   // ---- stop 3: pin on the map ----
   await page.getByRole('button', { name: 'Pick on map' }).click();
   await page.waitForSelector('.orbit-map');
+  await page.locator('.orbit-map').scrollIntoViewIfNeeded();
   const box = await page.locator('.orbit-map').boundingBox();
   await page.mouse.click(box.x + box.width * 0.55, box.y + box.height * 0.6);
   await page.getByLabel('Name this place').fill('Sintra');
@@ -128,9 +132,10 @@ export default async function trips({ newPage, check, tab, shots }) {
   check('stops come off', await page.getByLabel('Name of place 4').count() === 0);
 
   // ---- rating from the keyboard ----
-  await page.getByRole('radio', { name: '1 star' }).focus();
+  await page.getByRole('radio', { name: '2.5 stars' }).focus();
   await page.keyboard.press('ArrowRight');
   await page.keyboard.press('ArrowRight');
+  check('arrow keys step the rating by half a star', await page.getByRole('radio', { name: '3.5 stars' }).isChecked());
   await page.keyboard.press('ArrowRight');
   check('arrow keys set the rating', await page.getByRole('radio', { name: '4 stars' }).isChecked());
 
@@ -203,30 +208,55 @@ export default async function trips({ newPage, check, tab, shots }) {
   await page.getByLabel('Latitude').fill('42.2529');
   await page.getByLabel('Longitude').fill('-73.7910');
   await page.getByRole('button', { name: 'Add this place' }).click();
-  await page.getByRole('radio', { name: '2 stars' }).check({ force: true });
+  await page.getByRole('radio', { name: '2.5 stars' }).check({ force: true });
   await page.getByLabel('Find someone to add').fill('sam');
   await page.getByLabel('Find someone to add').press('Enter');
   await page.getByRole('button', { name: 'Save trip' }).click();
   await page.getByRole('button', { name: '← All trips' }).click();
 
-  // A card with no photo shows its rating in the thumbnail's place; that digit is not the title.
-  const cards = async () => (await page.locator('.crm-full .crm-row').allTextContents()).map((t) => t.replace(/^\d/, ''));
+  // A card with no photo shows its rating in the thumbnail's place; that number is not the title.
+  const cards = async () => (await page.locator('.crm-full .crm-row').allTextContents()).map((t) => t.replace(/^[\d.]+/, ''));
+  check('a half-star rating is saved as it was picked', (await stored('crm-trips-v1')).find((t) => t.title === 'Weekend upstate')?.rating === 2.5);
   check('the list shows newest first', (await cards()).map((t) => t.slice(0, 8)).join('|') === 'Weekend |A week i', await cards());
   await page.getByRole('button', { name: 'Map', exact: true }).click();
   await page.waitForSelector('.orbit-pin, .orbit-cluster');
   const pins = await page.locator('.orbit-pin').count();
   const clusters = await page.locator('.orbit-cluster').count();
   check('the map shows every stop, clustered where they crowd', pins + clusters >= 2 && pins + clusters <= 4, { pins, clusters });
+  check('the trips show as cards under the map, newest first',
+    await page.getByRole('heading', { name: 'Recent trips' }).isVisible()
+    && (await cards()).map((t) => t.slice(0, 8)).join('|') === 'Weekend |A week i', await cards());
+  const shared = page.getByRole('button', { name: 'Add a shared trip' });
+  check('"Add a shared trip" sits beside "Add a trip"',
+    (await shared.boundingBox()).y === (await page.getByRole('button', { name: 'Add a trip' }).boundingBox()).y);
+  await shared.click();
+  check('and opens the box to paste a link into', await page.getByLabel('Shared file').count() === 1
+    && await shared.getAttribute('aria-expanded') === 'true');
+  await page.getByRole('button', { name: 'Cancel' }).click();
   await page.locator('.orbit-pin[title="Weekend upstate"]').click();
   const popup = page.locator('.leaflet-popup');
   await popup.waitFor();
   check('a pin opens its trip in a popup', (await popup.textContent()).includes('Weekend upstate')
-    && (await popup.getByRole('img', { name: '2 out of 5 stars' }).isVisible()));
-  check('pins are coloured by rating', (await page.locator('.orbit-pin[title="Weekend upstate"] span').evaluate((el) => getComputedStyle(el).backgroundColor)) === 'rgb(176, 74, 12)');
+    && (await popup.getByRole('img', { name: '2.5 out of 5 stars' }).isVisible()));
+  const upstatePin = page.locator('.orbit-pin[title="Weekend upstate"] span');
+  check('pins are coloured by rating, a half star with its whole star',
+    (await upstatePin.evaluate((el) => getComputedStyle(el).backgroundColor)) === 'rgb(176, 74, 12)'
+    && (await upstatePin.textContent()) === '2.5');
   await page.screenshot({ path: path.join(shots, 'trips-map.png') });
   await popup.getByRole('button', { name: 'Open trip' }).click();
   check('Open trip goes to the trip', await page.getByRole('heading', { name: 'Weekend upstate' }).isVisible());
   await page.getByRole('button', { name: '← All trips' }).click();
+
+  // ---- a card under the map finds its trip on the map ----
+  await page.locator('section .crm-row', { hasText: 'A week in Portugal' }).click();
+  const found = page.locator('.leaflet-popup', { hasText: 'A week in Portugal' });
+  await found.waitFor({ timeout: 5000 });
+  check('tapping a card under the map opens that trip on the map', (await found.textContent()).includes('Place 1 of'));
+  check('and the keyboard lands on its Open trip button',
+    await page.evaluate(() => document.activeElement?.textContent) === 'Open trip');
+  check('the page scrolls up to the map', await page.evaluate(() => document.querySelector('.leaflet-container')?.getBoundingClientRect().top < window.innerHeight));
+  await page.getByRole('button', { name: 'Map', exact: true }).click();
+  await page.keyboard.press('Escape');
 
   await page.getByRole('button', { name: 'List', exact: true }).click();
   const titles = cards;

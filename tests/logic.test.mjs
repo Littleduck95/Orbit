@@ -440,6 +440,11 @@ describe('lists', () => {
     assert.deepEqual([c.items[2].rating, c.items[2].link, c.items[2].status, c.items[2].doneOn], [5, '', 'want', null]);
   });
 
+  it('keeps list ratings in half-star steps', () => {
+    const c = A.cleanCollection({ name: 'x', items: [3.5, 4, 2.3, 4.8, -1, '4.5'].map((rating, i) => ({ title: `t${i}`, rating })) });
+    assert.deepEqual(c.items.map((i) => i.rating), [3.5, 4, 2.5, 5, 0, 4.5]);
+  });
+
   it('sorts like a shelf, keeping ties in your order', () => {
     const items = list({ items: ['the Zoo', 'An Apple', 'b 10', 'b 9', 'Émile'].map((title) => ({ title })) }).items;
     assert.deepEqual(A.sortItems({ sort: 'title' }, items).map((i) => i.title), ['An Apple', 'b 9', 'b 10', 'Émile', 'the Zoo']);

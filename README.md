@@ -57,6 +57,7 @@ src/PersonalCRM.jsx   the app
 src/photoStore.js     trip photos in IndexedDB, and preparing uploads
 src/TripMap.jsx       the Leaflet maps, loaded only when a map is shown
 src/mapConfig.js      map tiles and place search: one entry each
+src/geo.js            country and US state outlines: which one a stop is in, and shading
 tests/                characterization tests (logic, storage, account, browser)
 vite.config.js        build config
 eslint.config.js      lint config
@@ -171,25 +172,71 @@ Both ends go through one whitelist of fields, so a share can never carry more
 than the picker offered, and a hand-edited one cannot slip anything else in.
 Lists shared with the older links still open as before.
 
+## Recap
+
+Recap shows a year: catch-ups, people added, events, reminders kept, lists
+crossed off, and **the year in trips**: how many, days away, countries, US
+states and places, the top-rated trip, a map of them all, the countries seen
+for the first time, and what is still planned for the rest of the year. The
+four latest years are buttons, and any before that are in an *Earlier* menu.
+When the year turns over while Orbit is open (or on coming back to it),
+Recap moves on to the new year by itself, unless an older one is being
+looked at on purpose.
+
 ## Trips
 
-The Trips tab keeps the places you have been: a title, one or more stops, the
-dates, a rating out of five, a short highlight, longer notes, who went with
-you, tags, and up to 30 photos. It shows them on a map or as a list, newest
-first, and filters by year, rating, companion and tag.
+The Trips tab keeps the places you have been, and the ones you mean to go: a
+title, one or more stops, the dates, a rating out of five stars in half steps,
+a short highlight, longer notes, who went with you, tags, and up to 30 photos.
+It shows them on a map with the trips as cards underneath, or as the cards
+alone, and filters by kind, year, rating, companion and tag. "Add a shared
+trip" sits beside "Add a trip". Tapping a card under the map finds that trip
+on the map.
 
-**The map** is [Leaflet](https://leafletjs.com) with OpenStreetMap tiles and
-no API key. There is a pin for every stop, coloured by rating with the rating
-written on it, and nearby pins gather into numbered circles. Tapping a pin
+**Been, planned, someday.** A trip is one you took (it needs a start date), a
+planned one (dates optional), or a someday wish (no dates, no rating). Trips
+to come are hollow pins, a solid ring for planned and a dashed one for
+someday, and the cards fall into *Coming up* (soonest first), *Recent trips*
+(newest first) and *Someday*. Once a planned trip's dates have gone by, it
+asks "Did you go?", and one tap makes it a trip you took. An entry on a
+Places list has *Put it on the trip map*, which opens a new someday trip (or
+a been trip, if the entry is ticked off) with its name filled in and its
+place already being searched for. Only a trip still to come stores a
+`status`, so every trip saved before plans existed reads as it did.
+
+**Stats** across the top count, from the trips you took, the countries, US
+states and places you have been, the days away this year (each day once,
+however many trips it was part of, and only up to today), and the place you
+have been back to most. Stops within 15 km of each other count as one place.
+*Hide stats* puts them away, and that is remembered; Recap has the same
+numbers year by year either way.
+
+**Where a stop is** (its country, and its state in the US) is worked out on
+the device from Natural Earth and US Census outlines ([`src/geo.js`](src/geo.js)),
+not asked of a web service, so every stop counts however it was added and
+nothing about where you have been leaves the device. The outlines are about
+280 KB and load only when Trips or Recap first needs them. A stop just off
+the coast is given to the nearest country within about 30 km. *Shade
+countries I have been to*, beside the map's key, colours in those countries,
+and the US states, for the trips shown.
+
+**Ratings**, on trips and list entries alike, go from half a star to five in
+half steps. A whole number means what it always did, so ratings saved, backed
+up or shared before halves existed read the same.
+
+**The map** is [Leaflet](https://leafletjs.com) with Stadia Maps' Alidade
+Smooth tiles, light or dark to match the theme. There is a pin for every stop,
+coloured by rating with the rating written on it (a half star shares its whole
+star's colour), and nearby pins gather into numbered circles. Tapping a pin
 opens the trip's title, dates, stars, highlight and first photo. The map frames
 every trip shown, and with none it shows the world and an offer to add one.
 
 **Adding a stop** works three ways: search by name, tap the map to drop a
 pin and name it, or type the coordinates. Search uses
-[Nominatim](https://nominatim.org), OpenStreetMap's free place search. Its
-policy allows one request a second, so every search in the app waits its
-turn, typing is given a pause before anything is sent, and answers are
-remembered for the visit. The event form's Find button uses the same search.
+[Stadia Maps' autocomplete](https://docs.stadiamaps.com/geocoding-search-autocomplete/),
+recognised by the site's domain like the tiles. Each request uses Stadia
+credits, so typing is given a pause before anything is sent, requests keep at
+least 300 ms apart, and answers are remembered for the visit. The event form's Find button uses the same search.
 
 **Photos** are redrawn on a canvas before they are kept: at most 1600 pixels
 on the long edge, as JPEG at 0.8 quality, with a separate thumbnail of about
@@ -423,13 +470,17 @@ stays a number.
 
 ## Maps, place search, and cost
 
-Map tiles come from `tile.openstreetmap.org` and place search from
-`nominatim.openstreetmap.org`. Both are free and keyless, and both ask for
-light use: fine for one person's Orbit, but not for an app with many users.
-Each is one entry in [`src/mapConfig.js`](src/mapConfig.js). Moving to a
-commercial provider (MapTiler, Stadia Maps, LocationIQ, Geoapify all have
-free tiers and cheap paid plans) means changing that entry and adding the
-provider's key, restricted to the site's domain.
+Map tiles come from [Stadia Maps](https://stadiamaps.com) (Alidade Smooth,
+and Alidade Smooth Dark under the Orbit theme). Stadia recognises the live
+site by its domain, set on the property in the Stadia dashboard, so no key is
+in the code; `localhost` works without one. The free plan is for
+non-commercial use only; a commercial Orbit needs a paid plan.
+
+Place search comes from Stadia too (its geocoding autocomplete), recognised
+by domain the same way. A search costs more credits than a tile, so the app
+waits for a pause in typing, keeps requests at least 300 ms apart and
+remembers answers for the visit. Both are entries in
+[`src/mapConfig.js`](src/mapConfig.js).
 
 When either service cannot be reached, the app says so and keeps working:
 place search points to the other two ways of adding a stop, and a map that

@@ -19,6 +19,7 @@ const THEMES = {
     overdue: '#A8362A', overdueBar: '#D2543F', overdueSoft: '#F8E5E1',
     rowHover: '#F2F9F4',
     sky: 'none',
+    dark: false,
   },
   // Deep space. The same green reads as telemetry against navy, and every
   // colour below was checked for contrast on the dark surface.
@@ -30,6 +31,7 @@ const THEMES = {
     soonText: '#F2C75C', soonBar: '#F2C75C',
     overdue: '#FF9585', overdueBar: '#FF6B57', overdueSoft: '#3A1D19',
     rowHover: '#17223A',
+    dark: true,
     sky: 'radial-gradient(1px 1px at 12% 18%, #ffffff55, transparent),'
        + 'radial-gradient(1px 1px at 34% 62%, #ffffff44, transparent),'
        + 'radial-gradient(1px 1px at 58% 12%, #ffffff55, transparent),'
@@ -2108,7 +2110,7 @@ const cleanItem = (raw, seen) => {
     title,
     detail: clip(raw.detail, TITLE_CAP),
     status,
-    rating: Math.min(5, Math.max(0, Math.round(Number(raw.rating) || 0))),
+    rating: halfStep(raw.rating),
     link: safeLink(raw.link),
     note: clip(raw.note, NOTE_CAP),
     from: clip(raw.from, 40) || null,
@@ -2198,7 +2200,18 @@ const withStatus = (it, status) => ({
   doneOn: status === 'done' ? (it.status === 'done' && it.doneOn ? it.doneOn : todayStr()) : null,
 });
 
-const stars = (n) => '★'.repeat(n) + '☆'.repeat(5 - n);
+// Ratings go from half a star to five in half steps: ten steps in all. A
+// whole number is a rating from before halves existed and means the same now,
+// so nothing saved, backed up or shared needs converting.
+const halfStep = (n) => Math.min(5, Math.max(0, Math.round((Number(n) || 0) * 2) / 2));
+const isRating = (n) => typeof n === 'number' && Number.isInteger(n * 2) && n >= 0.5 && n <= 5;
+const starWord = (n) => `${n} star${n === 1 ? '' : 's'}`;
+
+const stars = (n) => {
+  const full = Math.floor(n);
+  const half = n - full ? 1 : 0;
+  return '★'.repeat(full) + (half ? '½' : '') + '☆'.repeat(5 - full - half);
+};
 
 // Plain text anyone can read, for a message, an email or a note. Grouped by
 // stage when progress is included, because "Watched ★★★★★" is the part a
@@ -3270,9 +3283,133 @@ function Stat({ n, label, tone }) {
   );
 }
 
-function Recap({ people, year, years, onYear, eventCount, reminderCount, listCount }) {
+// The four latest years as chips; any before that in a menu, so a long
+// history does not push the page sideways.
+function YearPicker({ year, years, onYear }) {
+  if (years.length < 2) return null;
+  const recent = years.slice(0, 4);
+  const older = years.slice(4);
+  return (
+    <div role="group" aria-label="Year" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+      {recent.map((y) => (
+        <button
+          key={y}
+          className="crm-btn"
+          aria-pressed={y === year}
+          onClick={() => onYear(y)}
+          style={{
+            font: 'inherit', fontSize: 12.5, fontWeight: 600, padding: '4px 10px',
+            borderRadius: 20, cursor: 'pointer',
+            background: y === year ? C.accent : 'transparent',
+            border: `1px solid ${y === year ? C.accent : C.line}`,
+            color: y === year ? C.onAccent : C.muted,
+          }}
+        >{y}</button>
+      ))}
+      {older.length > 0 && (
+        <select className="crm-select" aria-label="Earlier years" value={older.includes(year) ? year : ''}
+          onChange={(e) => e.target.value && onYear(Number(e.target.value))}
+          style={{ ...inputStyle, width: 'auto', minHeight: 30, padding: '3px 30px 3px 10px', fontSize: 12.5, borderRadius: 20 }}>
+          <option value="">Earlier</option>
+          {older.map((y) => <option key={y} value={y}>{y}</option>)}
+        </select>
+      )}
+    </div>
+  );
+}
+
+// A year of trips in Recap: the numbers, the best one, a map and the rest.
+function RecapTrips({ trips, year, onTrip }) {
+  const { where } = useGeo();
+  const y = useMemo(() => tripYear(trips, where, year), [trips, where, year]);
+  const planned = trips.filter((t) => t.status === 'planned' && tripYears(t).includes(year) && !tripOverdue(t));
+  const points = useMemo(() => tripPoints(y.trips), [y.trips]);
+  if (!y.trips.length && !planned.length) return null;
+  const n = (x) => (x === null ? '…' : x.size);
+  const box = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, marginBottom: 12 };
+  return (
+    <section aria-labelledby="recap-trips" style={{ marginTop: 22 }}>
+      <h2 id="recap-trips" style={{ margin: '0 0 12px', fontSize: 20, fontWeight: 600, letterSpacing: '-0.03em' }}>{`${year} in trips`}</h2>
+      {y.trips.length > 0 && (
+        <>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+            <Stat n={y.trips.length} label={y.trips.length === 1 ? 'trip' : 'trips'} tone={C.accentDeep} />
+            <Stat n={y.days} label="days away" />
+            <Stat n={n(y.countries)} label={y.countries?.size === 1 ? 'country' : 'countries'} />
+            {y.states && y.states.size > 0 && <Stat n={y.states.size} label={y.states.size === 1 ? 'US state' : 'US states'} />}
+            <Stat n={y.places} label={y.places === 1 ? 'place' : 'places'} />
+          </div>
+
+          {y.best && (
+            <button className="crm-btn crm-row" onClick={() => onTrip(y.best.id)} style={{
+              ...box, display: 'flex', gap: 14, width: '100%', textAlign: 'left', font: 'inherit', color: C.ink,
+              padding: 12, cursor: 'pointer', alignItems: 'flex-start',
+            }}>
+              {y.best.photoIds[0] && (
+                <PhotoThumb id={y.best.photoIds[0]} alt={photoAlt(y.best.title, 0)} style={{ width: 120, height: 96, borderRadius: 8, flexShrink: 0 }} />
+              )}
+              <span style={{ display: 'block', minWidth: 0 }}>
+                <span style={{ display: 'block', fontSize: 13, color: C.muted }}>{y.best.rating ? 'Top-rated trip' : 'Longest trip'}</span>
+                <span style={{ display: 'block', fontSize: 19, fontWeight: 600, letterSpacing: '-0.025em', marginTop: 2 }}>{y.best.title}</span>
+                <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline', fontSize: 12.5, color: C.muted, marginTop: 3 }}>
+                  <span>{tripWhen(y.best).text}</span>
+                  <Stars n={y.best.rating} size={12.5} />
+                </span>
+                {y.best.excerpt && (
+                  <span className="crm-serif crm-clamp" style={{ display: '-webkit-box', fontSize: 14, lineHeight: 1.45, marginTop: 6 }}>{y.best.excerpt}</span>
+                )}
+              </span>
+            </button>
+          )}
+
+          <div style={{ ...mapFrame(), marginBottom: 12 }}>
+            <MapSlot height={280} render={(m) => (
+              <m.TripsMap points={points} height={280} dark={C.dark} renderPopup={(p) => {
+                const t = y.trips.find((x) => x.id === p.tripId);
+                return t ? <TripPopup trip={t} stop={p.stop} onOpen={() => onTrip(t.id)} /> : null;
+              }} />
+            )} />
+          </div>
+
+          <div style={{ ...box, padding: '6px 15px' }}>
+            {y.firsts && y.firsts.length > 0 && y.trips.length > 0 && (
+              <div style={{ display: 'flex', gap: 12, alignItems: 'baseline', padding: '11px 0', borderBottom: `1px solid ${C.line}` }}>
+                <span style={{ flex: 1, fontSize: 13, color: C.muted }}>First time in</span>
+                <span style={{ fontSize: 13.5, fontWeight: 600, color: C.ink, textAlign: 'right' }}>{y.firsts.join(', ')}</span>
+              </div>
+            )}
+            {y.trips.map((t) => (
+              <button key={t.id} className="crm-btn" onClick={() => onTrip(t.id)} style={{
+                display: 'flex', gap: 12, alignItems: 'baseline', width: '100%', textAlign: 'left', font: 'inherit',
+                padding: '11px 0', background: 'transparent', border: 'none', borderBottom: `1px solid ${C.line}`, cursor: 'pointer', color: C.ink,
+              }}>
+                <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600 }}>{t.title}</span>
+                <Stars n={t.rating} size={11.5} />
+                <span style={{ fontSize: 12.5, color: C.muted, flexShrink: 0 }}>{tripWhen(t).text}</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+      {planned.length > 0 && (
+        <p style={{ margin: '0 0 12px', fontSize: 13.5, color: C.muted }}>
+          {`Still to come in ${year}: `}
+          {planned.map((t, i) => (
+            <span key={t.id}>
+              {i > 0 && ', '}
+              <button className="crm-btn" onClick={() => onTrip(t.id)} style={{ ...textButton(), fontSize: 13.5 }}>{t.title}</button>
+            </span>
+          ))}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function Recap({ people, year, years, onYear, eventCount, reminderCount, listCount, trips = [], onTrip }) {
   const r = buildRecap(people, year);
   const maxMonth = Math.max(1, ...r.months);
+  const tripCount = trips.filter((t) => tripYears(t).includes(year)).length;
 
   return (
     <div>
@@ -3280,32 +3417,15 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
         <h1 style={{ margin: 0, fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>
           {year} in review
         </h1>
-        {years.length > 1 && (
-          <div style={{ display: 'flex', gap: 6 }}>
-            {years.map((y) => (
-              <button
-                key={y}
-                className="crm-btn"
-                onClick={() => onYear(y)}
-                style={{
-                  font: 'inherit', fontSize: 12.5, fontWeight: 600, padding: '4px 10px',
-                  borderRadius: 20, cursor: 'pointer',
-                  background: y === year ? C.accent : 'transparent',
-                  border: `1px solid ${y === year ? C.accent : C.line}`,
-                  color: y === year ? C.onAccent : C.muted,
-                }}
-              >{y}</button>
-            ))}
-          </div>
-        )}
+        <YearPicker year={year} years={years} onYear={onYear} />
       </div>
 
-      {r.total === 0 && r.added === 0 && !eventCount && !reminderCount && !listCount ? (
+      {r.total === 0 && r.added === 0 && !eventCount && !reminderCount && !listCount ? (tripCount ? null : (
         <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.6, margin: 0 }}>
           Nothing logged in {year} yet. Every catch-up you record builds this page, so it
           gets more interesting the longer you use it.
         </p>
-      ) : (
+      )) : (
         <>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
             <Stat n={r.total} label="catch-ups logged" tone={C.accentDeep} />
@@ -3364,7 +3484,7 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
             </div>
           )}
 
-          <div style={{
+          {(r.total > 0 || r.reunion || r.topCircle) && <div style={{
             background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '6px 15px',
           }}>
             {[
@@ -3394,18 +3514,19 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
                 </span>
               </div>
             ))}
-          </div>
+          </div>}
         </>
       )}
+
+      {onTrip && <RecapTrips trips={trips} year={year} onTrip={onTrip} />}
     </div>
   );
 }
 
 /* ---------- place lookup ---------- */
-// Nominatim, OpenStreetMap's free place search. Its usage policy allows one
-// request a second from any one user, so every lookup waits its turn here,
-// however many search boxes are asking. Answers are remembered for the visit,
-// so asking again costs nothing.
+// Stadia Maps' place search (see mapConfig.js). Every lookup waits its turn
+// here, however many search boxes are asking, and answers are remembered for
+// the visit, so asking again costs nothing.
 const placeCache = new Map();
 let placeNext = 0;
 
@@ -3416,8 +3537,8 @@ const pause = (ms, signal) => new Promise((resolve, reject) => {
   signal?.addEventListener('abort', () => { clearTimeout(t); stop(); }, { once: true });
 });
 
-// A short name for a place: Nominatim's own, or the first part of its address.
-const placeName = (r) => clip(r?.name, 200) || clip(String(r?.display_name || '').split(',')[0], 200);
+// A short name for a place: the search's own, or the first part of its address.
+const placeName = (p) => clip(p?.name, 200) || clip(String(p?.label || '').split(',')[0], 200);
 
 // -> { status: 'ok' | 'none' | 'offline' | 'aborted', results: [{ label, name, lat, lon }] }
 const searchPlaces = async (raw, { signal } = {}) => {
@@ -3431,14 +3552,20 @@ const searchPlaces = async (raw, { signal } = {}) => {
     placeNext = at + GEOCODER.minGapMs;
     if (at > now) await pause(at - now, signal);
     const params = new URLSearchParams({
-      q, format: 'jsonv2', limit: String(GEOCODER.limit),
-      'accept-language': (typeof navigator !== 'undefined' && navigator.language) || 'en',
+      text: q, size: String(GEOCODER.limit),
+      lang: ((typeof navigator !== 'undefined' && navigator.language) || 'en').split('-')[0],
     });
     const res = await fetch(`${GEOCODER.url}?${params}`, { signal, headers: { Accept: 'application/json' } });
     if (!res.ok) return { status: 'offline', results: [] };
     const data = await res.json();
-    const good = (Array.isArray(data) ? data : [])
-      .map((r) => ({ label: clip(r?.display_name, 300), name: placeName(r), lat: Number(r?.lat), lon: Number(r?.lon) }))
+    // GeoJSON: each place is a feature, its point given as [longitude, latitude].
+    const good = (Array.isArray(data?.features) ? data.features : [])
+      .map((f) => ({
+        label: clip(f?.properties?.label, 300),
+        name: placeName(f?.properties),
+        lat: Number(f?.geometry?.coordinates?.[1]),
+        lon: Number(f?.geometry?.coordinates?.[0]),
+      }))
       .filter((r) => r.label && Number.isFinite(r.lat) && Number.isFinite(r.lon)
         && Math.abs(r.lat) <= 90 && Math.abs(r.lon) <= 180);
     const out = good.length ? { status: 'ok', results: good } : { status: 'none', results: [] };
@@ -3455,8 +3582,12 @@ const searchPlaces = async (raw, { signal } = {}) => {
 // The record lives in localStorage like everything else; its photos are too
 // big for that and live in IndexedDB (see photoStore.js), referenced here by id.
 const TRIPS_KEY = 'crm-trips-v1';
+// Been is a trip you took. Planned has somewhere to go and maybe dates;
+// someday is a wish, with no dates at all.
+const TRIP_STATUSES = ['been', 'planned', 'someday'];
 // Set once the "this stays on this device" notice has been read.
 const TRIPS_NOTICE_KEY = 'crm-trips-notice-v1';
+const TRIP_STATS_KEY = 'crm-trip-stats-v1';
 // Set once the offer to turn pinned events into trips has been answered.
 const TRIPS_OFFER_KEY = 'crm-trips-events-offer-v1';
 // When a backup file was last downloaded, to say how old the newest one is.
@@ -3508,9 +3639,10 @@ const cleanTrip = (raw) => {
   if (!isPlainObject(raw)) return null;
   const title = clip(raw.title, TRIP_TITLE_CAP);
   const stops = (Array.isArray(raw.stops) ? raw.stops : []).map(cleanStop).filter(Boolean).slice(0, STOP_CAP);
-  let start = isDay(raw.startDate) ? raw.startDate : null;
-  let end = isDay(raw.endDate) ? raw.endDate : null;
-  if (!title || !stops.length || !start) return null;
+  const status = TRIP_STATUSES.includes(raw.status) ? raw.status : 'been';
+  let start = status !== 'someday' && isDay(raw.startDate) ? raw.startDate : null;
+  let end = start && isDay(raw.endDate) ? raw.endDate : null;
+  if (!title || !stops.length || (status === 'been' && !start)) return null;
   if (end && end < start) [start, end] = [end, start];
   if (end === start) end = null;
   const createdAt = stampOr(raw.createdAt) || new Date().toISOString();
@@ -3522,7 +3654,7 @@ const cleanTrip = (raw) => {
     stops,
     startDate: start,
     endDate: end,
-    rating: Number.isInteger(raw.rating) && raw.rating >= 1 && raw.rating <= 5 ? raw.rating : null,
+    rating: status === 'been' && isRating(raw.rating) ? raw.rating : null,
     excerpt: clip(raw.excerpt, EXCERPT_CAP),
     notes: clip(raw.notes, TRIP_NOTES_CAP),
     companions: idList(raw.companions, 500),
@@ -3530,6 +3662,9 @@ const cleanTrip = (raw) => {
     tags: cleanTags(raw.tags),
   };
   if (typeof raw.fromEvent === 'string' && raw.fromEvent) trip.fromEvent = raw.fromEvent.slice(0, 64);
+  // Only a trip still to come says so, so every trip saved before plans
+  // existed reads exactly as it did.
+  if (status !== 'been') trip.status = status;
   return trip;
 };
 
@@ -3543,10 +3678,20 @@ const cleanTrips = (raw) => {
   });
 };
 
-const tripWhen = (t) => eventWhen({ date: t.startDate, endDate: t.endDate });
+const tripStatus = (t) => t.status || 'been';
+
+// A trip to come with no dates yet says what it is instead.
+const tripWhen = (t) => (t.startDate
+  ? eventWhen({ date: t.startDate, endDate: t.endDate })
+  : { text: tripStatus(t) === 'someday' ? 'Someday' : 'Dates to come', days: 0 });
+
+// A planned trip whose dates have gone by: did it happen?
+const tripOverdue = (t, today = todayStr()) => tripStatus(t) === 'planned' && Boolean(t.startDate)
+  && (t.endDate || t.startDate) < today;
 
 // Every year a trip touched, so New Year's in Lisbon counts for both.
 const tripYears = (t) => {
+  if (!t.startDate) return [];
   const a = Number(t.startDate.slice(0, 4));
   const b = t.endDate ? Number(t.endDate.slice(0, 4)) : a;
   const out = [];
@@ -3556,12 +3701,122 @@ const tripYears = (t) => {
 
 // Newest first: latest start, then the one written down last.
 const sortTrips = (trips) => [...trips].sort((a, b) =>
-  b.startDate.localeCompare(a.startDate) || (b.createdAt || '').localeCompare(a.createdAt || ''));
+  (b.startDate || '').localeCompare(a.startDate || '') || (b.createdAt || '').localeCompare(a.createdAt || ''));
 
-const NO_TRIP_FILTER = Object.freeze({ year: '', minRating: 0, companion: '', tag: '' });
+// The trips in the three groups they show in: what is coming up (soonest
+// first, undated last), where you have been (newest first), and someday.
+const tripGroups = (trips) => {
+  const of = (st) => trips.filter((t) => tripStatus(t) === st);
+  return {
+    planned: of('planned').sort((a, b) => (a.startDate || '9999').localeCompare(b.startDate || '9999')
+      || (a.createdAt || '').localeCompare(b.createdAt || '')),
+    been: sortTrips(of('been')),
+    someday: of('someday').sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')),
+  };
+};
+
+/* ---------- trips: counting ---------- */
+// Only trips you took count. where(stop) gives { country, state } (see
+// geo.js); until that has loaded it is null, and so are the counts that need it.
+
+// Stops this close together are one place: a city, not every café in it.
+const PLACE_KM = 15;
+const kmApart = (a, b) => {
+  const x = ((b.lng - a.lng) * Math.PI / 180) * Math.cos(((a.lat + b.lat) / 2) * Math.PI / 180);
+  const y = ((b.lat - a.lat) * Math.PI / 180);
+  return Math.sqrt(x * x + y * y) * 6371;
+};
+
+// The places been to, most visited first: [{ name, trips, last }]. A place
+// is named by what its stops were called most often.
+const tripPlaces = (trips) => {
+  const groups = [];
+  sortTrips(trips.filter((t) => !t.status)).forEach((t) => t.stops.forEach((st) => {
+    let g = groups.find((x) => kmApart(x, st) <= PLACE_KM);
+    if (!g) {
+      g = { lat: st.lat, lng: st.lng, trips: new Set(), names: new Map(), last: t.startDate };
+      groups.push(g);
+    }
+    g.trips.add(t.id);
+    g.names.set(st.name, (g.names.get(st.name) || 0) + 1);
+  }));
+  return groups
+    .map((g) => ({
+      name: [...g.names.entries()].sort((a, b) => b[1] - a[1])[0][0],
+      trips: g.trips.size,
+      last: g.last,
+    }))
+    .sort((a, b) => b.trips - a.trips || b.last.localeCompare(a.last));
+};
+
+// Days spent on trips in a year, up to today, each day counted once however
+// many trips it was part of.
+const daysAway = (trips, year, today = todayStr()) => {
+  const first = `${year}-01-01`;
+  const last = `${year}-12-31` < today ? `${year}-12-31` : today;
+  const days = new Set();
+  trips.filter((t) => !t.status).forEach((t) => {
+    const from = t.startDate > first ? t.startDate : first;
+    const to = (t.endDate || t.startDate) < last ? (t.endDate || t.startDate) : last;
+    for (let d = parseDate(from), n = 0; n < 370; d.setDate(d.getDate() + 1), n += 1) {
+      const k = fmtDate(d);
+      if (k > to) break;
+      days.add(k);
+    }
+  });
+  return days.size;
+};
+
+const whereAll = (trips, where) => {
+  if (!where) return { countries: null, states: null };
+  const countries = new Set();
+  const states = new Set();
+  trips.filter((t) => !t.status).forEach((t) => t.stops.forEach((st) => {
+    const w = where(st);
+    if (w.country) countries.add(w.country);
+    if (w.state) states.add(w.state);
+  }));
+  return { countries, states };
+};
+
+// Everything the stats row shows.
+const tripStats = (trips, where, year, today = todayStr()) => {
+  const places = tripPlaces(trips);
+  return {
+    ...whereAll(trips, where),
+    trips: trips.filter((t) => !t.status).length,
+    places: places.length,
+    top: places[0] && places[0].trips > 1 ? places[0] : null,
+    days: daysAway(trips, year, today),
+    year,
+  };
+};
+
+// One year of trips, for Recap: the ones that touched it, what they added
+// up to, the countries seen for the first time, and the best of them.
+const tripYear = (trips, where, year, today = todayStr()) => {
+  const been = trips.filter((t) => !t.status);
+  const mine = sortTrips(been.filter((t) => tripYears(t).includes(year)));
+  const { countries, states } = whereAll(mine, where);
+  let firsts = null;
+  if (countries) {
+    const before = whereAll(been.filter((t) => t.startDate < `${year}-01-01`), where).countries;
+    firsts = [...countries].filter((c) => !before.has(c)).sort();
+  }
+  const best = [...mine].sort((a, b) => (b.rating || 0) - (a.rating || 0)
+    || tripWhen(b).days - tripWhen(a).days)[0] || null;
+  return {
+    trips: mine, countries, states, firsts, best,
+    places: tripPlaces(mine).length,
+    days: daysAway(mine, year, today),
+  };
+};
+
+const NO_TRIP_FILTER = Object.freeze({ year: '', minRating: 0, companion: '', tag: '', status: '' });
 
 const filterTrips = (trips, f) => trips.filter((t) =>
-  (!f.year || tripYears(t).includes(Number(f.year)))
+  (!f.status || tripStatus(t) === f.status)
+  && (!f.year || tripYears(t).includes(Number(f.year)))
   && (!f.minRating || (t.rating || 0) >= f.minRating)
   && (!f.companion || t.companions.includes(f.companion))
   && (!f.tag || t.tags.some((g) => g.toLowerCase() === f.tag.toLowerCase())));
@@ -3575,10 +3830,15 @@ const tripFilterOptions = (trips) => ({
 
 // Pins on the map run from red for a trip you would not repeat to deep green
 // for a favourite, with the rating written on each, so colour is never the
-// only way to tell. They sit on light map tiles in both themes, so these do
-// not change with the theme. Each carries white text at 4.5:1 or better.
+// only way to tell. A half star shares its whole star's colour (4.5 is a 4),
+// and half a star counts with one. The white ring keeps them apart from light
+// and dark tiles alike, so these do not change with the theme. Each carries
+// white text at 4.5:1 or better.
 const RATING_COLORS = ['#56655C', '#B42318', '#B04A0C', '#8A6208', '#2C7A3B', '#145A32'];
-const ratingColor = (r) => RATING_COLORS[r || 0] || RATING_COLORS[0];
+// Trips still to come are hollow pins: a solid ring for planned, a dashed one
+// for someday.
+const PLAN_COLORS = { planned: '#1F7A3A', someday: '#56655C' };
+const ratingColor = (r) => (r ? RATING_COLORS[Math.max(1, Math.floor(r))] || RATING_COLORS[0] : RATING_COLORS[0]);
 
 // One point per stop.
 const tripPoints = (trips) => trips.flatMap((t) => t.stops.map((s, i) => ({
@@ -3587,8 +3847,9 @@ const tripPoints = (trips) => trips.flatMap((t) => t.stops.map((s, i) => ({
   stop: i,
   lat: s.lat,
   lng: s.lng,
-  color: ratingColor(t.rating),
+  color: tripStatus(t) === 'been' ? ratingColor(t.rating) : PLAN_COLORS[tripStatus(t)],
   text: t.rating ? String(t.rating) : '',
+  hollow: tripStatus(t) === 'been' ? '' : tripStatus(t),
   label: t.stops.length > 1 ? `${t.title}: ${s.name}` : t.title,
 })));
 
@@ -3660,9 +3921,10 @@ const tripSharePayload = async (t, { notes, by, photos = [], on = todayStr() }) 
   trip: {
     ti: t.title,
     s: t.stops.map((x) => [x.name, x.displayAddress, x.lat, x.lng]),
-    a: t.startDate,
+    ...(t.startDate ? { a: t.startDate } : {}),
     ...(t.endDate ? { b: t.endDate } : {}),
     ...(t.rating ? { r: t.rating } : {}),
+    ...(t.status ? { st: t.status } : {}),
     ...(t.excerpt ? { x: t.excerpt } : {}),
     ...(notes && t.notes ? { n: t.notes } : {}),
     ...(t.tags.length ? { g: t.tags } : {}),
@@ -3688,7 +3950,7 @@ const readTripShare = (o) => {
   const trip = sharedTrip({
     title: r.ti,
     stops: (Array.isArray(r.s) ? r.s : []).filter(Array.isArray).map((x) => ({ name: x[0], displayAddress: x[1], lat: x[2], lng: x[3] })),
-    startDate: r.a, endDate: r.b, rating: r.r, excerpt: r.x, notes: r.n, tags: r.g,
+    startDate: r.a, endDate: r.b, rating: r.r, status: r.st, excerpt: r.x, notes: r.n, tags: r.g,
   });
   if (!trip) return null;
   const photos = (Array.isArray(o.ph) ? o.ph : []).slice(0, PHOTO_CAP).filter(isPlainObject).map((p) => {
@@ -4801,45 +5063,35 @@ function StageMark({ stage, size = 20 }) {
   );
 }
 
-function StarRow({ n, size = 11 }) {
+// How much of star i a rating of n fills: all, half or none.
+const starFill = (n, i) => (n >= i ? 1 : n >= i - 0.5 ? 0.5 : 0);
+
+// One star, whole, half or empty. A half star is the whole one's outline with
+// its left half filled in.
+function StarGlyph({ fill, size, on, off = on, stroke = 1.3 }) {
+  const shape = (filled) => (
+    <svg width={size} height={size} viewBox="0 0 16 16" style={{ display: 'block' }}>
+      <path d={STAR_PATH} fill={filled ? on : 'none'} stroke={fill ? on : off} strokeWidth={stroke} strokeLinejoin="round" />
+    </svg>
+  );
   return (
-    <span role="img" aria-label={`Rated ${n} of 5`}
-      style={{ display: 'inline-flex', gap: 1, color: C.soonText, flexShrink: 0 }}>
-      {[1, 2, 3, 4, 5].map((i) => (
-        <svg key={i} width={size} height={size} viewBox="0 0 16 16" aria-hidden="true">
-          <path d={STAR_PATH} fill={i <= n ? 'currentColor' : 'none'}
-            stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-        </svg>
-      ))}
+    <span aria-hidden="true" style={{ position: 'relative', display: 'inline-block', width: size, height: size, flexShrink: 0 }}>
+      {shape(fill === 1)}
+      {fill === 0.5 && (
+        <span style={{ position: 'absolute', left: 0, top: 0, width: size / 2, height: size, overflow: 'hidden' }}>
+          {shape(true)}
+        </span>
+      )}
     </span>
   );
 }
 
-function StarPicker({ value, onChange }) {
+function StarRow({ n, size = 11 }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap' }}>
-      {[1, 2, 3, 4, 5].map((i) => (
-        <button
-          key={i}
-          className="crm-btn"
-          onClick={() => onChange(i === value ? 0 : i)}
-          aria-label={`${i} out of 5`}
-          aria-pressed={i === value}
-          style={{
-            background: 'transparent', border: 'none', padding: 5, cursor: 'pointer', lineHeight: 0,
-            color: i <= value ? C.soonText : C.faint,
-          }}
-        >
-          <svg width="22" height="22" viewBox="0 0 16 16" aria-hidden="true">
-            <path d={STAR_PATH} fill={i <= value ? 'currentColor' : 'none'}
-              stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-          </svg>
-        </button>
-      ))}
-      <span style={{ fontSize: 12, color: C.faint, marginLeft: 8 }}>
-        {value ? 'Tap the same star again to clear it.' : 'Not rated.'}
-      </span>
-    </div>
+    <span role="img" aria-label={`Rated ${n} of 5`}
+      style={{ display: 'inline-flex', gap: 1, flexShrink: 0, alignSelf: 'center' }}>
+      {[1, 2, 3, 4, 5].map((i) => <StarGlyph key={i} fill={starFill(n, i)} size={size} on={C.soonText} />)}
+    </span>
   );
 }
 
@@ -5011,7 +5263,8 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
 }
 
 /* ---------- lists: one entry ---------- */
-function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
+// onTrip: on a Places list, starts a trip from this entry.
+function ItemEditor({ c, it, people, onSave, onRemove, onCancel, onTrip }) {
   const [title, setTitle] = useState(it.title);
   const [detail, setDetail] = useState(it.detail || '');
   const [status, setStatus] = useState(stageOf(c, it));
@@ -5070,9 +5323,7 @@ function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
         </Group>
       )}
 
-      <Group label="Your rating">
-        <StarPicker value={rating} onChange={setRating} />
-      </Group>
+      <StarInput label="Your rating" value={rating || null} onChange={(v) => setRating(v || 0)} />
 
       {people.length > 0 && (
         <Field label="Recommended by">
@@ -5109,6 +5360,11 @@ function ItemEditor({ c, it, people, onSave, onRemove, onCancel }) {
       <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
         <Button kind="solid" onClick={save} style={small}>Save</Button>
         <Button onClick={onCancel} style={small}>Cancel</Button>
+        {onTrip && (
+          <Button onClick={() => onTrip({ title: title.trim() || it.title, detail: detail.trim(), done: status === 'done' })} style={small}>
+            Put it on the trip map
+          </Button>
+        )}
         <Button kind="danger" onClick={() => (confirm ? onRemove(it.id) : setConfirm(true))}
           style={{ fontSize: 12.5, padding: '6px 8px', marginLeft: 'auto', ...(confirm ? { fontWeight: 700 } : {}) }}>
           {confirm ? 'Tap again to remove' : 'Remove'}
@@ -5374,7 +5630,7 @@ const SharePanel = memo(function SharePanel({ c, people, owner }) {
 });
 
 /* ---------- lists: one list, opened ---------- */
-function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }) {
+function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack, onTrip }) {
   const [stage, setStage] = useState('all');
   const [q, setQ] = useState('');
   const [editing, setEditing] = useState(null);
@@ -5568,7 +5824,8 @@ function CollectionDetail({ c, people, owner, onSave, onEdit, onRemove, onBack }
         <div style={{ border: `1px solid ${C.line}`, borderRadius: 12, overflow: 'hidden', background: C.surface }}>
           {shown.map((it, i) => (editing === it.id ? (
             <ItemEditor key={it.id} c={c} it={it} people={people}
-              onSave={saveItem} onRemove={removeItem} onCancel={() => setEditing(null)} />
+              onSave={saveItem} onRemove={removeItem} onCancel={() => setEditing(null)}
+              onTrip={c.kind === 'Places' ? onTrip : undefined} />
           ) : (
             <ItemRow key={it.id} shape={shape} it={it} from={names.get(it.from) || ''}
               n={numbered ? i + 1 : null} first={reordering && i === 0} last={reordering && i === shown.length - 1}
@@ -5859,6 +6116,33 @@ function CollectionsView({ collections, look, incoming, onOpen, onNew, onTakeSha
 /* ---------- trips: maps ---------- */
 // Leaflet is only fetched the first time a map is shown. A failed fetch
 // (offline, say) is not remembered, so Try again really tries again.
+// The country and state outlines (geo.js) load the same way, on first need.
+let geoModule = null;
+let geoLoading = null;
+const loadGeo = () => {
+  if (!geoLoading) {
+    geoLoading = import('./geo.js')
+      .then((m) => { geoModule = m; return m; })
+      .catch((e) => { geoLoading = null; throw e; });
+  }
+  return geoLoading;
+};
+
+// The outlines module once loaded, else null. where(stop) → { country, state },
+// or null until then (or if they cannot load, when the counts that need them
+// are left out).
+const useGeo = () => {
+  const [mod, setMod] = useState(geoModule);
+  useEffect(() => {
+    if (mod) return undefined;
+    let live = true;
+    loadGeo().then((m) => { if (live) setMod(m); }).catch(() => { /* counted without them */ });
+    return () => { live = false; };
+  }, [mod]);
+  const where = useMemo(() => (mod ? (st) => mod.whereIs(st.lat, st.lng) : null), [mod]);
+  return { geo: mod, where };
+};
+
 let mapsModule = null;
 let mapsLoading = null;
 const loadMaps = () => {
@@ -5944,16 +6228,26 @@ const mapFrame = () => ({
   isolation: 'isolate',
 });
 
-function RatingLegend() {
+function RatingLegend({ plans = new Set() }) {
+  const hollow = (st) => (
+    <span key={st} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      <span aria-hidden="true" style={{
+        width: 18, height: 18, borderRadius: 18, background: '#fff', boxSizing: 'border-box',
+        border: `${st === 'planned' ? '3px solid' : '2px dashed'} ${PLAN_COLORS[st]}`,
+      }} />
+      {PLAN_WORDS[st]}
+    </span>
+  );
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 14px', marginTop: 9, fontSize: 12, color: C.muted }}>
+      {['planned', 'someday'].filter((st) => plans.has(st)).map(hollow)}
       {[5, 4, 3, 2, 1, 0].map((r) => (
         <span key={r} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
           <span aria-hidden="true" style={{
             width: 18, height: 18, borderRadius: 18, background: ratingColor(r), color: '#fff',
             fontSize: 10.5, fontWeight: 700, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
           }}>{r || ''}</span>
-          {r ? `${r} star${r === 1 ? '' : 's'}` : 'Not rated'}
+          {r === 5 ? '5 stars' : r ? `${r === 1 ? 0.5 : r} to ${r + 0.5} stars` : 'Not rated'}
         </span>
       ))}
     </div>
@@ -6112,30 +6406,43 @@ function Stars({ n, size = 13.5 }) {
   if (!n) return null;
   return (
     <span role="img" aria-label={`${n} out of 5 stars`}
-      style={{ color: C.soonBar, fontSize: size, letterSpacing: '0.06em', whiteSpace: 'nowrap' }}>
-      {stars(n)}
+      style={{ display: 'inline-flex', gap: 1.5, alignSelf: 'center', whiteSpace: 'nowrap' }}>
+      {[1, 2, 3, 4, 5].map((i) => <StarGlyph key={i} fill={starFill(n, i)} size={Math.round(size * 0.92)} on={C.soonBar} />)}
     </span>
   );
 }
 
-// Five radio buttons dressed as stars, so arrow keys and screen readers work
-// the way they do on any other choice. "Not rated" is a choice too.
-function StarInput({ value, onChange }) {
+// Ten radio buttons dressed as five stars, the left half of each star for the
+// half step, so arrow keys and screen readers work the way they do on any
+// other choice. "Not rated" is a choice too, and gives back null.
+function StarInput({ value, onChange, label = 'Rating' }) {
   const [hover, setHover] = useState(0);
   const name = useId();
   const shown = hover || value || 0;
   return (
     <fieldset style={{ border: 'none', margin: '0 0 14px', padding: 0, minWidth: 0 }}>
-      <legend style={{ fontSize: 13, color: C.muted, marginBottom: 5, fontWeight: 500, padding: 0 }}>Rating</legend>
-      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 2 }} onMouseLeave={() => setHover(0)}>
-        {[1, 2, 3, 4, 5].map((n) => (
-          <label key={n} className="crm-star" onMouseEnter={() => setHover(n)} style={{ cursor: 'pointer', padding: '2px 3px', position: 'relative' }}>
-            <input type="radio" name={name} value={n} checked={value === n} onChange={() => onChange(n)}
-              className="crm-sr" aria-label={`${n} star${n === 1 ? '' : 's'}`} />
-            <span aria-hidden="true" style={{ display: 'inline-block', fontSize: 28, lineHeight: 1, color: n <= shown ? C.soonBar : C.line }}>★</span>
-          </label>
-        ))}
-        <label className="crm-star" style={{ cursor: 'pointer', marginLeft: 8, position: 'relative' }}>
+      <legend style={{ fontSize: 13, color: C.muted, marginBottom: 5, fontWeight: 500, padding: 0 }}>{label}</legend>
+      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 2 }}>
+        <span style={{ display: 'inline-flex', gap: 2 }} onMouseLeave={() => setHover(0)}>
+          {[1, 2, 3, 4, 5].map((i) => (
+            <span key={i} style={{ position: 'relative', display: 'inline-block', padding: '2px 3px' }}>
+              <StarGlyph fill={starFill(shown, i)} size={28} on={C.soonBar} off={C.faint} stroke={1.1} />
+              {[i - 0.5, i].map((v) => (
+                <label key={v} className="crm-star" onMouseEnter={() => setHover(v)} style={{
+                  position: 'absolute', top: 0, bottom: 0, left: v === i ? '50%' : 0, width: '50%', cursor: 'pointer',
+                }}>
+                  <input type="radio" name={name} value={v} checked={value === v} onChange={() => onChange(v)}
+                    className="crm-sr" aria-label={starWord(v)} />
+                  <span aria-hidden="true" style={{ display: 'block', height: '100%' }} />
+                </label>
+              ))}
+            </span>
+          ))}
+        </span>
+        <span aria-hidden="true" style={{ fontSize: 13, color: C.muted, minWidth: 34, marginLeft: 6, fontVariantNumeric: 'tabular-nums' }}>
+          {shown ? `${shown} / 5` : ''}
+        </span>
+        <label className="crm-star" style={{ cursor: 'pointer', marginLeft: 4, position: 'relative' }}>
           <input type="radio" name={name} value="0" checked={!value} onChange={() => onChange(null)} className="crm-sr" />
           <span style={{ ...filterChip(!value), display: 'inline-block' }}>Not rated</span>
         </label>
@@ -6153,10 +6460,11 @@ const iconButton = (disabled) => ({
 const labelText = () => ({ display: 'block', fontSize: 13, color: C.muted, marginBottom: 5, fontWeight: 500 });
 
 /* ---------- trips: adding a place ---------- */
-// Type to search. Waits for a pause in typing, and the search itself keeps to
-// Nominatim's one request a second.
-function PlaceSearch({ onPick }) {
-  const [q, setQ] = useState('');
+// Type to search. Waits for a pause in typing, and the search itself keeps a
+// small gap between requests (see searchPlaces).
+// initial: something to search for straight away, such as a Places list entry.
+function PlaceSearch({ onPick, initial = '' }) {
+  const [q, setQ] = useState(initial);
   const [found, setFound] = useState({ status: 'idle', results: [] });
   const [active, setActive] = useState(-1);
   const [open, setOpen] = useState(false);
@@ -6211,7 +6519,7 @@ function PlaceSearch({ onPick }) {
     : found.status === 'none' ? 'No match. Check the spelling, or try just the town or city.'
     : found.status === 'offline' ? 'Could not reach the place search. Check the connection, or pick the spot on the map or enter coordinates instead.'
     : term ? 'Keep typing…'
-    : 'A town, landmark or address. Results come from OpenStreetMap.';
+    : 'A town, landmark or address.';
 
   return (
     <div>
@@ -6286,7 +6594,7 @@ function PinDrop({ stops, onAdd }) {
     <div>
       <div style={mapFrame()}>
         <MapSlot height={300} render={(m) => (
-          <m.PickMap stops={stops} pending={pending} onPick={pick} stopColor={RATING_COLORS[5]} pendingColor={RATING_COLORS[1]} />
+          <m.PickMap stops={stops} pending={pending} onPick={pick} stopColor={RATING_COLORS[5]} pendingColor={RATING_COLORS[1]} dark={C.dark} />
         )} />
       </div>
       {pending ? (
@@ -6419,11 +6727,14 @@ function CompanionPicker({ people, value, onChange }) {
 /* ---------- trips: the form ---------- */
 const withKey = (s) => ({ ...s, _k: uid() });
 
-function TripForm({ initial, people, onSave, onCancel }) {
+// seed: how a new trip starts out when it comes from somewhere else, such as
+// an entry on a Places list ({ title, status, query }).
+function TripForm({ initial, seed, people, onSave, onCancel }) {
   // A new trip gets its id now, so its photos can be stored as they are added.
   const [id] = useState(() => initial?.id || uid());
-  const [title, setTitle] = useState(initial?.title || '');
-  const [startDate, setStartDate] = useState(initial?.startDate || todayStr());
+  const [status, setStatus] = useState(() => (initial ? tripStatus(initial) : seed?.status || 'been'));
+  const [title, setTitle] = useState(initial?.title || seed?.title || '');
+  const [startDate, setStartDate] = useState(initial ? initial.startDate || '' : seed?.status && seed.status !== 'been' ? '' : todayStr());
   const [endDate, setEndDate] = useState(initial?.endDate || '');
   const [stops, setStops] = useState(() => (initial?.stops || []).map(withKey));
   const [how, setHow] = useState('search');
@@ -6527,9 +6838,10 @@ function TripForm({ initial, people, onSave, onCancel }) {
   const save = () => {
     const errs = [];
     if (!title.trim()) errs.push('Give the trip a title.');
-    if (!startDate) errs.push('Add the day the trip started.');
-    if (dateProblem) errs.push(dateProblem);
-    if (!stops.length) errs.push('Add at least one place you went.');
+    if (status === 'been' && !startDate) errs.push('Add the day the trip started.');
+    if (status === 'planned' && endDate && !startDate) errs.push('Add the day the trip starts, or leave both dates empty.');
+    if (status !== 'someday' && dateProblem) errs.push(dateProblem);
+    if (!stops.length) errs.push(status === 'been' ? 'Add at least one place you went.' : 'Add at least one place.');
     if (busy) errs.push('Wait for the photos to finish, then save.');
     if (errs.length) {
       setErrors(errs);
@@ -6543,8 +6855,9 @@ function TripForm({ initial, people, onSave, onCancel }) {
       createdAt: initial?.createdAt || now,
       updatedAt: now,
       title,
+      status,
       stops: stops.map(({ _k, ...s }) => s),
-      startDate,
+      startDate: startDate || null,
       endDate: endDate || null,
       rating,
       excerpt,
@@ -6579,30 +6892,59 @@ function TripForm({ initial, people, onSave, onCancel }) {
         </div>
       )}
 
-      <Field label="Title">
-        <input style={inputStyle} value={title} maxLength={TRIP_TITLE_CAP}
-          onChange={(e) => setTitle(e.target.value)} placeholder="A week in Portugal" />
-      </Field>
-
-      <Group label="When">
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <div style={{ flex: '1 1 150px' }}>
-            <label htmlFor={`${fid}s`} style={{ display: 'block', fontSize: 12, color: C.faint, marginBottom: 4 }}>Started</label>
-            <input id={`${fid}s`} type="date" style={inputStyle} value={startDate} required
-              onChange={(e) => setStartDate(e.target.value)} />
-          </div>
-          <div style={{ flex: '1 1 150px' }}>
-            <label htmlFor={`${fid}e`} style={{ display: 'block', fontSize: 12, color: C.faint, marginBottom: 4 }}>Ended (optional)</label>
-            <input id={`${fid}e`} type="date" style={inputStyle} value={endDate} min={startDate || undefined}
-              aria-invalid={Boolean(dateProblem)} aria-describedby={dateProblem ? `${fid}ed` : undefined}
-              onChange={(e) => setEndDate(e.target.value)} />
-          </div>
+      <Group label="This trip is">
+        <div role="group" aria-label="This trip is" style={{ display: 'flex', gap: 6, maxWidth: 420 }}>
+          {[['been', 'Been'], ['planned', 'Planned'], ['someday', 'Someday']].map(([v, l]) => (
+            <button key={v} className="crm-btn" aria-pressed={status === v} onClick={() => {
+              // A new trip's date starts on today, which only suits one you took.
+              if (!initial && v !== 'been' && startDate === todayStr() && !endDate) setStartDate('');
+              if (!initial && v === 'been' && !startDate) setStartDate(todayStr());
+              setStatus(v);
+            }}
+              style={{ ...segment(status === v), fontSize: 13 }}>{l}</button>
+          ))}
         </div>
-        {dateProblem && <span id={`${fid}ed`} style={{ ...hintStyle(), color: C.overdue }}>{dateProblem}</span>}
+        <span style={hintStyle()}>
+          {status === 'been' ? 'A trip you took.' : status === 'planned' ? 'Booked or taking shape. Dates are optional.' : 'Somewhere you would like to go one day.'}
+        </span>
       </Group>
 
+      <Field label="Title">
+        <input style={inputStyle} value={title} maxLength={TRIP_TITLE_CAP}
+          onChange={(e) => setTitle(e.target.value)} placeholder={status === 'someday' ? 'See the northern lights' : 'A week in Portugal'} />
+      </Field>
+
+      {status !== 'someday' && (
+        <Group label="When">
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <div style={{ flex: '1 1 150px' }}>
+              <label htmlFor={`${fid}s`} style={{ display: 'block', fontSize: 12, color: C.faint, marginBottom: 4 }}>
+                {status === 'been' ? 'Started' : 'Starts (optional)'}
+              </label>
+              <input id={`${fid}s`} type="date" style={inputStyle} value={startDate} required={status === 'been'}
+                onChange={(e) => setStartDate(e.target.value)} />
+            </div>
+            <div style={{ flex: '1 1 150px' }}>
+              <label htmlFor={`${fid}e`} style={{ display: 'block', fontSize: 12, color: C.faint, marginBottom: 4 }}>
+                {status === 'been' ? 'Ended (optional)' : 'Ends (optional)'}
+              </label>
+              <input id={`${fid}e`} type="date" style={inputStyle} value={endDate} min={startDate || undefined}
+                aria-invalid={Boolean(dateProblem)} aria-describedby={dateProblem ? `${fid}ed` : undefined}
+                onChange={(e) => setEndDate(e.target.value)} />
+            </div>
+          </div>
+          {dateProblem && <span id={`${fid}ed`} style={{ ...hintStyle(), color: C.overdue }}>{dateProblem}</span>}
+          {!dateProblem && status === 'been' && startDate > todayStr() && (
+            <span style={hintStyle()}>
+              That is still to come.{' '}
+              <button className="crm-btn" onClick={() => setStatus('planned')} style={textButton()}>Make it a planned trip</button>
+            </span>
+          )}
+        </Group>
+      )}
+
       <div style={section}>
-        <Group label="Where you went">
+        <Group label={status === 'been' ? 'Where you went' : 'Where'}>
           {stops.length === 0 ? (
             <p style={{ margin: '0 0 10px', fontSize: 13, color: C.faint }}>No places yet. Add at least one below.</p>
           ) : (
@@ -6647,7 +6989,7 @@ function TripForm({ initial, people, onSave, onCancel }) {
                   style={{ ...segment(how === v), fontSize: 12.5 }}>{l}</button>
               ))}
             </div>
-            {how === 'search' && <PlaceSearch onPick={addStop} />}
+            {how === 'search' && <PlaceSearch onPick={addStop} initial={initial ? '' : seed?.query || ''} />}
             {how === 'map' && <PinDrop stops={stops} onAdd={addStop} />}
             {how === 'coords' && <CoordEntry onAdd={addStop} />}
           </div>
@@ -6656,7 +6998,7 @@ function TripForm({ initial, people, onSave, onCancel }) {
       </div>
 
       <div style={section}>
-        <StarInput value={rating} onChange={setRating} />
+        {status === 'been' && <StarInput value={rating} onChange={setRating} />}
 
         <Field label="The highlight">
           <textarea
@@ -6941,7 +7283,9 @@ const TripSharePanel = memo(function TripSharePanel({ trip, owner }) {
 
 const osmLink = (s) => `https://www.openstreetmap.org/?mlat=${s.lat}&mlon=${s.lng}#map=13/${s.lat}/${s.lng}`;
 
-function TripDetail({ trip, people, owner, onEdit, onRemove, onBack, onPerson }) {
+const PLAN_WORDS = { planned: 'Planned', someday: 'Someday' };
+
+function TripDetail({ trip, people, owner, onEdit, onRemove, onBack, onPerson, onWent }) {
   const [confirm, setConfirm] = useState(false);
   const [sharing, setSharing] = useState(false);
   const [viewing, setViewing] = useState(null);
@@ -6956,9 +7300,21 @@ function TripDetail({ trip, people, owner, onEdit, onRemove, onBack, onPerson })
       </button>
       <h1 style={{ margin: 0, fontSize: 27, lineHeight: 1.18, fontWeight: 600, letterSpacing: '-0.035em' }}>{trip.title}</h1>
       <p style={{ margin: '6px 0 0', fontSize: 14, color: C.muted, display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'baseline' }}>
-        <span>{when.text}{when.days > 1 ? ` · ${when.days} days` : ''}</span>
+        {trip.status && <span style={kindChip()}>{PLAN_WORDS[trip.status]}</span>}
+        {(trip.startDate || trip.status === 'planned') && <span>{when.text}{when.days > 1 ? ` · ${when.days} days` : ''}</span>}
         <Stars n={trip.rating} size={16} />
       </p>
+      {tripOverdue(trip) && (
+        <div role="note" style={{
+          marginTop: 14, padding: '12px 14px', borderRadius: 10, background: C.surface, border: `1px solid ${C.accent}`,
+        }}>
+          <p style={{ margin: '0 0 10px', fontSize: 14, color: C.ink }}>The dates for this trip have passed. Did you go?</p>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <Button kind="solid" onClick={onWent} style={small}>Yes, I went</Button>
+            <Button onClick={onEdit} style={small}>Change the dates</Button>
+          </div>
+        </div>
+      )}
       {trip.tags.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
           {trip.tags.map((g) => <span key={g} style={kindChip()}>{g}</span>)}
@@ -7070,10 +7426,12 @@ function TripPopup({ trip, stop, onOpen }) {
   );
 }
 
-const TripCard = memo(function TripCard({ trip, onOpen }) {
+// onOpen gets the trip's id. Under the map it finds the trip there instead of
+// opening it, and says so to a screen reader.
+const TripCard = memo(function TripCard({ trip, onOpen, onMap }) {
   const places = trip.stops.map((s) => s.name).join(' → ');
   return (
-    <button className="crm-btn crm-row" onClick={() => onOpen(trip.id)} style={{
+    <button className="crm-btn crm-row" onClick={() => onOpen(trip.id)} aria-description={onMap ? 'Shows it on the map' : undefined} style={{
       display: 'flex', gap: 12, width: '100%', textAlign: 'left', font: 'inherit', color: C.ink,
       background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 10,
       cursor: 'pointer', alignItems: 'flex-start',
@@ -7084,15 +7442,18 @@ const TripCard = memo(function TripCard({ trip, onOpen }) {
             position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: C.paper,
           }}>
             <span style={{
-              width: 28, height: 28, borderRadius: 28, background: ratingColor(trip.rating), color: '#fff',
-              fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              width: 28, height: 28, borderRadius: 28, background: trip.status ? '#fff' : ratingColor(trip.rating), color: '#fff',
+              boxSizing: 'border-box', border: trip.status ? `${trip.status === 'planned' ? '4px solid' : '3px dashed'} ${PLAN_COLORS[trip.status]}` : 'none',
+              fontSize: Number.isInteger(trip.rating) ? 13 : 10.5, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center',
             }}>{trip.rating || ''}</span>
           </span>
         )} />
       <span style={{ display: 'block', minWidth: 0, flex: 1 }}>
         <span style={{ display: 'block', fontSize: 15.5, fontWeight: 600, letterSpacing: '-0.02em', lineHeight: 1.25 }}>{trip.title}</span>
         <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline', fontSize: 12.5, color: C.muted, marginTop: 3 }}>
-          <span>{tripWhen(trip).text}</span>
+          {trip.status !== 'someday' && <span>{tripWhen(trip).text}</span>}
+          {trip.status && <span style={kindChip()}>{PLAN_WORDS[trip.status]}</span>}
+          {tripOverdue(trip) && <span style={{ color: C.calmText, fontWeight: 600 }}>Did you go?</span>}
           <Stars n={trip.rating} size={12.5} />
         </span>
         <span style={{ display: 'block', fontSize: 12, color: C.faint, marginTop: 3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{places}</span>
@@ -7180,47 +7541,124 @@ function EventsOffer({ events, onConvert, onDismiss }) {
 }
 
 // The same box Import has, since a trip arrives the same ways anything
-// shared does. Whatever is opened goes where its kind belongs.
-function AddSharedTrip({ onOpen }) {
-  const [open, setOpen] = useState(false);
-  if (!open) {
-    return (
-      <button className="crm-btn" onClick={() => setOpen(true)} style={{ ...textButton(), fontSize: 13, color: C.muted }}>
-        Add a shared trip
-      </button>
-    );
-  }
+// shared does. Whatever is opened goes where its kind belongs. Opened from
+// the button beside "Add a trip".
+function AddSharedTrip({ onOpen, onClose }) {
   return (
-    <div className="crm-open" style={{ maxWidth: 560 }}>
-      <OpenShared onOpen={(got) => { setOpen(false); onOpen(got); }} />
-      <Button onClick={() => setOpen(false)} style={{ ...small, marginTop: -8 }}>Cancel</Button>
+    <div id="add-shared-trip" className="crm-open" style={{ margin: '0 0 14px', maxWidth: 560 }}>
+      <OpenShared onOpen={(got) => { onClose(); onOpen(got); }} />
+      <Button onClick={onClose} style={{ ...small, marginTop: -8 }}>Cancel</Button>
+    </div>
+  );
+}
+
+// The counts at the top of Trips. Everyone can hide them; Recap keeps the
+// same numbers year by year either way.
+function TripStats({ stats, onHide }) {
+  const tile = { flex: '1 1 110px', background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '11px 12px', minWidth: 0 };
+  const num = { fontSize: 24, fontWeight: 600, letterSpacing: '-0.04em', lineHeight: 1, color: C.ink };
+  const lab = { fontSize: 12, color: C.muted, marginTop: 6, lineHeight: 1.3 };
+  const n = (x) => (x === null ? '…' : x);
+  return (
+    <section aria-label="Trip stats" style={{ margin: '0 0 14px' }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+        <div style={tile}><div style={num}>{n(stats.countries && stats.countries.size)}</div><div style={lab}>{stats.countries?.size === 1 ? 'country' : 'countries'}</div></div>
+        {stats.states && stats.states.size > 0 && (
+          <div style={tile}><div style={num}>{stats.states.size}</div><div style={lab}>{stats.states.size === 1 ? 'US state' : 'US states'}</div></div>
+        )}
+        <div style={tile}><div style={num}>{stats.places}</div><div style={lab}>{stats.places === 1 ? 'place' : 'places'}</div></div>
+        <div style={tile}><div style={{ ...num, color: C.accentDeep }}>{stats.days}</div><div style={lab}>{`${stats.days === 1 ? 'day' : 'days'} away in ${stats.year}`}</div></div>
+        {stats.top && (
+          <div style={{ ...tile, flex: '2 1 190px' }}>
+            <div style={{ ...num, fontSize: 19, letterSpacing: '-0.03em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: 1.26 }}>{stats.top.name}</div>
+            <div style={lab}>{`Most visited · ${stats.top.trips} trips`}</div>
+          </div>
+        )}
+      </div>
+      <button className="crm-btn" onClick={onHide} style={{ ...textButton(), fontSize: 12, fontWeight: 500, color: C.faint, marginTop: 6 }}>
+        Hide stats
+      </button>
+    </section>
+  );
+}
+
+// The trips in their groups: coming up, been, someday. Headings show under
+// the map, and in the list once there is more than one group.
+function TripSections({ groups, onOpen, onMap = false, narrowed }) {
+  const parts = [
+    ['planned', 'Coming up', groups.planned],
+    ['been', narrowed ? 'Matching trips' : 'Recent trips', groups.been],
+    ['someday', 'Someday', groups.someday],
+  ].filter(([, , list]) => list.length);
+  const heads = onMap || parts.length > 1;
+  return parts.map(([k, head, list], i) => (
+    <section key={k} aria-labelledby={heads ? `trips-${k}` : undefined} aria-label={heads ? undefined : 'Trips'}
+      style={{ marginTop: i ? 26 : onMap ? 26 : 0 }}>
+      {heads && (
+        <h2 id={`trips-${k}`} style={{ margin: '0 0 10px', fontSize: 17, fontWeight: 600, letterSpacing: '-0.02em' }}>
+          {head}
+          <span style={{ fontSize: 13, fontWeight: 500, color: C.faint, marginLeft: 8 }}>{list.length}</span>
+        </h2>
+      )}
+      {onMap && i === 0 && <p style={{ margin: '-6px 0 10px', fontSize: 13, color: C.muted }}>Tap one to find it on the map.</p>}
+      <TripCards trips={list} onOpen={onOpen} onMap={onMap} />
+    </section>
+  ));
+}
+
+// The trips as cards: under the map, or on their own as the list.
+function TripCards({ trips, onOpen, onMap = false }) {
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(300px, 100%), 1fr))', gap: 10 }}>
+      {trips.map((t) => <TripCard key={t.id} trip={t} onOpen={onOpen} onMap={onMap} />)}
     </div>
   );
 }
 
 function TripsView({
-  trips, people, look, incoming, offer, notice,
+  trips, people, look, incoming, offer, notice, statsHidden, onStatsHidden,
   onOpen, onNew, onTakeShared, onOpenShared, onDropShared, onConvert, onDismissOffer, onDismissNotice, onBackup, signedIn,
 }) {
   const [mode, setMode] = useState(look.current.mode);
   const [f, setF] = useState(look.current.filter);
-  useEffect(() => { look.current = { mode, filter: f }; }, [look, mode, f]);
+  const [addingShared, setAddingShared] = useState(false);
+  const { geo, where } = useGeo();
+  const [shade, setShade] = useState(Boolean(look.current.shade));
+  const stats = useMemo(() => tripStats(trips, where, new Date().getFullYear()), [trips, where]);
+  // A card tapped under the map: the map brings that trip into view.
+  const [focus, setFocus] = useState(null);
+  const mapBox = useRef(null);
+  const showOnMap = useCallback((tripId) => {
+    const calm = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    mapBox.current?.scrollIntoView({ behavior: calm ? 'auto' : 'smooth', block: 'center' });
+    setFocus({ tripId });
+  }, []);
+  useEffect(() => { look.current = { mode, filter: f, shade }; }, [look, mode, f, shade]);
 
   const opts = useMemo(() => tripFilterOptions(trips), [trips]);
+  const plans = useMemo(() => new Set(trips.map((t) => t.status).filter(Boolean)), [trips]);
   const names = useMemo(() => new Map(people.map((p) => [p.id, p.name])), [people]);
   // A filter left pointing at something no longer there (a tag nobody has
   // now, a person deleted) is quietly dropped rather than hiding everything.
   const live = useMemo(() => ({
     year: opts.years.includes(Number(f.year)) ? f.year : '',
     minRating: f.minRating,
+    status: plans.has(f.status) || (f.status === 'been' && plans.size > 0) ? f.status : '',
     companion: opts.companions.includes(f.companion) && names.has(f.companion) ? f.companion : '',
     tag: opts.tags.find((g) => g.toLowerCase() === (f.tag || '').toLowerCase()) || '',
-  }), [f, opts, names]);
-  const narrowed = Boolean(live.year || live.minRating || live.companion || live.tag);
+  }), [f, opts, names, plans]);
+  const narrowed = Boolean(live.status || live.year || live.minRating || live.companion || live.tag);
   const shown = useMemo(() => sortTrips(filterTrips(trips, live)), [trips, live]);
+  const groups = useMemo(() => tripGroups(shown), [shown]);
+  const been = useMemo(() => trips.filter((t) => !t.status), [trips]);
   const byId = useMemo(() => new Map(trips.map((t) => [t.id, t])), [trips]);
   const points = useMemo(() => tripPoints(shown), [shown]);
-  const places = useMemo(() => new Set(trips.flatMap((t) => t.stops.map((s) => `${s.lat.toFixed(2)},${s.lng.toFixed(2)}`))).size, [trips]);
+  // The countries (and US states) of the trips shown, to shade on the map.
+  const shaded = useMemo(() => {
+    if (!shade || !geo || !where) return null;
+    const { countries, states } = whereAll(shown, where);
+    return geo.shapesNamed(countries, states);
+  }, [shade, geo, where, shown]);
 
   const set = (k, v) => setF({ ...live, [k]: v });
   const pick = { ...inputStyle, width: 'auto', flex: '1 1 140px', minHeight: 36, padding: '6px 11px', fontSize: 13 };
@@ -7233,14 +7671,30 @@ function TripsView({
   if (trips.length) {
     head = narrowed
       ? `${countThings(shown.length, 'trip', 'trips')} of ${trips.length}`
-      : `${countThings(trips.length, 'trip', 'trips')}, ${countThings(places, 'place', 'places').toLowerCase()}`;
-    sub = mode === 'map' ? 'Tap a pin for the trip. Pins close together gather into a circle; tap it to zoom in.' : 'Newest first.';
+      : been.length
+        ? `${countThings(been.length, 'trip', 'trips')}, ${countThings(stats.places, 'place', 'places').toLowerCase()}`
+        : `${countThings(trips.length, 'trip', 'trips')} to come`;
+    sub = mode === 'map'
+      ? 'Tap a pin for the trip, or scroll down for your latest. Pins close together gather into a circle; tap it to zoom in.'
+      : 'Newest first.';
   }
 
   return (
     <div>
       <h1 style={{ margin: 0, fontSize: 27, lineHeight: 1.18, fontWeight: 600, letterSpacing: '-0.035em' }}>{head}</h1>
-      <p style={{ margin: '8px 0 18px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>{sub}</p>
+      <p style={{ margin: '8px 0 18px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
+        {sub}
+        {statsHidden && stats.trips > 0 && (
+          <>
+            {' '}
+            <button className="crm-btn" onClick={() => onStatsHidden(false)} style={{ ...textButton(), fontSize: 13, fontWeight: 500, color: C.muted }}>
+              Show stats
+            </button>
+          </>
+        )}
+      </p>
+
+      {!statsHidden && stats.trips > 0 && <TripStats stats={stats} onHide={() => onStatsHidden(true)} />}
 
       {notice && (
         <div role="note" style={{
@@ -7268,22 +7722,37 @@ function TripsView({
         {trips.length > 0 && (
           <div role="group" aria-label="Show trips as" style={{ display: 'flex', gap: 6, flex: '0 1 220px' }}>
             {[['map', 'Map'], ['list', 'List']].map(([v, l]) => (
-              <button key={v} className="crm-btn" aria-pressed={mode === v} onClick={() => setMode(v)} style={segment(mode === v)}>{l}</button>
+              <button key={v} className="crm-btn" aria-pressed={mode === v} onClick={() => { setMode(v); setFocus(null); }} style={segment(mode === v)}>{l}</button>
             ))}
           </div>
         )}
-        <Button kind="solid" onClick={onNew} style={{ marginLeft: 'auto' }}>Add a trip</Button>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginLeft: 'auto' }}>
+          <Button onClick={() => setAddingShared((o) => !o)} aria-expanded={addingShared} aria-controls="add-shared-trip">
+            Add a shared trip
+          </Button>
+          <Button kind="solid" onClick={onNew}>Add a trip</Button>
+        </div>
       </div>
+
+      {addingShared && <AddSharedTrip onOpen={onOpenShared} onClose={() => setAddingShared(false)} />}
 
       {trips.length > 0 && (
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', margin: '0 0 12px' }}>
+          {plans.size > 0 && (
+            <select className="crm-select" aria-label="Show" value={live.status} onChange={(e) => set('status', e.target.value)} style={pick}>
+              <option value="">Every trip</option>
+              <option value="been">Been</option>
+              {plans.has('planned') && <option value="planned">Planned</option>}
+              {plans.has('someday') && <option value="someday">Someday</option>}
+            </select>
+          )}
           <select className="crm-select" aria-label="Year" value={live.year} onChange={(e) => set('year', e.target.value)} style={pick}>
             <option value="">Any year</option>
             {opts.years.map((y) => <option key={y} value={y}>{y}</option>)}
           </select>
           <select className="crm-select" aria-label="Rating" value={live.minRating} onChange={(e) => set('minRating', Number(e.target.value))} style={pick}>
             <option value={0}>Any rating</option>
-            {[1, 2, 3, 4].map((r) => <option key={r} value={r}>{`${r} star${r === 1 ? '' : 's'} and up`}</option>)}
+            {[1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5].map((r) => <option key={r} value={r}>{`${starWord(r)} and up`}</option>)}
             <option value={5}>5 stars only</option>
           </select>
           {companionOptions.length > 0 && (
@@ -7304,11 +7773,14 @@ function TripsView({
 
       {(mode === 'map' || trips.length === 0) ? (
         <>
-          <div style={mapFrame()}>
+          <div ref={mapBox} style={mapFrame()}>
             <MapSlot height={mapHeight} render={(m) => (
               <m.TripsMap
                 points={points}
                 height={mapHeight}
+                dark={C.dark}
+                focus={focus}
+                shade={shaded}
                 renderPopup={(p) => {
                   const t = byId.get(p.tripId);
                   return t ? <TripPopup trip={t} stop={p.stop} onOpen={() => onOpen(t.id)} /> : null;
@@ -7338,7 +7810,21 @@ function TripsView({
               </div>
             )}
           </div>
-          {trips.length > 0 && <RatingLegend />}
+          {trips.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: '6px 14px' }}>
+              <div style={{ flex: '1 1 300px' }}><RatingLegend plans={plans} /></div>
+              {stats.trips > 0 && (
+                <button className="crm-btn" aria-pressed={shade} onClick={() => setShade((v) => !v)}
+                  style={{ ...filterChip(shade), marginTop: 6, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <span aria-hidden="true" style={{
+                    width: 12, height: 12, borderRadius: 3, background: shade ? C.onAccent : C.accent, opacity: shade ? 0.6 : 1,
+                  }} />
+                  Shade countries I have been to
+                </button>
+              )}
+            </div>
+          )}
+          {shown.length > 0 && <TripSections groups={groups} onOpen={showOnMap} onMap narrowed={narrowed} />}
         </>
       ) : shown.length === 0 ? (
         <div style={{ padding: '18px 16px', border: `1px solid ${C.line}`, borderRadius: 12, background: C.surface }}>
@@ -7346,14 +7832,8 @@ function TripsView({
           <Button onClick={() => setF(NO_TRIP_FILTER)} style={small}>Clear filters</Button>
         </div>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 10 }}>
-          {shown.map((t) => <TripCard key={t.id} trip={t} onOpen={onOpen} />)}
-        </div>
+        <TripSections groups={groups} onOpen={onOpen} narrowed={narrowed} />
       )}
-
-      <div style={{ marginTop: 22 }}>
-        <AddSharedTrip onOpen={onOpenShared} />
-      </div>
     </div>
   );
 }
@@ -8669,6 +9149,7 @@ export default function PersonalCRM({ account = null } = {}) {
   // turn pinned events into trips have been answered. Both start answered so
   // neither flashes up before storage has been read.
   const [tripNoticeSeen, setTripNoticeSeen] = useState(true);
+  const [tripStatsHidden, setTripStatsHidden] = useState(false);
   const [tripOfferDone, setTripOfferDone] = useState(true);
   const [lastBackup, setLastBackup] = useState('');
   // Saved lists that could not be read as they were: their original text,
@@ -8679,6 +9160,29 @@ export default function PersonalCRM({ account = null } = {}) {
   const heldBack = useRef(new Set());
   const [menuOpen, setMenuOpen] = useState(false);
   const [year, setYear] = useState(new Date().getFullYear());
+  // The calendar year, kept current: when it turns over while Orbit is open
+  // (or on coming back to it), Recap moves on to the new year too, unless
+  // an older year is being looked at on purpose.
+  const [thisYear, setThisYear] = useState(() => new Date().getFullYear());
+  const thisYearSeen = useRef(thisYear);
+  useEffect(() => {
+    const check = () => {
+      const now = new Date().getFullYear();
+      if (now === thisYearSeen.current) return;
+      const was = thisYearSeen.current;
+      thisYearSeen.current = now;
+      setThisYear(now);
+      setYear((y) => (y === was ? now : y));
+    };
+    const tick = setInterval(check, 60000);
+    document.addEventListener('visibilitychange', check);
+    window.addEventListener('focus', check);
+    return () => {
+      clearInterval(tick);
+      document.removeEventListener('visibilitychange', check);
+      window.removeEventListener('focus', check);
+    };
+  }, []);
   const [backup, setBackup] = useState('');
   const [paste, setPaste] = useState('');
 
@@ -8727,10 +9231,12 @@ export default function PersonalCRM({ account = null } = {}) {
           .catch(() => { /* the photo store is out of reach; nothing to tidy */ });
       }
       try {
-        const [seen, offered, backedUp] = await Promise.all([
+        const [seen, offered, backedUp, statsOff] = await Promise.all([
           window.storage.get(TRIPS_NOTICE_KEY), window.storage.get(TRIPS_OFFER_KEY), window.storage.get(BACKUP_AT_KEY),
+          window.storage.get(TRIP_STATS_KEY),
         ]);
         setTripNoticeSeen(Boolean(seen?.value));
+        setTripStatsHidden(statsOff?.value === 'hidden');
         setTripOfferDone(Boolean(offered?.value));
         if (backedUp?.value) setLastBackup(backedUp.value);
       } catch {
@@ -9269,7 +9775,8 @@ export default function PersonalCRM({ account = null } = {}) {
     [people]
   );
   const years = useMemo(() => {
-    const found = new Set([new Date().getFullYear()]);
+    const found = new Set([thisYear]);
+    trips.forEach((t) => { if (!t.status) tripYears(t).forEach((y) => { if (y <= thisYear) found.add(y); }); });
     people.forEach((p) => {
       if (p.addedOn) found.add(Number(p.addedOn.slice(0, 4)));
       (p.log || []).forEach((e) => e.date && found.add(Number(e.date.slice(0, 4))));
@@ -9279,7 +9786,7 @@ export default function PersonalCRM({ account = null } = {}) {
     collections.forEach((c) => c.items.forEach((it) =>
       it.doneOn && stageOf(c, it) === 'done' && found.add(Number(it.doneOn.slice(0, 4)))));
     return [...found].sort((a, b) => b - a);
-  }, [people, reminders, collections]);
+  }, [people, reminders, collections, trips, thisYear]);
 
   const companies = useMemo(
     () => [...new Set(people.map((p) => p.company).filter(Boolean))].sort(),
@@ -9449,9 +9956,21 @@ export default function PersonalCRM({ account = null } = {}) {
           outline: 2px solid ${C.ink}; outline-offset: 2px; border-radius: 6px;
         }
         .crm-clamp { -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-        /* Maps. The tiles are light in both themes; popups follow the theme. */
-        /* OpenStreetMap's sea colour, so any gap around the world reads as ocean. */
-        .orbit-map { font-family: inherit; background: #AAD3DF; }
+        /* Maps. Tiles, popups and controls all follow the theme. */
+        /* Close to the tiles' own sea, so any gap around the world reads as ocean. */
+        .orbit-map { font-family: inherit; background: ${C.dark ? '#1B1D20' : '#D6DCDE'}; }
+        .orbit-map .leaflet-bar { border: 1px solid ${C.line}; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.12); overflow: hidden; }
+        .orbit-map .leaflet-bar a {
+          width: 34px; height: 34px; line-height: 32px; font-size: 18px; font-weight: 500;
+          background: ${C.surface}; color: ${C.ink}; border-bottom: 1px solid ${C.line};
+        }
+        .orbit-map .leaflet-bar a:last-child { border-bottom: none; }
+        .orbit-map .leaflet-bar a:hover, .orbit-map .leaflet-bar a:focus-visible { background: ${C.rowHover}; color: ${C.ink}; }
+        .orbit-map .leaflet-bar a.leaflet-disabled { background: ${C.surface}; color: ${C.faint}; opacity: 0.5; }
+        .orbit-map .leaflet-control-attribution {
+          background: ${C.surface}cc; color: ${C.muted}; font-size: 10.5px; border-top-left-radius: 6px; padding: 1px 6px;
+        }
+        .orbit-map .leaflet-control-attribution a { color: ${C.muted}; }
         .orbit-map .leaflet-popup-content-wrapper, .orbit-map .leaflet-popup-tip {
           background: ${C.surface}; color: ${C.ink}; box-shadow: 0 6px 22px rgba(0,0,0,0.28);
         }
@@ -9463,6 +9982,12 @@ export default function PersonalCRM({ account = null } = {}) {
           border-radius: 50%; color: #fff; font-weight: 700; font-family: system-ui, sans-serif;
         }
         .orbit-pin span { width: 28px; height: 28px; font-size: 13px; border: 2px solid #fff; box-shadow: 0 1px 5px rgba(0,0,0,0.45); }
+        /* Trips to come: the colour moves from the fill to a thick ring. */
+        .orbit-pin-planned span, .orbit-pin-someday span {
+          background: #fff !important; box-shadow: 0 0 0 2px #fff, 0 1px 5px rgba(0,0,0,0.45);
+        }
+        .orbit-pin-planned span { border: 4px solid ${PLAN_COLORS.planned}; }
+        .orbit-pin-someday span { border: 3px dashed ${PLAN_COLORS.someday}; }
         .orbit-cluster span {
           width: 38px; height: 38px; font-size: 13px; background: #15211B;
           border: 3px solid #72DE88; box-shadow: 0 1px 6px rgba(0,0,0,0.4);
@@ -9774,6 +10299,14 @@ export default function PersonalCRM({ account = null } = {}) {
                   setCollectionOpen(null);
                 }}
                 onBack={() => setCollectionOpen(null)}
+                onTrip={({ title, detail, done }) => {
+                  // A place already been to becomes a trip you took; one
+                  // still wanted becomes a someday trip. Its place is searched for.
+                  setTripDraft({ trip: null, seed: { title, status: done ? 'been' : 'someday', query: [title, detail].filter(Boolean).join(', ') } });
+                  setTripOpen(null);
+                  setView('trips');
+                  window.scrollTo(0, 0);
+                }}
               />
             ) : (
               <CollectionsView
@@ -9856,6 +10389,7 @@ export default function PersonalCRM({ account = null } = {}) {
             ) : tripDraft ? (
               <TripForm
                 initial={tripDraft.trip}
+                seed={tripDraft.seed}
                 people={people}
                 onSave={saveTrip}
                 onCancel={() => setTripDraft(null)}
@@ -9868,6 +10402,10 @@ export default function PersonalCRM({ account = null } = {}) {
                 owner={owner}
                 onEdit={() => { setTripDraft({ trip: openTrip }); window.scrollTo(0, 0); }}
                 onRemove={() => removeTrip(openTrip)}
+                onWent={() => {
+                  const went = cleanTrip({ ...openTrip, status: 'been', updatedAt: new Date().toISOString() });
+                  if (went) saveTrip(went);
+                }}
                 onBack={() => setTripOpen(null)}
                 onPerson={(id) => {
                   setView('list'); setCircleTab('all'); setOpenId(id);
@@ -9882,6 +10420,11 @@ export default function PersonalCRM({ account = null } = {}) {
                 incoming={incomingTrip}
                 offer={pinnedEvents}
                 notice={!tripNoticeSeen}
+                statsHidden={tripStatsHidden}
+                onStatsHidden={(hide) => {
+                  setTripStatsHidden(hide);
+                  window.storage.set(TRIP_STATS_KEY, hide ? 'hidden' : 'shown').catch(() => { /* asked again next visit */ });
+                }}
                 onOpen={openTripById}
                 onNew={() => { setTripDraft({ trip: null }); window.scrollTo(0, 0); }}
                 onTakeShared={takeSharedTrip}
@@ -9917,6 +10460,8 @@ export default function PersonalCRM({ account = null } = {}) {
         {view === 'recap' && (
           <div className="crm-full">
             <Recap people={people} year={year} years={years} onYear={setYear}
+              trips={trips}
+              onTrip={(id) => { setView('trips'); openTripById(id); }}
               eventCount={events.filter((e) => Number(e.date.slice(0, 4)) === year).length}
               reminderCount={reminders.reduce((n, r) => n + (r.history || [])
                 .filter((h) => h?.date && Number(h.date.slice(0, 4)) === year).length, 0)}

@@ -45,12 +45,21 @@ describe('the trip record', () => {
     assert.equal(trip({ endDate: 'soon' }).endDate, null);
   });
 
-  it('only keeps whole-star ratings from 1 to 5', () => {
+  it('keeps ratings from half a star to 5, in half steps', () => {
     assert.equal(trip({ rating: 0 }).rating, null);
     assert.equal(trip({ rating: 6 }).rating, null);
-    assert.equal(trip({ rating: 3.5 }).rating, null);
+    assert.equal(trip({ rating: 5.5 }).rating, null);
+    assert.equal(trip({ rating: 3.25 }).rating, null);
     assert.equal(trip({ rating: '4' }).rating, null);
-    assert.equal(trip({ rating: 5 }).rating, 5);
+    assert.equal(trip({ rating: 0.5 }).rating, 0.5);
+    assert.equal(trip({ rating: 3.5 }).rating, 3.5);
+    assert.equal(trip({ rating: 5 }).rating, 5, 'a whole-star rating from before halves reads the same');
+  });
+
+  it('writes half stars in plain text', () => {
+    assert.equal(A.stars(4.5), '★★★★½');
+    assert.equal(A.stars(0.5), '½☆☆☆☆');
+    assert.equal(A.stars(3), '★★★☆☆');
   });
 
   it('caps the highlight at 280 characters and a trip at 30 photos', () => {
@@ -113,6 +122,20 @@ describe('looking at trips', () => {
     assert.equal(pins.find((p) => p.tripId === 'a').color, A.RATING_COLORS[5]);
     assert.equal(porto[0].color, A.RATING_COLORS[0], 'unrated');
     assert.equal(porto[0].text, '');
+  });
+
+  it('gives a half star its whole star\'s colour, and half a star the colour of one', () => {
+    assert.equal(A.ratingColor(4.5), A.RATING_COLORS[4]);
+    assert.equal(A.ratingColor(1.5), A.RATING_COLORS[1]);
+    assert.equal(A.ratingColor(0.5), A.RATING_COLORS[1]);
+    assert.equal(A.ratingColor(null), A.RATING_COLORS[0]);
+    const half = A.tripPoints([trip({ id: 'h', rating: 3.5 })])[0];
+    assert.deepEqual([half.color, half.text], [A.RATING_COLORS[3], '3.5']);
+  });
+
+  it('filters by half-star minimum ratings', () => {
+    const rated = [trip({ id: 'x', rating: 4 }), trip({ id: 'y', rating: 4.5 })];
+    assert.equal(A.filterTrips(rated, { ...A.NO_TRIP_FILTER, minRating: 4.5 }).map((t) => t.id).join(), 'y');
   });
 
   it('says when a trip was, collapsing what repeats', () => {
@@ -265,19 +288,29 @@ describe('place search', () => {
   const realFetch = globalThis.fetch;
   after(() => { globalThis.fetch = realFetch; });
 
-  it('asks Nominatim, keeps a second between requests, and remembers answers', async () => {
+  it('asks Stadia, keeps a gap between requests, and remembers answers', async () => {
     const asked = [];
     globalThis.fetch = async (url) => {
       asked.push({ url: String(url), at: performance.now() });
-      return { ok: true, json: async () => [{ name: 'Porto', display_name: 'Porto, Portugal', lat: '41.1', lon: '-8.6' }, { lat: 'x' }] };
+      return {
+        ok: true,
+        json: async () => ({
+          type: 'FeatureCollection',
+          features: [
+            { type: 'Feature', geometry: { type: 'Point', coordinates: [-8.6, 41.1] }, properties: { name: 'Porto', label: 'Porto, Portugal' } },
+            { type: 'Feature', geometry: { type: 'Point', coordinates: ['x', 1] }, properties: { name: 'Broken', label: 'Broken' } },
+          ],
+        }),
+      };
     };
     const a = await A.searchPlaces('Porto one');
     const b = await A.searchPlaces('Porto two');
     const c = await A.searchPlaces('porto ONE');
     assert.equal(asked.length, 2, 'the repeated search is answered from memory');
-    assert.ok(asked[0].url.startsWith('https://nominatim.openstreetmap.org/search?'));
-    assert.ok(asked[0].url.includes('format=jsonv2'));
-    assert.ok(asked[1].at - asked[0].at >= 990, `requests ${asked[1].at - asked[0].at}ms apart`);
+    assert.ok(asked[0].url.startsWith('https://api.stadiamaps.com/geocoding/v1/autocomplete?'));
+    assert.ok(asked[0].url.includes('text=Porto+one') && asked[0].url.includes('size=5'), asked[0].url);
+    assert.ok(!/api_key/.test(asked[0].url), 'no key: the site is recognised by its domain');
+    assert.ok(asked[1].at - asked[0].at >= 290, `requests ${asked[1].at - asked[0].at}ms apart`);
     assert.deepEqual(a, { status: 'ok', results: [{ label: 'Porto, Portugal', name: 'Porto', lat: 41.1, lon: -8.6 }] });
     assert.deepEqual(b, a);
     assert.equal(c, a);
@@ -288,7 +321,7 @@ describe('place search', () => {
     assert.equal((await A.searchPlaces('Nowhere at all')).status, 'offline');
     globalThis.fetch = async () => ({ ok: false, status: 429 });
     assert.equal((await A.searchPlaces('Too many')).status, 'offline');
-    globalThis.fetch = async () => ({ ok: true, json: async () => [] });
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ type: 'FeatureCollection', features: [] }) });
     assert.equal((await A.searchPlaces('Xyzzy')).status, 'none');
   });
 });
