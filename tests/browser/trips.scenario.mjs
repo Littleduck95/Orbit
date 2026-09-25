@@ -244,6 +244,17 @@ export default async function trips({ newPage, check, tab, shots }) {
   check('Open trip goes to the trip', await page.getByRole('heading', { name: 'Weekend upstate' }).isVisible());
   await page.getByRole('button', { name: '← All trips' }).click();
 
+  // ---- a card under the map finds its trip on the map ----
+  await page.locator('section .crm-row', { hasText: 'A week in Portugal' }).click();
+  const found = page.locator('.leaflet-popup', { hasText: 'A week in Portugal' });
+  await found.waitFor({ timeout: 5000 });
+  check('tapping a card under the map opens that trip on the map', (await found.textContent()).includes('Place 1 of'));
+  check('and the keyboard lands on its Open trip button',
+    await page.evaluate(() => document.activeElement?.textContent) === 'Open trip');
+  check('the page scrolls up to the map', await page.evaluate(() => document.querySelector('.leaflet-container')?.getBoundingClientRect().top < window.innerHeight));
+  await page.getByRole('button', { name: 'Map', exact: true }).click();
+  await page.keyboard.press('Escape');
+
   await page.getByRole('button', { name: 'List', exact: true }).click();
   const titles = cards;
   await page.getByLabel('Year').selectOption('2025');

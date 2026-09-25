@@ -7086,10 +7086,12 @@ function TripPopup({ trip, stop, onOpen }) {
   );
 }
 
-const TripCard = memo(function TripCard({ trip, onOpen }) {
+// onOpen gets the trip's id. Under the map it finds the trip there instead of
+// opening it, and says so to a screen reader.
+const TripCard = memo(function TripCard({ trip, onOpen, onMap }) {
   const places = trip.stops.map((s) => s.name).join(' → ');
   return (
-    <button className="crm-btn crm-row" onClick={() => onOpen(trip.id)} style={{
+    <button className="crm-btn crm-row" onClick={() => onOpen(trip.id)} aria-description={onMap ? 'Shows it on the map' : undefined} style={{
       display: 'flex', gap: 12, width: '100%', textAlign: 'left', font: 'inherit', color: C.ink,
       background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 10,
       cursor: 'pointer', alignItems: 'flex-start',
@@ -7208,10 +7210,10 @@ function AddSharedTrip({ onOpen, onClose }) {
 }
 
 // The trips as cards, newest first: under the map, or on their own as the list.
-function TripCards({ trips, onOpen }) {
+function TripCards({ trips, onOpen, onMap = false }) {
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(300px, 100%), 1fr))', gap: 10 }}>
-      {trips.map((t) => <TripCard key={t.id} trip={t} onOpen={onOpen} />)}
+      {trips.map((t) => <TripCard key={t.id} trip={t} onOpen={onOpen} onMap={onMap} />)}
     </div>
   );
 }
@@ -7223,6 +7225,14 @@ function TripsView({
   const [mode, setMode] = useState(look.current.mode);
   const [f, setF] = useState(look.current.filter);
   const [addingShared, setAddingShared] = useState(false);
+  // A card tapped under the map: the map brings that trip into view.
+  const [focus, setFocus] = useState(null);
+  const mapBox = useRef(null);
+  const showOnMap = useCallback((tripId) => {
+    const calm = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    mapBox.current?.scrollIntoView({ behavior: calm ? 'auto' : 'smooth', block: 'center' });
+    setFocus({ tripId });
+  }, []);
   useEffect(() => { look.current = { mode, filter: f }; }, [look, mode, f]);
 
   const opts = useMemo(() => tripFilterOptions(trips), [trips]);
@@ -7289,7 +7299,7 @@ function TripsView({
         {trips.length > 0 && (
           <div role="group" aria-label="Show trips as" style={{ display: 'flex', gap: 6, flex: '0 1 220px' }}>
             {[['map', 'Map'], ['list', 'List']].map(([v, l]) => (
-              <button key={v} className="crm-btn" aria-pressed={mode === v} onClick={() => setMode(v)} style={segment(mode === v)}>{l}</button>
+              <button key={v} className="crm-btn" aria-pressed={mode === v} onClick={() => { setMode(v); setFocus(null); }} style={segment(mode === v)}>{l}</button>
             ))}
           </div>
         )}
@@ -7332,12 +7342,13 @@ function TripsView({
 
       {(mode === 'map' || trips.length === 0) ? (
         <>
-          <div style={mapFrame()}>
+          <div ref={mapBox} style={mapFrame()}>
             <MapSlot height={mapHeight} render={(m) => (
               <m.TripsMap
                 points={points}
                 height={mapHeight}
                 dark={C.dark}
+                focus={focus}
                 renderPopup={(p) => {
                   const t = byId.get(p.tripId);
                   return t ? <TripPopup trip={t} stop={p.stop} onOpen={() => onOpen(t.id)} /> : null;
@@ -7370,10 +7381,11 @@ function TripsView({
           {trips.length > 0 && <RatingLegend />}
           {shown.length > 0 && (
             <section aria-labelledby="recent-trips" style={{ marginTop: 26 }}>
-              <h2 id="recent-trips" style={{ margin: '0 0 10px', fontSize: 17, fontWeight: 600, letterSpacing: '-0.02em' }}>
+              <h2 id="recent-trips" style={{ margin: 0, fontSize: 17, fontWeight: 600, letterSpacing: '-0.02em' }}>
                 {narrowed ? 'Matching trips' : 'Recent trips'}
               </h2>
-              <TripCards trips={shown} onOpen={onOpen} />
+              <p style={{ margin: '3px 0 10px', fontSize: 13, color: C.muted }}>Tap one to find it on the map.</p>
+              <TripCards trips={shown} onOpen={showOnMap} onMap />
             </section>
           )}
         </>

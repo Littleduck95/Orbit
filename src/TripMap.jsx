@@ -68,6 +68,39 @@ function FitToPoints({ points }) {
   return null;
 }
 
+// Asked for one trip (a card was tapped): frames its stops, then opens the
+// popup on its first, zooming into the cluster it hides in if it needs to.
+// focus is a new object on every ask, so asking twice for one trip works.
+function FocusTrip({ focus, points, markers, cluster }) {
+  const map = useMap();
+  useEffect(() => {
+    const mine = focus ? points.filter((p) => p.tripId === focus.tripId) : [];
+    if (!mine.length) return undefined;
+    const animate = !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    const group = cluster.current;
+    const show = () => {
+      // Clusters are still regrouping after a zoom: wait for them to settle.
+      if (group?._inZoomAnimation) { group.once('animationend', show); return; }
+      const marker = markers.current.get(mine[0].key);
+      if (marker && group) group.zoomToShowLayer(marker, () => marker.openPopup());
+    };
+    map.closePopup();
+    map.once('moveend', show);
+    if (mine.length === 1) {
+      map.setView([mine[0].lat, mine[0].lng], Math.max(map.getZoom(), 10), { animate });
+    } else {
+      map.fitBounds(L.latLngBounds(mine.map((p) => [p.lat, p.lng])), { padding: [36, 36], maxZoom: 11, animate });
+    }
+    return () => {
+      map.off('moveend', show);
+      group?.off('animationend', show);
+    };
+    // Only a new ask should move the map, not the points changing under it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map, focus]);
+  return null;
+}
+
 // Light or dark tiles, following the app's theme.
 function Tiles({ dark }) {
   return <TileLayer url={dark ? TILE_LAYER.dark : TILE_LAYER.light} attribution={TILE_LAYER.attribution} maxZoom={TILE_LAYER.maxZoom} />;
@@ -76,13 +109,31 @@ function Tiles({ dark }) {
 /*
  * points: [{ key, tripId, lat, lng, color, text, label }]
  * dark: draw the dark tiles, for the Orbit theme.
+ * focus: { tripId } to bring that trip into view and open its popup, which
+ * then takes keyboard focus. A new object each time it is asked.
  * renderPopup(point): the popup's contents. Only the open popup is drawn, so a
  * map with hundreds of pins does not load hundreds of thumbnails.
  */
-export function TripsMap({ points, renderPopup, height = 420, dark = false, children }) {
+export function TripsMap({ points, renderPopup, height = 420, dark = false, focus = null, children }) {
   const [openKey, setOpenKey] = useState(null);
+  const mapRef = useRef(null);
+  const markers = useRef(new Map());
+  const cluster = useRef(null);
+  const focusFor = useRef(null);
+  useEffect(() => {
+    focusFor.current = focus ? focus.tripId : null;
+  }, [focus]);
+  // A popup opened for a tapped card takes focus, so the keyboard lands on
+  // "Open trip" rather than back on the card, far from the map.
+  useEffect(() => {
+    const p = openKey && points.find((x) => x.key === openKey);
+    if (!p || p.tripId !== focusFor.current) return;
+    focusFor.current = null;
+    mapRef.current?.getContainer().querySelector('.leaflet-popup-content button')?.focus({ preventScroll: true });
+  }, [openKey, points]);
   return (
     <MapContainer
+      ref={mapRef}
       center={WORLD_VIEW.center}
       zoom={WORLD_VIEW.zoom}
       minZoom={1}
@@ -92,10 +143,15 @@ export function TripsMap({ points, renderPopup, height = 420, dark = false, chil
     >
       <Tiles dark={dark} />
       <FitToPoints points={points} />
-      <ClusterGroup showCoverageOnHover={false} maxClusterRadius={46} iconCreateFunction={clusterIcon}>
+      <FocusTrip focus={focus} points={points} markers={markers} cluster={cluster} />
+      <ClusterGroup ref={cluster} showCoverageOnHover={false} maxClusterRadius={46} iconCreateFunction={clusterIcon}>
         {points.map((p) => (
           <Marker
             key={p.key}
+            ref={(m) => {
+              if (m) markers.current.set(p.key, m);
+              else markers.current.delete(p.key);
+            }}
             position={[p.lat, p.lng]}
             icon={pinIcon(p.color, p.text)}
             title={p.label}
