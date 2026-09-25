@@ -2,11 +2,15 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, use
 import Papa from 'papaparse';
 import { KINDS, deviceTimeZone, pushSupport } from './notifications.js';
 import {
-  MIN_PASSWORD, PROFILE_FIELDS, SOCIAL_KEYS, VISIBILITY, birthdayProblem, cleanUsername, displayNameProblem, emailProblem,
+  MIN_PASSWORD, PROFILE_FIELDS, publicApi, SOCIAL_KEYS, VISIBILITY, birthdayProblem, cleanUsername, displayNameProblem, emailProblem,
   passwordProblem, seenAs, usernameProblem, visibilityOf,
 } from './accountApi.js';
 import * as photoStore from './photoStore.js';
 import { GEOCODER } from './mapConfig.js';
+import { CARD_W, CARD_H, drawRecapCard, cardBlob, cardFontsReady } from './recapCard.js';
+import { BASE, catalogPath, pageUrl, profilePath, readRoute } from './route.js';
+import { deviceKind, flush as flushUsage, track, usageShare } from './usage.js';
+import { CATALOG_KINDS, LINKS_FOR, OUTING_VISIBILITY, WIKIDATA, cleanLinks, outingsToShare, searchWikidata, tripsToShare } from './catalog.js';
 
 /* ---------- palette ---------- */
 const THEMES = {
@@ -368,6 +372,19 @@ function OrbitDial({ p, size = 38 }) {
 }
 
 // Empty screens have nothing to compete with, so an illustration is free here.
+// The planet and its moon, beside the name.
+function OrbitMark() {
+  return (
+    <svg width="19" height="19" viewBox="0 0 19 19" style={{ flexShrink: 0, overflow: 'visible' }}>
+      <ellipse cx="9.5" cy="9.5" rx="9" ry="4.4" fill="none"
+        stroke={C.accent} strokeWidth="1.1" opacity="0.65"
+        transform="rotate(-28 9.5 9.5)" />
+      <circle cx="9.5" cy="9.5" r="3.1" fill={C.accent} />
+      <circle cx="17.2" cy="5.7" r="1.7" fill={C.accent} />
+    </svg>
+  );
+}
+
 function EmptySky({ width = 132 }) {
   return (
     <svg width={width} height={width * 0.62} viewBox="0 0 132 82"
@@ -504,6 +521,142 @@ const applyTheme = (name) => {
     ...linkStyle, color: C.ink, borderBottom: `1px solid ${C.line}`,
   };
 };
+
+// The app's own stylesheet: fonts, hover states, the map's pins. Shared with
+// the public pages, which are drawn without the rest of the app.
+function AppStyles() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600&family=Source+Serif+4:opsz,wght@8..60,400&display=swap');
+      .crm-serif { font-family: 'Source Serif 4', Georgia, serif; }
+      .crm-btn:hover { filter: brightness(0.94); }
+      .crm-row:hover { background: ${C.rowHover}; }
+      .crm-btn:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible {
+        outline: 2px solid ${C.ink}; outline-offset: 2px;
+      }
+      input, select, textarea { font-family: inherit; }
+      .crm-full { grid-column: 1 / -1; }
+      
+      /* Narrow: one column. The panel replaces the list rather than pushing it. */
+      .crm-shell { max-width: 460px; margin: 0 auto; padding: 22px 16px 60px; }
+      .crm-main.is-hidden { display: none; }
+      .crm-detail { display: none; }
+      .crm-detail.is-open { display: block; }
+      .crm-idle { display: none; }
+      .crm-tpl-wide { display: none; }
+
+      /* Wide: list and detail side by side, detail pinned while the list scrolls. */
+      @media (min-width: 880px) {
+        .crm-shell {
+          max-width: 1000px;
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) 384px;
+          column-gap: 30px;
+          align-items: start;
+        }
+        .crm-head { grid-column: 1 / -1; }
+        .crm-main.is-hidden { display: block; }
+        .crm-detail { display: block; position: sticky; top: 20px; }
+        .crm-back { display: none; }
+        .crm-idle { display: block; }
+        .crm-tpl-wide { display: block; }
+        .crm-tpl-pick { display: none; }
+      }
+      .crm-person:last-child, .crm-entry:last-child { border-bottom: none !important; }
+      /* A list can hold thousands of entries. Rows off screen are skipped
+         until scrolled to, which is most of what a keystroke costs on a long
+         list. Still found by find-in-page and screen readers. */
+      .crm-entry { content-visibility: auto; contain-intrinsic-size: auto 62px; }
+      /* The same for people, who can run to hundreds. What every person
+         row shares is here too, rather than inline (see PersonRow). */
+      .crm-person {
+        content-visibility: auto; contain-intrinsic-size: auto 65px;
+        display: flex; border-bottom: 1px solid ${C.line};
+      }
+      .crm-person-bar { width: 4px; flex-shrink: 0; }
+      .crm-person-body, .crm-person-main { flex: 1; min-width: 0; }
+      .crm-person .crm-row { padding: 14px 15px; cursor: pointer; display: flex; align-items: baseline; gap: 10px; }
+      .crm-person-top { display: flex; align-items: baseline; gap: 7px; }
+      .crm-person-name {
+        font-size: 17px; font-weight: 600; letter-spacing: -0.02em; color: ${C.ink};
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .crm-person-age { font-size: 13px; color: ${C.faint}; flex-shrink: 0; }
+      .crm-person-sub { font-size: 13px; color: ${C.muted}; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .crm-person-when { text-align: right; flex-shrink: 0; max-width: 116px; white-space: nowrap; }
+      .crm-person-status { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+      .crm-person-cadence { font-size: 12px; color: ${C.faint}; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
+      .crm-person-act {
+        flex-shrink: 0; cursor: pointer; background: transparent;
+        border: none; border-left: 1px solid ${C.line};
+        display: flex; align-items: center; justify-content: center;
+      }
+      /* That also clips painting to each row, which would cut off a focus
+         ring drawn outside a button that fills the row, so rings go inside. */
+      .crm-entry .crm-btn:focus-visible, .crm-entry a:focus-visible,
+      .crm-person .crm-btn:focus-visible { outline-offset: -3px; }
+      /* Important, because every select also takes the shared input style
+         inline, whose background and padding would otherwise paint over
+         the arrow and run the text underneath it. */
+      .crm-select {
+        appearance: none; -webkit-appearance: none;
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.5 4.5 L6 8 L9.5 4.5' fill='none' stroke='${encodeURIComponent(C.muted)}' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>") !important;
+        background-repeat: no-repeat !important; background-position: right 11px center !important; background-size: 12px !important;
+        padding-right: 32px !important;
+      }
+      /* Hidden from sight, still there for keyboards and screen readers. */
+      .crm-sr {
+        position: absolute !important; width: 1px; height: 1px; margin: -1px; padding: 0;
+        overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+      }
+      .crm-star input:focus-visible + span, .crm-file:focus-within {
+        outline: 2px solid ${C.ink}; outline-offset: 2px; border-radius: 6px;
+      }
+      .crm-clamp { -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+      /* Maps. Tiles, popups and controls all follow the theme. */
+      /* Close to the tiles' own sea, so any gap around the world reads as ocean. */
+      .orbit-map { font-family: inherit; background: ${C.dark ? '#1B1D20' : '#D6DCDE'}; }
+      .orbit-map .leaflet-bar { border: 1px solid ${C.line}; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.12); overflow: hidden; }
+      .orbit-map .leaflet-bar a {
+        width: 34px; height: 34px; line-height: 32px; font-size: 18px; font-weight: 500;
+        background: ${C.surface}; color: ${C.ink}; border-bottom: 1px solid ${C.line};
+      }
+      .orbit-map .leaflet-bar a:last-child { border-bottom: none; }
+      .orbit-map .leaflet-bar a:hover, .orbit-map .leaflet-bar a:focus-visible { background: ${C.rowHover}; color: ${C.ink}; }
+      .orbit-map .leaflet-bar a.leaflet-disabled { background: ${C.surface}; color: ${C.faint}; opacity: 0.5; }
+      .orbit-map .leaflet-control-attribution {
+        background: ${C.surface}cc; color: ${C.muted}; font-size: 10.5px; border-top-left-radius: 6px; padding: 1px 6px;
+      }
+      .orbit-map .leaflet-control-attribution a { color: ${C.muted}; }
+      .orbit-map .leaflet-popup-content-wrapper, .orbit-map .leaflet-popup-tip {
+        background: ${C.surface}; color: ${C.ink}; box-shadow: 0 6px 22px rgba(0,0,0,0.28);
+      }
+      .orbit-map .leaflet-popup-content { margin: 12px 14px; font-size: 13px; line-height: 1.4; }
+      .orbit-map a.leaflet-popup-close-button { color: ${C.muted}; }
+      .orbit-pin, .orbit-cluster { background: none; border: none; }
+      .orbit-pin span, .orbit-cluster span {
+        display: flex; align-items: center; justify-content: center; box-sizing: border-box;
+        border-radius: 50%; color: #fff; font-weight: 700; font-family: system-ui, sans-serif;
+      }
+      .orbit-pin span { width: 28px; height: 28px; font-size: 13px; border: 2px solid #fff; box-shadow: 0 1px 5px rgba(0,0,0,0.45); }
+      /* Trips to come: the colour moves from the fill to a thick ring. */
+      .orbit-pin-planned span, .orbit-pin-someday span {
+        background: #fff !important; box-shadow: 0 0 0 2px #fff, 0 1px 5px rgba(0,0,0,0.45);
+      }
+      .orbit-pin-planned span { border: 4px solid ${PLAN_COLORS.planned}; }
+      .orbit-pin-someday span { border: 3px dashed ${PLAN_COLORS.someday}; }
+      .orbit-cluster span {
+        width: 38px; height: 38px; font-size: 13px; background: #15211B;
+        border: 3px solid #72DE88; box-shadow: 0 1px 6px rgba(0,0,0,0.4);
+      }
+      .orbit-pin:focus-visible, .orbit-cluster:focus-visible { outline: none; }
+      .orbit-pin:focus-visible span, .orbit-cluster:focus-visible span { outline: 3px solid #15211B; outline-offset: 2px; }
+      .crm-open { animation: crmIn .16s ease-out; }
+      @keyframes crmIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+      @media (prefers-reduced-motion: reduce) { .crm-open { animation: none; } }
+    `}</style>
+  );
+}
 
 /* ---------- add / edit ---------- */
 function PersonForm({ initial, defaultCircle, inline, families, allGroups, companies, onSave, onCancel }) {
@@ -1443,6 +1596,7 @@ function PersonShare({ p, owner, onClose }) {
   const going = ['Name', ...fields.filter((f) => picks[f.key]).map((f) => (f.labelFor ? f.labelFor(p) : f.label))];
 
   const copy = async () => {
+    track('share.person', { how: 'link', fields: going.length });
     try {
       await navigator.clipboard.writeText(link);
       setSaid('The link is copied. Send it however you like.');
@@ -1454,12 +1608,14 @@ function PersonShare({ p, owner, onClose }) {
   };
   const sheet = async () => {
     try {
+      track('share.person', { how: 'sheet', fields: going.length });
       await navigator.share({ title: p.name, text: `${by.trim() || 'Someone'} shared ${p.name}'s contact from Orbit.`, url: link });
     } catch (e) {
       if (e?.name !== 'AbortError') copy();
     }
   };
   const save = () => {
+    track('share.person', { how: 'file', fields: going.length });
     const ok = downloadCsv(`${fileSlug(p.name)}.orbit`, shareFileText(payload), 'application/json');
     setSaid(ok ? `Saved ${fileSlug(p.name)}.orbit. They open it from Import in their Orbit.` : 'This browser would not save the file.');
   };
@@ -2650,6 +2806,8 @@ const fixText = (v) => (v == null || typeof v === 'string' ? v : typeof v === 'n
 // The same, for fields every record has to have.
 const fixNeeded = (v) => fixText(v) ?? '';
 const fixNumber = (v) => (v == null || typeof v === 'number' ? v : null);
+// Half stars from 0.5 to 5; anything else is no rating.
+const fixRating = (v) => (v == null || isRating(v) ? v : null);
 const fixTextList = (v) => {
   if (!v) return v;
   if (!Array.isArray(v)) return [];
@@ -2710,6 +2868,11 @@ const EVENT_FIXES = [
   ...['endDate', 'kind', 'place', 'note', 'addedOn'].map((k) => [k, fixText]),
   ['people', fixTextList],
   ['lat', fixNumber], ['lon', fixNumber],
+  ['rating', fixRating],
+  // Links to the shared catalog, what you thought (shared), and who sees it.
+  ['links', fixEntries([['id', fixText], ['kind', fixText], ['name', fixText]])],
+  ['review', fixText],
+  ['visibility', fixText],
 ];
 
 const REMINDER_FIXES = [
@@ -2825,6 +2988,7 @@ const EVENT_COLS = [
   { h: 'Start', get: (e) => e.date, set: (e, v) => { e.date = v; } },
   { h: 'End', get: (e) => e.endDate || '', set: (e, v) => { e.endDate = v || null; } },
   { h: 'Kind', get: (e) => e.kind || '', set: (e, v) => { e.kind = v || 'Other'; } },
+  { h: 'Rating', get: (e) => (e.rating ? String(e.rating) : ''), set: (e, v) => { if (v) e.rating = halfStep(v) || null; } },
   { h: 'Place', get: (e) => e.place || '', set: (e, v) => { e.place = v; } },
   { h: 'Latitude', get: (e) => (e.lat == null ? '' : String(e.lat)), set: (e, v) => { e.lat = v === '' ? null : Number(v); } },
   { h: 'Longitude', get: (e) => (e.lon == null ? '' : String(e.lon)), set: (e, v) => { e.lon = v === '' ? null : Number(v); } },
@@ -3004,6 +3168,71 @@ const fromCsv = (cols, rows, make) => {
     if (touched) out.push(obj); else skipped += 1;
   });
   return { out, skipped };
+};
+
+// What a save changed, as usage counts (see usage.js): how many were added,
+// removed or edited, and a few plain details of a single one, never what
+// anyone wrote. A pile at once (an import, a restore) is one count.
+const changeActions = (what, prev, next) => {
+  const out = [];
+  if (!Array.isArray(prev) || !Array.isArray(next)) return out;
+  const before = new Map(prev.map((x) => [x?.id, x]));
+  const after = new Map(next.map((x) => [x?.id, x]));
+  const added = next.filter((x) => !before.has(x?.id));
+  const removed = prev.filter((x) => !after.has(x?.id));
+  const edited = next.filter((x) => before.has(x?.id) && before.get(x.id) !== x);
+  const total = (xs, f) => xs.reduce((n, x) => n + (f(x) || 0), 0);
+  const grew = (f) => Math.max(0, total(next, f) - total(prev, f));
+  const one = (name, xs, detail) => {
+    if (!xs.length) return;
+    out.push([name, xs.length === 1 && detail ? detail(xs[0]) : { n: xs.length, ...(xs.length > 3 ? { bulk: true } : {}) }]);
+  };
+  const eventDetail = (e) => ({ kind: e.kind || 'Other', rated: Boolean(e.rating), linked: (e.links || []).length, shared: e.visibility || 'me', thoughts: Boolean(e.review) });
+  if (what === 'people') {
+    const logs = grew((p) => (p.log || []).length);
+    one('person.add', added, (p) => ({ circle: p.circle || 'friend', birthday: Boolean(p.birthday), cadence: p.cadence || 0 }));
+    one('person.remove', removed);
+    one('person.edit', edited.filter((p) => (p.log || []).length === (before.get(p.id).log || []).length));
+    if (logs) out.push(['catchup.log', { n: logs }]);
+  } else if (what === 'events') {
+    one('event.add', added, eventDetail);
+    one('event.remove', removed);
+    one('event.edit', edited, eventDetail);
+  } else if (what === 'reminders') {
+    const done = grew((r) => (r.history || []).length);
+    one('reminder.add', added, (r) => ({ kind: r.kind || 'Other', repeats: Boolean(r.every), anchor: r.anchor || 'date' }));
+    one('reminder.remove', removed);
+    one('reminder.edit', edited.filter((r) => (r.history || []).length === (before.get(r.id).history || []).length));
+    if (done) out.push(['reminder.done', { n: done }]);
+  } else if (what === 'lists') {
+    one('list.add', added, (c) => ({ kind: c.kind || 'Other', stages: Boolean(c.track) }));
+    one('list.remove', removed);
+    const items = grew((c) => (c.items || []).length);
+    const finished = grew((c) => (c.items || []).filter((it) => it.doneOn).length);
+    const rated = grew((c) => (c.items || []).filter((it) => it.rating).length);
+    if (items) out.push(['list.item_add', { n: items }]);
+    if (finished) out.push(['list.item_done', { n: finished }]);
+    if (rated) out.push(['list.item_rate', { n: rated }]);
+  } else if (what === 'trips') {
+    one('trip.add', added, (t) => ({ status: t.status || 'been', rated: Boolean(t.rating), stops: (t.stops || []).length, photos: (t.photoIds || []).length }));
+    one('trip.remove', removed);
+    one('trip.edit', edited, (t) => ({ status: t.status || 'been', rated: Boolean(t.rating) }));
+    const photos = grew((t) => (t.photoIds || []).length);
+    if (photos) out.push(['trip.photo_add', { n: photos }]);
+  }
+  return out;
+};
+const trackChanges = (what, prev, next) => changeActions(what, prev, next).forEach(([name, props]) => track(name, props));
+
+// A short fingerprint of some text (FNV-1a), to tell whether it changed
+// without keeping it.
+const fingerprint = (text) => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `${text.length}:${h.toString(36)}`;
 };
 
 const downloadCsv = (name, text, type = 'text/csv;charset=utf-8;') => {
@@ -3406,10 +3635,229 @@ function RecapTrips({ trips, year, onTrip }) {
   );
 }
 
-function Recap({ people, year, years, onYear, eventCount, reminderCount, listCount, trips = [], onTrip }) {
+// What each kind of outing is called when counted: "3 concerts", "1 game".
+const OUTING_WORDS = { Concert: ['concert', 'concerts'], Sports: ['game', 'games'], Theater: ['show', 'shows'], Festival: ['festival', 'festivals'] };
+
+// A year of outings for Recap: the concerts, games, shows and festivals that
+// have happened, how many of each, the best-rated event of any kind, and the
+// outings still to come.
+const eventsYear = (events, year, today = todayStr()) => {
+  const mine = events.filter((e) => eventYear(e) === year);
+  const outings = mine.filter((e) => OUTING_KINDS.includes(e.kind));
+  const done = outings.filter((e) => e.date <= today).sort((a, b) => (a.date < b.date ? 1 : -1));
+  const counts = OUTING_KINDS.map((k) => ({ kind: k, n: done.filter((e) => e.kind === k).length })).filter((c) => c.n);
+  const best = mine.filter((e) => e.rating && e.date <= today)
+    .sort((a, b) => b.rating - a.rating || (a.date < b.date ? 1 : -1))[0] || null;
+  const ahead = outings.filter((e) => e.date > today).sort((a, b) => (a.date < b.date ? -1 : 1));
+  return { outings: done, counts, best, ahead };
+};
+
+function RecapEvents({ events, year, onEvent }) {
+  const y = useMemo(() => eventsYear(events, year), [events, year]);
+  if (!y.outings.length && !y.ahead.length && !y.best) return null;
+  const box = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, marginBottom: 12 };
+  return (
+    <section aria-labelledby="recap-events" style={{ marginTop: 22 }}>
+      <h2 id="recap-events" style={{ margin: '0 0 12px', fontSize: 20, fontWeight: 600, letterSpacing: '-0.03em' }}>{`${year} in events`}</h2>
+      {y.counts.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+          {y.counts.map((c, i) => (
+            <Stat key={c.kind} n={c.n} label={OUTING_WORDS[c.kind][c.n === 1 ? 0 : 1]} tone={i === 0 ? C.accentDeep : undefined} />
+          ))}
+        </div>
+      )}
+      {y.best && (
+        <button className="crm-btn crm-row" onClick={() => onEvent(y.best)} style={{
+          ...box, display: 'block', width: '100%', textAlign: 'left', font: 'inherit', color: C.ink, padding: 12, cursor: 'pointer',
+        }}>
+          <span style={{ display: 'block', fontSize: 13, color: C.muted }}>Top-rated event</span>
+          <span style={{ display: 'block', fontSize: 19, fontWeight: 600, letterSpacing: '-0.025em', marginTop: 2 }}>{y.best.title}</span>
+          <span style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline', fontSize: 12.5, color: C.muted, marginTop: 3 }}>
+            <span>{eventWhen(y.best).text}</span>
+            {y.best.place && <span>{y.best.place}</span>}
+            <Stars n={y.best.rating} size={12.5} />
+          </span>
+        </button>
+      )}
+      {y.outings.length > 0 && (
+        <div style={{ ...box, padding: '6px 15px' }}>
+          {y.outings.map((e) => (
+            <button key={e.id} className="crm-btn" onClick={() => onEvent(e)} style={{
+              display: 'flex', gap: 12, alignItems: 'baseline', width: '100%', textAlign: 'left', font: 'inherit',
+              padding: '11px 0', background: 'transparent', border: 'none', borderBottom: `1px solid ${C.line}`, cursor: 'pointer', color: C.ink,
+            }}>
+              <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600 }}>{e.title}</span>
+              <Stars n={e.rating} size={11.5} />
+              <span style={kindChip()}>{e.kind}</span>
+              <span style={{ fontSize: 12.5, color: C.muted, flexShrink: 0 }}>{eventWhen(e).text}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {y.ahead.length > 0 && (
+        <p style={{ margin: '0 0 12px', fontSize: 13.5, color: C.muted }}>
+          {`Still to come in ${year}: `}
+          {y.ahead.map((e, i) => (
+            <span key={e.id}>
+              {i > 0 && ', '}
+              <button className="crm-btn" onClick={() => onEvent(e)} style={{ ...textButton(), fontSize: 13.5 }}>{e.title}</button>
+            </span>
+          ))}
+        </p>
+      )}
+    </section>
+  );
+}
+
+// What goes on the year's share card (see recapCard.js): counts, titles and
+// ratings only. Who anyone was with, notes, and anything from People but the
+// number of catch-ups never go, and the catch-ups only when asked for.
+// include: { trips, events, people }. where: from useGeo, or null while the
+// outlines load (the card then has no countries).
+const recapCard = ({ people, events, trips, where, year, include, name = '', site = '', today = todayStr() }) => {
+  const t = include.trips ? tripYear(trips, where, year, today) : null;
+  const ev = include.events ? eventsYear(events, year, today) : null;
+  const catchUps = include.people ? buildRecap(people, year).total : 0;
+  const word = (n, one, many) => (n === 1 ? one : many);
+  const stats = [
+    t && { n: t.trips.length, label: word(t.trips.length, 'trip', 'trips') },
+    t && t.countries && { n: t.countries.size, label: word(t.countries.size, 'country', 'countries') },
+    ...(ev ? ev.counts.map((c) => ({ n: c.n, label: OUTING_WORDS[c.kind][c.n === 1 ? 0 : 1] })) : []),
+    t && { n: t.days, label: word(t.days, 'day away', 'days away') },
+    include.people && { n: catchUps, label: word(catchUps, 'catch-up', 'catch-ups') },
+    t && t.states && { n: t.states.size, label: word(t.states.size, 'US state', 'US states') },
+    t && { n: t.places, label: word(t.places, 'place', 'places') },
+  ].filter((x) => x && x.n > 0).slice(0, 6);
+  const highlights = [
+    t?.best && {
+      label: t.best.rating ? 'Top-rated trip' : 'Longest trip',
+      title: t.best.title, rating: t.best.rating || null, sub: tripWhen(t.best).text,
+    },
+    ev?.best && {
+      label: 'Top-rated event',
+      title: ev.best.title, rating: ev.best.rating, sub: [ev.best.place, eventWhen(ev.best).text].filter(Boolean).join(' · '),
+    },
+  ].filter(Boolean);
+  const hasTrips = Boolean(t?.trips.length);
+  const hasEvents = Boolean(ev && (ev.outings.length || ev.best));
+  return {
+    year,
+    name: clip(name.trim(), 60),
+    subtitle: hasTrips && hasEvents ? 'in trips & events' : hasTrips ? 'in trips' : hasEvents ? 'in events' : 'in review',
+    stats,
+    highlights,
+    countries: t?.countries ? [...t.countries].sort() : [],
+    pins: ev ? ev.outings.filter((e) => typeof e.lat === 'number' && typeof e.lon === 'number').map((e) => ({ lat: e.lat, lng: e.lon })) : [],
+    site,
+    empty: !stats.length && !highlights.length,
+  };
+};
+
+// The card in words, for the preview's label and for anyone sharing it as text.
+const recapCardText = (card) => [
+  `${card.year} ${card.subtitle}`,
+  card.stats.map((x) => `${x.n} ${x.label}`).join(', '),
+  ...card.highlights.map((h) => `${h.label}: ${h.title}${h.rating ? ` (${stars(h.rating)})` : ''}`),
+].filter(Boolean).join('\n');
+
+// page: the address of this year on your page, when you have one, which the
+// picture names and the share sheet sends with it.
+function RecapShare({ people, events, trips, year, owner, page = '' }) {
+  const { geo, where } = useGeo();
+  const [include, setInclude] = useState({ trips: true, events: true, people: false });
+  const [by, setBy] = useState(owner || '');
+  const [said, setSaid] = useState('');
+  const canvas = useRef(null);
+  const site = page ? page.replace(/^https?:\/\//, '') : typeof location === 'undefined' ? '' : location.host;
+  const card = useMemo(() => recapCard({ people, events, trips, where, year, include, name: by, site }),
+    [people, events, trips, where, year, include, by, site]);
+  // Which card the canvas holds, so nothing is sent from a picture of the
+  // choices made a moment before.
+  const [drawn, setDrawn] = useState(null);
+  useEffect(() => {
+    let live = true;
+    cardFontsReady().then(() => {
+      if (!live || !canvas.current) return;
+      drawRecapCard(canvas.current, card, geo);
+      setDrawn(card);
+    });
+    return () => { live = false; };
+  }, [card, geo]);
+  const ready = drawn === card && !card.empty;
+  const file = `orbit-${year}.png`;
+
+  const picture = async () => {
+    const blob = await cardBlob(canvas.current);
+    if (!blob) throw new Error('no picture');
+    return blob;
+  };
+  const save = async () => {
+    track('recap.card_save', { trips: include.trips, events: include.events, catchups: include.people, named: Boolean(by.trim()) });
+    try {
+      const url = URL.createObjectURL(await picture());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setSaid('Saved the picture.');
+    } catch {
+      setSaid('The picture could not be made in this browser.');
+    }
+  };
+  const canSheet = typeof navigator !== 'undefined' && typeof navigator.canShare === 'function' && typeof File === 'function';
+  const sheet = async () => {
+    track('recap.card_share', { trips: include.trips, events: include.events, catchups: include.people, linked: Boolean(page) });
+    try {
+      const f = new File([await picture()], file, { type: 'image/png' });
+      if (!navigator.canShare({ files: [f] })) { await save(); return; }
+      await navigator.share({ files: [f], title: `My ${year} in Orbit`, ...(page ? { text: page } : {}) });
+    } catch (e) {
+      if (e?.name !== 'AbortError') setSaid('Sharing did not work here. Save the picture instead.');
+    }
+  };
+  const tick = (k) => (v) => setInclude({ ...include, [k]: v });
+
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+      <p style={{ margin: '0 0 3px', fontSize: 14, fontWeight: 600, color: C.ink }}>Share your {year}</p>
+      <p style={{ margin: '0 0 14px', fontSize: 12.5, color: C.muted, lineHeight: 1.5 }}>
+        A picture of the year, made on this device. Only counts, titles and ratings go on it: never who you were with, and never your notes.
+      </p>
+      <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+        <canvas ref={canvas} width={CARD_W} height={CARD_H} role="img" aria-label={recapCardText(card)}
+          style={{ width: '100%', maxWidth: 300, aspectRatio: `${CARD_W} / ${CARD_H}`, borderRadius: 10, border: `1px solid ${C.line}`, flex: '0 1 300px' }} />
+        <div style={{ flex: '1 1 220px', minWidth: 0 }}>
+          <Check on={include.trips} onChange={tick('trips')} label="Trips" hint="How many, where, days away, and the best one" />
+          <Check on={include.events} onChange={tick('events')} label="Events" hint="Concerts, games, shows and festivals, and the top-rated event" />
+          <Check on={include.people} onChange={tick('people')} label="Catch-ups" hint="Only how many. Never names." />
+          <Field label="Your name on it">
+            <input style={{ ...inputStyle, minHeight: 38 }} value={by} onChange={(e) => setBy(e.target.value)} placeholder="Optional" />
+          </Field>
+          {card.empty ? (
+            <p style={{ margin: 0, fontSize: 13, color: C.muted, lineHeight: 1.5 }}>Nothing from {year} to put on it with these ticked.</p>
+          ) : (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {canSheet && <Button kind="solid" disabled={!ready} onClick={sheet}>{ready ? 'Share…' : 'Getting it ready…'}</Button>}
+              <Button kind={canSheet ? 'quiet' : 'solid'} disabled={!ready} onClick={save}>Save image</Button>
+            </div>
+          )}
+          {said && <p role="status" style={{ margin: '10px 0 0', fontSize: 12.5, color: C.muted }}>{said}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Recap({ people, year, years, onYear, eventCount, reminderCount, listCount, trips = [], onTrip, events = [], onEvent, owner, pageFor = null }) {
   const r = buildRecap(people, year);
   const maxMonth = Math.max(1, ...r.months);
   const tripCount = trips.filter((t) => tripYears(t).includes(year)).length;
+  const [sharing, setSharing] = useState(false);
+  const outings = eventsYear(events, year);
+  const shareable = Boolean(tripCount || outings.outings.length || outings.best || r.total);
 
   return (
     <div>
@@ -3418,7 +3866,13 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
           {year} in review
         </h1>
         <YearPicker year={year} years={years} onYear={onYear} />
+        {shareable && (
+          <Button onClick={() => { if (!sharing) track('recap.card_open', { year }); setSharing(!sharing); }} aria-expanded={sharing}
+            style={{ marginLeft: 'auto', ...(sharing ? { borderColor: C.accent } : null) }}>Share your year</Button>
+        )}
       </div>
+
+      {sharing && shareable && <RecapShare people={people} events={events} trips={trips} year={year} owner={owner} page={pageFor ? pageFor(year) : ''} />}
 
       {r.total === 0 && r.added === 0 && !eventCount && !reminderCount && !listCount ? (tripCount ? null : (
         <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.6, margin: 0 }}>
@@ -3519,6 +3973,7 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
       )}
 
       {onTrip && <RecapTrips trips={trips} year={year} onTrip={onTrip} />}
+      {onEvent && <RecapEvents events={events} year={year} onEvent={onEvent} />}
     </div>
   );
 }
@@ -3886,6 +4341,7 @@ const eventToTrip = (e) => cleanTrip({
   endDate: e.endDate,
   notes: e.note || '',
   companions: e.people || [],
+  rating: e.rating || null,
   tags: e.kind && e.kind !== 'Other' && e.kind !== 'Trip' ? [e.kind] : [],
   fromEvent: e.id,
 });
@@ -4107,7 +4563,12 @@ const downloadBlob = (name, blob) => {
 
 /* ---------- events ---------- */
 const EVENTS_KEY = 'crm-events-v1';
-const EVENT_KINDS = ['Milestone', 'Trip', 'Celebration', 'Work', 'Loss', 'Other'];
+const EVENT_KINDS = ['Milestone', 'Trip', 'Celebration', 'Concert', 'Sports', 'Theater', 'Festival', 'Work', 'Loss', 'Other'];
+// Things you went to, rather than things that happened: these can be rated
+// once they have happened, and are what Recap counts as the year's outings.
+const OUTING_KINDS = ['Concert', 'Sports', 'Theater', 'Festival'];
+const RATED_EVENT_KINDS = [...OUTING_KINDS, 'Trip', 'Celebration', 'Other'];
+const canRateEvent = (kind, date, today = todayStr()) => RATED_EVENT_KINDS.includes(kind) && Boolean(date) && date <= today;
 
 const eventYear = (e) => Number(e.date.slice(0, 4));
 
@@ -4131,13 +4592,17 @@ const eventWhen = (e) => {
   return { text, days };
 };
 
-function EventForm({ initial, people, onSave, onCancel }) {
+function EventForm({ initial, people, onSave, onCancel, catalog = null }) {
   const [date, setDate] = useState(initial?.date || todayStr());
   const [endDate, setEndDate] = useState(initial?.endDate || '');
   const [spans, setSpans] = useState(Boolean(initial?.endDate && initial.endDate !== initial.date));
   const [title, setTitle] = useState(initial?.title || '');
   const [kind, setKind] = useState(initial?.kind || 'Milestone');
   const [note, setNote] = useState(initial?.note || '');
+  const [rating, setRating] = useState(initial?.rating || null);
+  const [links, setLinks] = useState(() => cleanLinks(initial?.links));
+  const [review, setReview] = useState(initial?.review || '');
+  const [visibility, setVisibility] = useState(initial?.visibility || 'friends');
   const [who, setWho] = useState(initial?.people || []);
   const [place, setPlace] = useState(initial?.place || '');
   const [coords, setCoords] = useState(
@@ -4184,6 +4649,12 @@ function EventForm({ initial, people, onSave, onCancel }) {
       id: initial?.id || uid(),
       addedOn: initial?.addedOn || todayStr(),
       date: start, endDate: finish, title: t, kind, note: note.trim(), people: who,
+      rating: canRateEvent(kind, start) ? rating : null,
+      // Only an outing links to the catalog, and only one that has happened
+      // has thoughts to share.
+      links: LINKS_FOR[kind] ? cleanLinks(links) : [],
+      review: LINKS_FOR[kind] && start <= todayStr() ? review.trim().slice(0, 2000) : '',
+      visibility: LINKS_FOR[kind] ? visibility : 'me',
       place: place.trim(),
       lat: coords ? coords.lat : null,
       lon: coords ? coords.lon : null,
@@ -4228,6 +4699,45 @@ function EventForm({ initial, people, onSave, onCancel }) {
           {EVENT_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
         </select>
       </Field>
+
+      {catalog && LINKS_FOR[kind] && (
+        <>
+          <CatalogPicker api={catalog} kind={LINKS_FOR[kind].kind} label={LINKS_FOR[kind].label} ph={LINKS_FOR[kind].ph}
+            many={LINKS_FOR[kind].many} value={links.filter((l) => l.kind !== 'venue')}
+            onChange={(ls) => setLinks([...ls, ...links.filter((l) => l.kind === 'venue')])} />
+          <CatalogPicker api={catalog} kind="venue" label="Venue" ph="Search for a stadium, arena, theatre or club"
+            value={links.filter((l) => l.kind === 'venue')}
+            onChange={(ls) => {
+              setLinks([...links.filter((l) => l.kind !== 'venue'), ...ls]);
+              if (ls[0] && !place.trim()) setPlace(ls[0].name);
+            }} />
+        </>
+      )}
+
+      {canRateEvent(kind, date) && <StarInput label="How was it?" value={rating} onChange={setRating} />}
+
+      {catalog && LINKS_FOR[kind] && date && date <= todayStr() && (
+        <>
+          <Field label="Your thoughts">
+            <textarea className="crm-serif" maxLength={2000} value={review} onChange={(e) => setReview(e.target.value)}
+              style={{ ...inputStyle, minHeight: 80, resize: 'vertical', lineHeight: 1.55 }}
+              placeholder="What was it like? This goes with your rating." />
+          </Field>
+          <Group label="Who sees your rating and thoughts">
+            <div style={{ display: 'flex', gap: 8 }}>
+              {OUTING_VISIBILITY.map(([v, l]) => (
+                <button key={v} type="button" className="crm-btn" aria-pressed={visibility === v} onClick={() => setVisibility(v)} style={segment(visibility === v)}>{l}</button>
+              ))}
+            </div>
+            <span style={hintStyle()}>
+              {visibility === 'me' ? 'Kept to yourself.'
+                : !links.length ? `Link ${LINKS_FOR[kind].kind === 'team' ? 'a team' : `a ${LINKS_FOR[kind].kind}`} or a venue above to share it on ${visibility === 'everyone' ? 'their pages' : 'their pages, for friends'}.`
+                : `Shows on the pages of what it links to, for ${visibility === 'everyone' ? 'everyone in Orbit' : 'your friends'}, with your username.`}
+              {' '}Who you went with and the details below are never shared.
+            </span>
+          </Group>
+        </>
+      )}
 
       <Field label="Where">
         <div style={{ display: 'flex', gap: 8 }}>
@@ -4362,7 +4872,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
   );
 }
 
-function EventCard({ e, people, onPerson, onEdit, onRemove }) {
+function EventCard({ e, people, onPerson, onEdit, onRemove, onCatalog }) {
   const [confirm, setConfirm] = useState(false);
   const attended = (e.people || []).map((id) => people.find((x) => x.id === id)).filter(Boolean);
   const when = eventWhen(e);
@@ -4380,6 +4890,7 @@ function EventCard({ e, people, onPerson, onEdit, onRemove }) {
           {when.days > 1 && (
             <span style={{ fontSize: 12, color: C.faint }}>{when.days} days</span>
           )}
+          <Stars n={e.rating} size={12.5} />
           {e.kind && (
             <span style={{
               fontSize: 11, fontWeight: 600, color: C.muted,
@@ -4391,6 +4902,26 @@ function EventCard({ e, people, onPerson, onEdit, onRemove }) {
         <p style={{ margin: '5px 0 0', fontSize: 17, fontWeight: 600, letterSpacing: '-0.02em', color: C.ink }}>
           {e.title}
         </p>
+
+        {e.links?.length > 0 && (
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 7 }}>
+            {e.links.map((l) => (onCatalog ? (
+              <button key={l.id} className="crm-btn" onClick={() => onCatalog(l.id)} aria-label={`Open ${l.name}`}
+                style={{ ...filterChip(false), padding: '3px 10px', fontSize: 12 }}>{l.name}</button>
+            ) : (
+              <span key={l.id} style={{ ...kindChip(), fontSize: 12 }}>{l.name}</span>
+            )))}
+          </div>
+        )}
+
+        {e.review && (
+          <p className="crm-serif" style={{ margin: '7px 0 0', fontSize: 15, lineHeight: 1.6, color: C.ink }}>
+            <span style={{ fontFamily: 'inherit', fontSize: 11, fontWeight: 600, color: C.faint, textTransform: 'uppercase', letterSpacing: '0.06em', marginRight: 6 }}>
+              {e.visibility === 'everyone' ? 'Shared with everyone' : e.visibility === 'friends' ? 'Shared with friends' : 'Your thoughts'}
+            </span>
+            {e.review}
+          </p>
+        )}
 
         {e.note && (
           <p className="crm-serif" style={{ margin: '7px 0 0', fontSize: 15, lineHeight: 1.6, color: C.ink }}>
@@ -4439,7 +4970,7 @@ function EventCard({ e, people, onPerson, onEdit, onRemove }) {
   );
 }
 
-function EventsView({ events, people, onAdd, onEdit, onRemove }) {
+function EventsView({ events, people, onAdd, onEdit, onRemove, onCatalog, onExplore }) {
   const [q, setQ] = useState('');
   const [kind, setKind] = useState('All');
   const [sort, setSort] = useState('newest');
@@ -4479,14 +5010,17 @@ function EventsView({ events, people, onAdd, onEdit, onRemove }) {
             ? `${countThings(sorted.length, 'event', 'events')} ${sorted.length === 1 ? 'matches' : 'match'}`
             : `${countThings(events.length, 'event', 'events')} worth keeping`}
         </h1>
-        <Button kind="solid" onClick={onAdd} style={{ marginLeft: 'auto' }}>Add an event</Button>
+        <div style={{ display: 'flex', gap: 8, marginLeft: 'auto' }}>
+          {onExplore && <Button onClick={onExplore}>Explore</Button>}
+          <Button kind="solid" onClick={onAdd}>Add an event</Button>
+        </div>
       </div>
 
       {events.length === 0 && <EmptySky />}
 
       <p style={{ margin: '0 0 18px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
         {events.length === 0
-          ? 'Weddings, moves, births, losses, the trip you never want to forget.'
+          ? 'Weddings, moves, concerts, games, the trip you never want to forget.'
           : byAdded
           ? 'Most recently written down first.'
           : sort === 'oldest'
@@ -4542,7 +5076,7 @@ function EventsView({ events, people, onAdd, onEdit, onRemove }) {
 
       {byAdded
         ? sorted.map((e) => (
-            <EventCard key={e.id} e={e} people={people} onPerson={(n) => setQ(n)}
+            <EventCard key={e.id} e={e} people={people} onPerson={(n) => setQ(n)} onCatalog={onCatalog}
               onEdit={() => onEdit(e)} onRemove={() => onRemove(e.id)} />
           ))
         : years.map((y) => (
@@ -4552,11 +5086,991 @@ function EventsView({ events, people, onAdd, onEdit, onRemove }) {
                 textTransform: 'uppercase', color: C.faint,
               }}>{y}</p>
               {sorted.filter((e) => eventYear(e) === y).map((e) => (
-                <EventCard key={e.id} e={e} people={people} onPerson={(n) => setQ(n)}
+                <EventCard key={e.id} e={e} people={people} onPerson={(n) => setQ(n)} onCatalog={onCatalog}
                   onEdit={() => onEdit(e)} onRemove={() => onRemove(e.id)} />
               ))}
             </div>
           ))}
+    </div>
+  );
+}
+
+/* ---------- the shared catalog ---------- */
+const catalogKindWord = (k) => CATALOG_KINDS[k]?.one || k;
+const ratingLine = (n, avg) => [n ? `${n} logged` : '', avg ? `★ ${Number(avg).toFixed(1)}` : ''].filter(Boolean).join(' · ');
+
+// Finds entries of one kind in the shared catalog and on Wikidata; picking
+// one links it, and anything neither has can be made in Orbit. value: the
+// links of this kind already chosen.
+function CatalogPicker({ api, kind, label, ph, many = false, value, onChange }) {
+  const [q, setQ] = useState('');
+  const [found, setFound] = useState({ q: '', orbit: [], wiki: [] });
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState('');
+  const listId = useId();
+  const term = q.trim().replace(/\s+/g, ' ');
+  useEffect(() => {
+    if (term.length < 2) return undefined;
+    let live = true;
+    // A pause in typing before asking, as place search does.
+    const t = setTimeout(async () => {
+      const [orbit, wiki] = await Promise.all([api.search(term, kind).catch(() => []), searchWikidata(term)]);
+      if (live) setFound({ q: term, orbit, wiki });
+    }, 350);
+    return () => { live = false; clearTimeout(t); };
+  }, [term, api, kind]);
+
+  const showing = term.length >= 2 && found.q === term;
+  const inOrbit = new Set(found.orbit.map((e) => `${e.source}:${e.source_id}`));
+  const wiki = found.wiki.filter((e) => !inOrbit.has(`wikidata:${e.source_id}`));
+  const exact = found.orbit.some((e) => e.name.toLowerCase() === term.toLowerCase());
+  const chosen = new Set(value.map((l) => l.id));
+
+  const pick = async (entry) => {
+    setBusy(true);
+    setProblem('');
+    try {
+      const e = entry.id ? entry : await api.add({ ...entry, kind });
+      if (!e?.id) throw new Error('That could not be added.');
+      track('catalog.link', { kind, source: entry.id ? 'orbit' : entry.source });
+      const link = { id: e.id, kind: e.kind, name: e.name };
+      if (!chosen.has(link.id)) onChange(many ? [...value, link] : [link]);
+      setQ('');
+    } catch (err) {
+      setProblem(err?.message || 'That could not be added.');
+    }
+    setBusy(false);
+  };
+
+  const row = (key, onClick, name, about, extra) => (
+    <button key={key} type="button" className="crm-btn" onClick={onClick} disabled={busy} style={{
+      display: 'flex', gap: 10, alignItems: 'baseline', width: '100%', textAlign: 'left', font: 'inherit', color: C.ink,
+      padding: '9px 12px', background: C.surface, border: 'none', borderTop: `1px solid ${C.line}`, cursor: 'pointer',
+    }}>
+      <span style={{ flex: 1, minWidth: 0 }}>
+        <span style={{ display: 'block', fontSize: 14, fontWeight: 600 }}>{name}</span>
+        {about && <span style={{ display: 'block', fontSize: 12, color: C.muted, marginTop: 1 }}>{about}</span>}
+      </span>
+      {extra && <span style={{ fontSize: 11.5, color: C.faint, flexShrink: 0 }}>{extra}</span>}
+    </button>
+  );
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <span style={labelText()}>{label}</span>
+      {value.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 7 }}>
+          {value.map((l) => (
+            <span key={l.id} style={{ ...filterChip(true), display: 'inline-flex', gap: 6, alignItems: 'center', cursor: 'default' }}>
+              {l.name}
+              <button type="button" className="crm-btn" aria-label={`Remove ${l.name}`} onClick={() => onChange(value.filter((x) => x.id !== l.id))}
+                style={{ font: 'inherit', fontSize: 14, lineHeight: 1, padding: 0, border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer' }}>×</button>
+            </span>
+          ))}
+        </div>
+      )}
+      {(many || !value.length) && (
+        <input style={inputStyle} value={q} onChange={(e) => setQ(e.target.value)} aria-label={label} aria-controls={listId}
+          placeholder={ph} autoComplete="off" />
+      )}
+      {showing && (
+        <div id={listId} role="group" aria-label={`Matches for ${term}`} style={{ marginTop: 6, border: `1px solid ${C.line}`, borderRadius: 8, overflow: 'hidden', marginBottom: 0 }}>
+          <div style={{ marginTop: -1 }}>
+            {found.orbit.filter((e) => !chosen.has(e.id)).map((e) => row(e.id, () => pick(e), e.name, e.about, ratingLine(e.outings, e.average) || 'In Orbit'))}
+            {wiki.map((e) => row(e.source_id, () => pick(e), e.name, e.about, 'Wikidata'))}
+            {!exact && row('new', () => pick({ source: 'orbit', name: term, about: '' }), `Add “${term}”`, `As a new ${catalogKindWord(kind)}, for anything the lists above do not have`)}
+          </div>
+        </div>
+      )}
+      {term.length >= 2 && !showing && <span style={hintStyle()}>Looking…</span>}
+      {problem && <span role="alert" style={{ ...hintStyle(), color: C.overdue }}>{problem}</span>}
+    </div>
+  );
+}
+
+// Half-star bars, 0.5 to 5.
+function RatingSpread({ spread }) {
+  const most = Math.max(1, ...spread);
+  return (
+    <div aria-hidden="true" style={{ display: 'flex', alignItems: 'flex-end', gap: 3, height: 44 }}>
+      {spread.map((n, i) => (
+        <div key={i} title={`${(i + 1) / 2} stars: ${n}`} style={{
+          flex: 1, height: Math.max(3, (n / most) * 44), borderRadius: 2, background: C.soonBar, opacity: n ? 1 : 0.25,
+        }} />
+      ))}
+    </div>
+  );
+}
+
+// Explore: search the shared catalog, and each entry's page. trail is the
+// entries opened in order; with none, it is the search.
+function ExploreView({ api, trail, onOpen, onBack }) {
+  const id = trail[trail.length - 1] || null;
+  return (
+    <div>
+      <button className="crm-btn" onClick={onBack} style={{ ...textButton(), fontSize: 13.5, marginBottom: 14 }}>
+        {id ? '← Back' : '← Events'}
+      </button>
+      {id ? <CatalogPage key={id} api={api} id={id} onOpen={onOpen} /> : <CatalogSearch api={api} onOpen={onOpen} />}
+    </div>
+  );
+}
+
+function CatalogSearch({ api, onOpen }) {
+  const [q, setQ] = useState('');
+  const [kind, setKind] = useState('');
+  const [found, setFound] = useState({ key: '', rows: [], problem: '' });
+  const term = q.trim().replace(/\s+/g, ' ');
+  const key = `${kind}:${term}`;
+  useEffect(() => {
+    if (term.length < 2) return undefined;
+    let live = true;
+    const t = setTimeout(() => {
+      api.search(term, kind || null).then(
+        (rows) => { if (live) { setFound({ key, rows, problem: '' }); track('explore.search', { kind: kind || 'all', found: rows.length }); } },
+        (e) => { if (live) setFound({ key, rows: [], problem: e.message || 'The search did not work.' }); },
+      );
+    }, 300);
+    return () => { live = false; clearTimeout(t); };
+  }, [term, kind, key, api]);
+  const ready = term.length >= 2 && found.key === key;
+  return (
+    <div>
+      <h1 style={{ margin: '0 0 6px', fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Explore</h1>
+      <p style={{ margin: '0 0 14px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
+        Teams, artists, shows, festivals and venues people in Orbit have been to, with their ratings and what they thought.
+      </p>
+      <input style={{ ...inputStyle, marginBottom: 10 }} value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search the catalog"
+        placeholder="Search for a team, artist, show or venue" />
+      <div role="group" aria-label="Kind" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 16 }}>
+        {[['', 'All'], ...Object.entries(CATALOG_KINDS).map(([k, w]) => [k, w.many[0].toUpperCase() + w.many.slice(1)])].map(([k, l]) => (
+          <button key={k || 'all'} className="crm-btn" aria-pressed={kind === k} onClick={() => setKind(k)} style={filterChip(kind === k)}>{l}</button>
+        ))}
+      </div>
+      {found.problem && ready && <p role="alert" style={{ fontSize: 13.5, color: C.overdue }}>{found.problem}</p>}
+      {ready && !found.problem && !found.rows.length && (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.55 }}>
+          Nothing in Orbit by that name yet. Anything you link from an event (a team, an artist, a venue) shows up here.
+        </p>
+      )}
+      {ready && found.rows.length > 0 && (
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '4px 15px' }}>
+          {found.rows.map((e) => (
+            <button key={e.id} className="crm-btn" onClick={() => onOpen(e.id)} style={{
+              display: 'flex', gap: 10, alignItems: 'baseline', width: '100%', textAlign: 'left', font: 'inherit', color: C.ink,
+              padding: '11px 0', background: 'transparent', border: 'none', borderBottom: `1px solid ${C.line}`, cursor: 'pointer',
+            }}>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', fontSize: 14.5, fontWeight: 600 }}>{e.name}</span>
+                {e.about && <span style={{ display: 'block', fontSize: 12.5, color: C.muted, marginTop: 1 }}>{e.about}</span>}
+              </span>
+              <span style={{ fontSize: 12, color: C.muted, flexShrink: 0 }}>{ratingLine(e.outings, e.average)}</span>
+              <span style={kindChip()}>{catalogKindWord(e.kind)}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CatalogPage({ api, id, onOpen, onPerson, canAct = true }) {
+  const [page, setPage] = useState({ state: 'loading' });
+  useEffect(() => {
+    let live = true;
+    api.page(id).then(
+      (p) => {
+        if (!live) return;
+        setPage(p ? { state: 'ok', ...p } : { state: 'gone' });
+        if (p) track('catalog.view', { kind: p.entry.kind, ratings: p.ratings, outings: p.outings.length });
+      },
+      (e) => { if (live) setPage({ state: 'failed', problem: e.message }); },
+    );
+    return () => { live = false; };
+  }, [api, id]);
+  if (page.state === 'loading') return <p style={{ fontSize: 14, color: C.muted }}>Loading…</p>;
+  if (page.state !== 'ok') {
+    return <p role="alert" style={{ fontSize: 14, color: C.muted }}>{page.state === 'gone' ? 'That is not in the catalog.' : page.problem || 'That page could not be loaded.'}</p>;
+  }
+  const { entry, ratings, average, spread, outings } = page;
+  const box = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, marginBottom: 12 };
+  return (
+    <div>
+      <span style={kindChip()}>{catalogKindWord(entry.kind)}</span>
+      <h1 style={{ margin: '8px 0 4px', fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>{entry.name}</h1>
+      {entry.about && <p style={{ margin: '0 0 6px', fontSize: 14, color: C.muted }}>{entry.about}</p>}
+      {entry.source === 'wikidata' && (
+        <a href={WIKIDATA.page(entry.source_id)} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12.5, color: C.muted }}>On Wikidata</a>
+      )}
+
+      <div style={{ ...box, padding: 15, marginTop: 16, display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap' }}>
+        {ratings ? (
+          <>
+            <div>
+              <div style={{ fontSize: 34, fontWeight: 600, letterSpacing: '-0.04em', lineHeight: 1 }}>{Number(average).toFixed(1)}</div>
+              <div style={{ marginTop: 6 }}><Stars n={halfStep(average)} size={14} /></div>
+              <div style={{ fontSize: 12.5, color: C.muted, marginTop: 6 }}>{countThings(ratings, 'rating', 'ratings')} shared with everyone</div>
+            </div>
+            <div style={{ flex: '1 1 180px' }}><RatingSpread spread={spread} /></div>
+          </>
+        ) : (
+          <p style={{ margin: 0, fontSize: 13.5, color: C.muted }}>No ratings shared with everyone yet.</p>
+        )}
+      </div>
+
+      <h2 style={{ margin: '22px 0 10px', fontSize: 20, fontWeight: 600, letterSpacing: '-0.03em' }}>What people thought</h2>
+      {!outings.length ? (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.55 }}>
+          Nobody you can see has logged this yet. Add an event and link it here to be the first.
+        </p>
+      ) : outings.map((o, i) => (
+        <article key={`${o.by.username}-${o.date}-${i}`} style={{ ...box, padding: '13px 15px' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+            {onPerson ? (
+              <a href={profilePath(o.by.username)} onClick={(ev) => { ev.preventDefault(); onPerson(o.by.username); }}
+                style={{ fontSize: 14, fontWeight: 600, color: C.ink, textDecoration: 'none' }}>{o.by.display_name}</a>
+            ) : <span style={{ fontSize: 14, fontWeight: 600 }}>{o.by.display_name}</span>}
+            <span style={{ fontSize: 12.5, color: C.faint }}>@{o.by.username}</span>
+            {o.by.relation === 'self' && <span style={kindChip()}>You</span>}
+            {o.by.relation === 'friends' && <span style={kindChip()}>Friend</span>}
+            <span style={{ marginLeft: 'auto' }}><Stars n={o.rating} size={12.5} /></span>
+          </div>
+          <p style={{ margin: '4px 0 0', fontSize: 12.5, color: C.muted }}>{o.title} · {prettyDate(o.date)}</p>
+          {o.review && <p className="crm-serif" style={{ margin: '8px 0 0', fontSize: 15, lineHeight: 1.6 }}>{o.review}</p>}
+          {o.links.length > 0 && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 9 }}>
+              {o.links.map((l) => (
+                <button key={l.id} className="crm-btn" onClick={() => onOpen(l.id)} aria-label={`Open ${l.name}`}
+                  style={{ ...filterChip(false), padding: '3px 10px', fontSize: 12 }}>{l.name}</button>
+              ))}
+            </div>
+          )}
+          <PostActions api={api} post={o} canAct={canAct} />
+        </article>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- likes and comments ---------- */
+// The heart and the comments under a shared outing or trip. post: { owner,
+// post, ref, likes, liked, comments } as the server hands them out. canAct:
+// signed in; otherwise the counts show, with a way in.
+function PostActions({ api, post, canAct = true }) {
+  const [likes, setLikes] = useState({ n: post.likes || 0, mine: Boolean(post.liked) });
+  const [count, setCount] = useState(post.comments || 0);
+  const [open, setOpen] = useState(false);
+  const [thread, setThread] = useState(null);
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState('');
+  const name = useId();
+  if (!post.owner || !post.ref) return null;
+
+  const toggleLike = async () => {
+    const was = likes;
+    setLikes({ n: was.n + (was.mine ? -1 : 1), mine: !was.mine });
+    setProblem('');
+    try {
+      const r = await api.like(post, !was.mine);
+      setLikes({ n: r.likes, mine: r.liked });
+      track(was.mine ? 'post.unlike' : 'post.like', { post: post.post });
+    } catch (e) {
+      setLikes(was);
+      setProblem(e.message || 'That did not work.');
+    }
+  };
+  const load = async () => {
+    try {
+      const t = await api.thread(post);
+      if (!t) { setProblem('That is not there any more.'); return; }
+      setThread(t);
+      setCount(t.comments);
+      setLikes({ n: t.likes, mine: t.liked });
+    } catch (e) {
+      setProblem(e.message || 'The comments could not be loaded.');
+    }
+  };
+  const toggleOpen = () => {
+    if (!open && !thread) load();
+    setOpen(!open);
+    if (!open) track('post.open_comments', { post: post.post });
+  };
+  const send = async () => {
+    const body = draft.trim();
+    if (!body || busy) return;
+    setBusy(true);
+    setProblem('');
+    try {
+      const c = await api.comment(post, body);
+      setThread((t) => ({ ...(t || { thread: [], likers: [] }), thread: [...(t?.thread || []), c] }));
+      setCount((n) => n + 1);
+      setDraft('');
+      track('post.comment', { post: post.post, length: body.length });
+    } catch (e) {
+      setProblem(e.message || 'That comment did not post.');
+    }
+    setBusy(false);
+  };
+  const remove = async (id) => {
+    try {
+      await api.uncomment(id);
+      setThread((t) => ({ ...t, thread: t.thread.filter((c) => c.id !== id) }));
+      setCount((n) => Math.max(0, n - 1));
+    } catch (e) {
+      setProblem(e.message || 'That did not work.');
+    }
+  };
+  const small = { font: 'inherit', fontSize: 12.5, fontWeight: 600, background: 'transparent', border: 'none', padding: '4px 2px', color: C.muted };
+
+  return (
+    <div style={{ marginTop: 10, borderTop: `1px solid ${C.line}`, paddingTop: 6 }}>
+      <div style={{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+        {canAct ? (
+          <button className="crm-btn" aria-pressed={likes.mine} onClick={toggleLike}
+            aria-label={likes.mine ? `Unlike, ${likes.n} ${likes.n === 1 ? 'like' : 'likes'}` : `Like, ${likes.n} ${likes.n === 1 ? 'like' : 'likes'}`}
+            style={{ ...small, cursor: 'pointer', color: likes.mine ? C.overdueBar : C.muted }}>
+            <span aria-hidden="true">{likes.mine ? '♥' : '♡'}</span> {likes.n || ''}
+          </button>
+        ) : (
+          <span style={small} aria-label={`${likes.n} ${likes.n === 1 ? 'like' : 'likes'}`}><span aria-hidden="true">♡</span> {likes.n || ''}</span>
+        )}
+        {canAct ? (
+          <button className="crm-btn" aria-expanded={open} onClick={toggleOpen} style={{ ...small, cursor: 'pointer' }}>
+            {count ? `${count} ${count === 1 ? 'comment' : 'comments'}` : 'Comment'}
+          </button>
+        ) : (
+          <span style={small}>{count ? `${count} ${count === 1 ? 'comment' : 'comments'}` : ''}</span>
+        )}
+        {!canAct && <a href={BASE} style={{ fontSize: 12, color: C.muted }}>Log in to like or comment</a>}
+      </div>
+      {problem && <p role="alert" style={{ margin: '4px 0 0', fontSize: 12.5, color: C.overdue }}>{problem}</p>}
+      {open && canAct && (
+        <div style={{ marginTop: 6 }}>
+          {thread === null && !problem && <p style={{ margin: 0, fontSize: 12.5, color: C.muted }}>Loading…</p>}
+          {thread?.likers?.length > 0 && (
+            <p style={{ margin: '0 0 8px', fontSize: 12.5, color: C.muted }}>
+              Liked by {thread.likers.slice(0, 3).map((l) => l.display_name).join(', ')}{thread.likers.length > 3 ? ` and ${thread.likers.length - 3} more` : ''}
+            </p>
+          )}
+          {thread?.thread.map((c) => (
+            <div key={c.id} style={{ padding: '6px 0', borderTop: `1px solid ${C.line}` }}>
+              <p style={{ margin: 0, fontSize: 12.5, color: C.muted, display: 'flex', gap: 6, alignItems: 'baseline' }}>
+                <a href={profilePath(c.by.username)} style={{ fontWeight: 600, color: C.ink, textDecoration: 'none' }}>{c.by.display_name}</a>
+                <span style={{ color: C.faint }}>{ago(c.at)}</span>
+                {c.can_delete && (
+                  <button className="crm-btn" onClick={() => remove(c.id)} aria-label={`Delete ${c.mine ? 'your' : `${c.by.display_name}’s`} comment`}
+                    style={{ ...textButton(), fontSize: 12, fontWeight: 500, marginLeft: 'auto', color: C.faint }}>Delete</button>
+                )}
+              </p>
+              <p style={{ margin: '2px 0 0', fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{c.body}</p>
+            </div>
+          ))}
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <label htmlFor={name} className="crm-sr">Add a comment</label>
+            <textarea id={name} rows={1} maxLength={1000} value={draft} onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => { if (isEnter(e) && !e.shiftKey) { e.preventDefault(); send(); } }}
+              placeholder="Add a comment" style={{ ...inputStyle, minHeight: 38, fontSize: 14, resize: 'vertical', flex: 1 }} />
+            <Button kind="solid" onClick={send} disabled={busy || !draft.trim()} style={{ fontSize: 13, padding: '7px 12px' }}>Post</Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- the friends feed ---------- */
+// How long ago something was shared, in words.
+const ago = (at, now = Date.now()) => {
+  const t = Date.parse(at);
+  if (Number.isNaN(t)) return '';
+  const min = Math.max(0, Math.round((now - t) / 60000));
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min} min ago`;
+  const h = Math.round(min / 60);
+  if (h < 24) return `${h} h ago`;
+  const d = Math.round(h / 24);
+  if (d === 1) return 'yesterday';
+  if (d < 7) return `${d} days ago`;
+  return formatDay(new Date(t), 'full');
+};
+
+// Runs of things one friend shared at once (a year of concerts linked in one
+// go) are gathered, so they do not bury everyone else. Returns groups of
+// consecutive items by the same person shared within two minutes of each
+// other, in the feed's order.
+const groupFeed = (items) => {
+  const out = [];
+  items.forEach((x) => {
+    const last = out[out.length - 1];
+    const prev = last?.items[last.items.length - 1];
+    if (last && last.by.username === x.by.username && Math.abs(Date.parse(prev.at) - Date.parse(x.at)) <= 120000) {
+      last.items.push(x);
+    } else {
+      out.push({ key: x.id, by: x.by, items: [x] });
+    }
+  });
+  return out;
+};
+const GROUP_SHOWN = 3;
+
+function FeedItem({ x, onCatalog, api }) {
+  const trip = x.type === 'trip' ? pageTrip({ ...x, id: x.id }) : null;
+  const verb = !trip && x.rating ? 'rated' : 'went to';
+  return (
+    <article style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '12px 15px', marginBottom: 10 }}>
+      <p style={{ margin: 0, fontSize: 13, color: C.muted, display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'baseline' }}>
+        <a href={profilePath(x.by.username)} style={{ fontWeight: 600, color: C.ink, textDecoration: 'none' }}>{x.by.display_name}</a>
+        <span>{verb}</span>
+        <span style={{ marginLeft: 'auto', color: C.faint, fontSize: 12 }}>{ago(x.at)}</span>
+      </p>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap', marginTop: 4 }}>
+        <span style={{ fontSize: 16.5, fontWeight: 600, letterSpacing: '-0.02em' }}>{x.title}</span>
+        {!trip && <span style={kindChip()}>{x.kind}</span>}
+        <span style={{ marginLeft: 'auto' }}><Stars n={x.rating} size={13} /></span>
+      </div>
+      <p style={{ margin: '3px 0 0', fontSize: 12.5, color: C.muted }}>
+        {trip ? tripWhen(trip).text : prettyDate(x.date)}
+        {trip && trip.stops.length > 0 && ` · ${[...new Set(trip.stops.map((st) => st.name).filter(Boolean))].join(' → ')}`}
+      </p>
+      {(x.review || x.highlight) && (
+        <p className="crm-serif" style={{ margin: '8px 0 0', fontSize: 15, lineHeight: 1.55 }}>{x.review || x.highlight}</p>
+      )}
+      {x.links?.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 9 }}>
+          {x.links.map((l) => (
+            <button key={l.id} className="crm-btn" onClick={() => onCatalog(l.id)} aria-label={`Open ${l.name}`}
+              style={{ ...filterChip(false), padding: '3px 10px', fontSize: 12 }}>{l.name}</button>
+          ))}
+        </div>
+      )}
+      <PostActions api={api} post={x} />
+    </article>
+  );
+}
+
+// What friends have shared, newest first, a page at a time. onSeen gets the
+// newest item's time once it is showing.
+function FeedView({ api, onCatalog, onSeen, onFriends }) {
+  const [items, setItems] = useState(null);
+  const [more, setMore] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState('');
+  const [open, setOpen] = useState(() => new Set());
+  const PAGE = 30;
+  useEffect(() => {
+    let live = true;
+    api.feed(null, PAGE).then(
+      (rows) => {
+        if (!live) return;
+        setItems(rows);
+        setMore(rows.length === PAGE);
+        if (rows[0]) onSeen(rows[0].at);
+        track('feed.view', { items: rows.length });
+      },
+      (e) => { if (live) { setItems([]); setProblem(e.message || 'The feed could not be loaded.'); } },
+    );
+    return () => { live = false; };
+  }, [api, onSeen]);
+  const loadMore = async () => {
+    setBusy(true);
+    try {
+      const rows = await api.feed(items[items.length - 1], PAGE);
+      track('feed.more', { shown: items.length });
+      setItems([...items, ...rows]);
+      setMore(rows.length === PAGE);
+    } catch (e) {
+      setProblem(e.message || 'More could not be loaded.');
+    }
+    setBusy(false);
+  };
+  const groups = useMemo(() => groupFeed(items || []), [items]);
+
+  return (
+    <div>
+      <h1 style={{ margin: '0 0 6px', fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Feed</h1>
+      <p style={{ margin: '0 0 18px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
+        The concerts, games and shows your friends went to, and the trips they have taken, as they share them.
+      </p>
+      {problem && <p role="alert" style={{ fontSize: 13.5, color: C.overdue }}>{problem}</p>}
+      {items === null && <p style={{ fontSize: 14, color: C.muted }}>Loading…</p>}
+      {items && items.length === 0 && !problem && (
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
+          <p style={{ margin: '0 0 10px', fontSize: 14, lineHeight: 1.55 }}>
+            Nothing from friends yet. When a friend rates a concert or a game, or shows their trips, it appears here.
+          </p>
+          {onFriends && <Button kind="solid" onClick={onFriends}>Find friends</Button>}
+        </div>
+      )}
+      {groups.map((g) => {
+        const shown = open.has(g.key) ? g.items : g.items.slice(0, GROUP_SHOWN);
+        const rest = g.items.length - shown.length;
+        return (
+          <div key={g.key}>
+            {shown.map((x) => <FeedItem key={x.id} x={x} onCatalog={onCatalog} api={api} />)}
+            {rest > 0 && (
+              <button className="crm-btn" onClick={() => { track('feed.expand', { n: rest }); setOpen(new Set([...open, g.key])); }}
+                style={{ ...textButton(), fontSize: 13, margin: '0 0 14px 4px' }}>
+                {`${rest} more from ${g.by.display_name.split(' ')[0]}`}
+              </button>
+            )}
+          </div>
+        );
+      })}
+      {more && <Button onClick={busy ? undefined : loadMore}>{busy ? 'Loading…' : 'Load more'}</Button>}
+    </div>
+  );
+}
+
+/* ---------- usage report (Orbit's team only) ---------- */
+// The parts of the app, as the report names them (the part of each action's
+// name before the dot), in plain words.
+const USAGE_AREAS = {
+  app: 'Opening Orbit', view: 'Moving between tabs', person: 'People', catchup: 'Logging catch-ups', event: 'Events',
+  reminder: 'Reminders', list: 'Lists', trip: 'Trips', recap: 'Recap and its card', share: 'Sending copies',
+  catalog: 'The catalog', explore: 'Explore', feed: 'The feed', post: 'Likes and comments', friends: 'Friends',
+  notify: 'Notifications', settings: 'Settings', profile: 'Their profile and page', page: 'Public pages', data: 'Import, export, backup',
+};
+const areaName = (a) => USAGE_AREAS[a] || a;
+const shortDay = (d) => formatDay(parseDate(d), 'monthDay');
+
+// Active people by day: one column per day, one colour. Hovering or
+// focusing a day shows its numbers above; the table has them all.
+function DailyActive({ rows }) {
+  const [at, setAt] = useState(rows.length - 1);
+  const [asTable, setAsTable] = useState(false);
+  const most = Math.max(1, ...rows.map((r) => r.active));
+  const r = rows[Math.min(at, rows.length - 1)] || rows[rows.length - 1];
+  const H = 120;
+  if (!rows.length) return null;
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 15, marginBottom: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+        <p style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>Active people each day</p>
+        <button className="crm-btn" onClick={() => setAsTable(!asTable)} style={{ ...textButton(), fontSize: 12.5, marginLeft: 'auto' }}>
+          {asTable ? 'Show as chart' : 'Show as table'}
+        </button>
+      </div>
+      {asTable ? (
+        <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+          <UsageTable head={['Day', 'Active', 'New', 'Actions']} rows={[...rows].reverse().map((x) => [shortDay(x.day), x.active, x.joined, x.actions])} />
+        </div>
+      ) : (
+        <>
+          <p aria-live="polite" style={{ margin: '0 0 8px', fontSize: 13, color: C.muted }}>
+            <strong style={{ fontSize: 16, color: C.ink }}>{r.active}</strong> active on {shortDay(r.day)}
+            {` · ${r.joined} new · ${r.actions} actions`}
+          </p>
+          <div style={{ position: 'relative', height: H, display: 'flex', alignItems: 'flex-end', gap: 2, borderBottom: `1px solid ${C.line}` }}>
+            <span aria-hidden="true" style={{ position: 'absolute', top: -2, left: 0, fontSize: 11, color: C.faint, fontVariantNumeric: 'tabular-nums' }}>{most}</span>
+            {rows.map((x, i) => (
+              <button key={x.day} className="crm-btn" onMouseEnter={() => setAt(i)} onFocus={() => setAt(i)}
+                aria-label={`${shortDay(x.day)}: ${x.active} active, ${x.joined} new, ${x.actions} actions`}
+                style={{ flex: '1 1 0', height: '100%', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', background: 'transparent', border: 'none', padding: 0, cursor: 'default', minWidth: 0 }}>
+                <span style={{
+                  display: 'block', width: '100%', maxWidth: 24, height: Math.max(x.active ? 3 : 1, (x.active / most) * (H - 14)),
+                  background: x.active ? C.accentDeep : C.line, borderRadius: '4px 4px 0 0', opacity: i === at ? 1 : 0.78,
+                }} />
+              </button>
+            ))}
+          </div>
+          <div aria-hidden="true" style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: C.faint, marginTop: 5 }}>
+            <span>{shortDay(rows[0].day)}</span><span>{shortDay(rows[rows.length - 1].day)}</span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function UsageTable({ head, rows, bar }) {
+  const cell = { padding: '7px 8px', borderBottom: `1px solid ${C.line}`, fontSize: 13, textAlign: 'right', fontVariantNumeric: 'tabular-nums' };
+  return (
+    <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+      <thead>
+        <tr>{head.map((h, i) => <th key={h} scope="col" style={{ ...cell, textAlign: i ? 'right' : 'left', color: C.muted, fontWeight: 600, fontSize: 12 }}>{h}</th>)}</tr>
+      </thead>
+      <tbody>
+        {rows.map((r, j) => (
+          <tr key={j}>
+            {r.map((v, i) => (
+              <td key={i} style={{ ...cell, textAlign: i ? 'right' : 'left', color: C.ink }}>
+                {i === 0 && bar ? (
+                  <span style={{ display: 'block' }}>
+                    {v}
+                    <span aria-hidden="true" style={{ display: 'block', height: 4, marginTop: 4, borderRadius: 2, background: C.line }}>
+                      <span style={{ display: 'block', height: 4, borderRadius: 2, width: `${Math.max(0, Math.min(100, bar(j)))}%`, background: C.accentDeep }} />
+                    </span>
+                  </span>
+                ) : v}
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function UsageView({ api }) {
+  const [days, setDays] = useState(30);
+  const [report, setReport] = useState(null);
+  const [problem, setProblem] = useState('');
+  const [allActions, setAllActions] = useState(false);
+  useEffect(() => {
+    let live = true;
+    api.report(days).then((r) => { if (live) { setReport(r); setProblem(''); } }, (e) => { if (live) setProblem(e.message || 'The report could not be loaded.'); });
+    return () => { live = false; };
+  }, [api, days]);
+  const card = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 15, marginBottom: 12 };
+  const head = (t, sub) => (
+    <>
+      <p style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>{t}</p>
+      {sub && <p style={{ margin: '3px 0 8px', fontSize: 12.5, color: C.muted, lineHeight: 1.45 }}>{sub}</p>}
+    </>
+  );
+  const pct = (n) => `${n}%`;
+  const t = report?.totals;
+  return (
+    <div style={{ opacity: report || problem ? 1 : 0.6 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
+        <h1 style={{ margin: 0, fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Usage</h1>
+        <div role="group" aria-label="Window" style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
+          {[7, 30, 90].map((d) => (
+            <button key={d} className="crm-btn" aria-pressed={days === d} onClick={() => setDays(d)} style={filterChip(days === d)}>{d} days</button>
+          ))}
+        </div>
+      </div>
+      <p style={{ margin: '0 0 16px', fontSize: 13.5, color: C.muted, lineHeight: 1.5 }}>
+        What people do in Orbit, as counts: never what they wrote. People who turned usage counts off are not in it.
+      </p>
+      {problem && <p role="alert" style={{ fontSize: 13.5, color: C.overdue }}>{problem}</p>}
+      {!report && !problem && <p style={{ fontSize: 14, color: C.muted }}>Loading…</p>}
+      {report && (
+        <>
+          <div role="region" aria-label="Headline numbers" style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+            <Stat n={t.active_today} label="active today" tone={C.accentDeep} />
+            <Stat n={t.active_week} label="active in the last 7 days" />
+            <Stat n={t.active} label={`active in ${report.days} days`} />
+            <Stat n={t.people} label="people in all" />
+            <Stat n={t.joined} label={`joined in ${report.days} days`} />
+            <Stat n={t.visits} label="visits from people signed out" />
+          </div>
+
+          <DailyActive rows={report.daily} />
+
+          <div style={card}>
+            {head('Parts of the app', 'How many of the people active in this window used each part.')}
+            <UsageTable head={['Part', 'Of active people', 'People', 'Actions']} bar={(j) => report.areas[j].share}
+              rows={report.areas.map((a) => [areaName(a.area), pct(a.share), a.people, a.actions])} />
+          </div>
+
+          <div style={card}>
+            {head('What engaged people rely on', `Heavy: active on 8 or more days in this window (${report.heavy.heavy_people} people). Light: fewer (${report.heavy.light_people}). A part far more used by heavy people is a good candidate to build on, or to charge for.`)}
+            <UsageTable head={['Part', 'Heavy', 'Light']}
+              rows={report.heavy.areas.map((a) => [areaName(a.area), pct(a.heavy), pct(a.light)])} />
+          </div>
+
+          <div style={card}>
+            {head('How often people come back', 'People by the number of days they were active in this window.')}
+            <UsageTable head={['Days active', 'People']} rows={Object.entries(report.depth).map(([k, v]) => [k === '1' ? '1 day' : `${k} days`, v])} />
+          </div>
+
+          <div style={card}>
+            {head('Do new people stay?', 'People by the week they joined, and how many came back 1–7, 8–14 and 22–28 days later.')}
+            <UsageTable head={['Joined', 'People', 'Week 1', 'Week 2', 'Week 4']}
+              rows={report.cohorts.map((c) => [`Week of ${shortDay(c.week)}`, c.joined, c.week1, c.week2, c.week4])} />
+          </div>
+
+          <div style={card}>
+            {head('Tabs opened')}
+            <UsageTable head={['Tab', 'Opens', 'People']} rows={report.views.map((v) => [v.view || '?', v.count, v.people])} />
+          </div>
+
+          <div style={card}>
+            {head('Public pages', 'Views of people’s pages and catalog pages, and whether visitors go on to join.')}
+            <UsageTable head={['', 'Count']} rows={[
+              ['Page views', report.public.views], ['Visitors signed out', report.public.visitors],
+              ['“Join Orbit” clicks', report.public.join_clicks], ['New accounts in this window', report.public.joined],
+            ]} />
+          </div>
+
+          <div style={card}>
+            {head('Devices', 'Each time Orbit was opened.')}
+            <UsageTable head={['Device', 'From the Home Screen', 'Opens']}
+              rows={report.devices.map((d) => [d.device, d.installed ? 'Yes' : 'No', d.opens])} />
+          </div>
+
+          <div style={card}>
+            {head('Every action', 'Each thing counted, most frequent first.')}
+            <UsageTable head={['Action', 'Times', 'People']}
+              rows={(allActions ? report.actions : report.actions.slice(0, 15)).map((a) => [a.name, a.count, a.people])} />
+            {report.actions.length > 15 && (
+              <button className="crm-btn" onClick={() => setAllActions(!allActions)} style={{ ...textButton(), fontSize: 13, marginTop: 10 }}>
+                {allActions ? 'Show fewer' : `Show all ${report.actions.length}`}
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---------- public pages ---------- */
+// A shared trip as the rest of the app knows trips, so the same map, dates
+// and stars work on it.
+const pageTrip = (t) => ({
+  id: t.id, title: t.title, startDate: t.start, endDate: t.end || null, rating: t.rating || null, excerpt: t.highlight || '',
+  notes: '', companions: [], photoIds: [], tags: [],
+  stops: (t.stops || []).map((st) => ({ name: st.name, displayAddress: '', lat: st.lat, lng: st.lng, country: st.country, state: st.state })),
+});
+
+// The numbers across the top of a page: trips, countries, US states, days
+// away and places from the trips shown; the outings by kind.
+const pageStats = (trips, outings, year = null) => {
+  const stops = trips.flatMap((t) => t.stops);
+  const countries = new Set(stops.map((st) => st.country).filter(Boolean));
+  const states = new Set(stops.filter((st) => st.country === 'United States').map((st) => st.state).filter(Boolean));
+  const days = year ? daysAway(trips, year) : trips.reduce((n, t) => n + tripWhen(t).days, 0);
+  const word = (n, one, many) => (n === 1 ? one : many);
+  return [
+    { n: trips.length, label: word(trips.length, 'trip', 'trips') },
+    { n: countries.size, label: word(countries.size, 'country', 'countries') },
+    { n: states.size, label: word(states.size, 'US state', 'US states') },
+    { n: days, label: word(days, 'day away', 'days away') },
+    ...OUTING_KINDS.map((k) => {
+      const n = outings.filter((o) => o.kind === k).length;
+      return { n, label: OUTING_WORDS[k][n === 1 ? 0 : 1] };
+    }),
+  ].filter((x) => x.n > 0);
+};
+
+// Someone's page. go(path) moves to another public page.
+function ProfilePage({ api, username, year, go, signedIn }) {
+  const [page, setPage] = useState({ state: 'loading' });
+  const [said, setSaid] = useState('');
+  useEffect(() => {
+    let live = true;
+    api.profile(username, year).then(
+      (p) => { if (live) setPage(p ? { state: 'ok', ...p } : { state: 'gone' }); },
+      (e) => { if (live) setPage({ state: 'failed', problem: e.message }); },
+    );
+    return () => { live = false; };
+  }, [api, username, year]);
+  const trips = useMemo(() => (page.trips || []).map(pageTrip), [page.trips]);
+  const points = useMemo(() => tripPoints(trips), [trips]);
+  const pr = page.profile;
+  useEffect(() => {
+    if (pr) document.title = `${pr.display_name} (@${pr.username})${year ? ` · ${year}` : ''} · Orbit`;
+  }, [pr, year]);
+
+  if (page.state === 'loading') return <p style={{ fontSize: 14, color: C.muted }}>Loading…</p>;
+  if (page.state === 'gone') {
+    return (
+      <div>
+        <h1 style={{ margin: '0 0 8px', fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Nobody here by that name</h1>
+        <p style={{ fontSize: 14, color: C.muted }}>There is no page for @{username}. Check the link.</p>
+      </div>
+    );
+  }
+  if (page.state !== 'ok') return <p role="alert" style={{ fontSize: 14, color: C.muted }}>{page.problem || 'That page could not be loaded.'}</p>;
+
+  const link = pageUrl(profilePath(pr.username, year));
+  const copy = async () => {
+    track('page.copy_link', { own: pr.relation === 'self' });
+    try { await navigator.clipboard.writeText(link); setSaid('Link copied.'); } catch { setSaid(link); }
+  };
+  const box = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, marginBottom: 12 };
+  const head = (
+    <header style={{ marginBottom: 18 }}>
+      <h1 style={{ margin: 0, fontSize: 30, fontWeight: 600, letterSpacing: '-0.04em' }}>{pr.display_name}</h1>
+      <p style={{ margin: '3px 0 0', fontSize: 14, color: C.muted, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline' }}>
+        <span>@{pr.username}</span>
+        {pr.pronouns && <span>{pr.pronouns}</span>}
+        {pr.location && <span>{pr.location}</span>}
+        {pr.relation === 'self' && <span style={kindChip()}>You</span>}
+        {pr.relation === 'friends' && <span style={kindChip()}>Friend</span>}
+      </p>
+      {pr.bio && <p className="crm-serif" style={{ margin: '10px 0 0', fontSize: 15.5, lineHeight: 1.55 }}>{pr.bio}</p>}
+      {pr.website && safeLink(pr.website) && (
+        <a href={safeLink(pr.website)} target="_blank" rel="noopener noreferrer nofollow" style={{ display: 'inline-block', marginTop: 8, fontSize: 13, color: C.muted }}>
+          {safeLink(pr.website).replace(/^https?:\/\//, '')}
+        </a>
+      )}
+    </header>
+  );
+
+  if (page.hidden) {
+    return (
+      <div>
+        {head}
+        <div style={{ ...box, padding: 16 }}>
+          <p style={{ margin: '0 0 12px', fontSize: 14, lineHeight: 1.55 }}>
+            {pr.display_name.split(' ')[0]}’s page is only for people signed in to Orbit.
+          </p>
+          <a href={BASE} onClick={() => { track('page.join', { where: 'hidden' }); flushUsage(); }} style={{ ...solidLink(), display: 'inline-block' }}>Log in or join Orbit</a>
+        </div>
+      </div>
+    );
+  }
+
+  const stats = pageStats(trips, page.outings, year);
+  const nothing = !trips.length && !page.outings.length;
+  return (
+    <div>
+      {head}
+      {(page.years.length > 0 || year) && (
+        <nav aria-label="Years" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 16 }}>
+          {[null, ...[...new Set([...page.years, ...(year ? [year] : [])])].sort((a, b) => b - a)].map((y) => (
+            <a key={y ?? 'all'} href={profilePath(pr.username, y)} aria-current={y === year ? 'page' : undefined}
+              onClick={(ev) => { ev.preventDefault(); go(profilePath(pr.username, y)); }}
+              style={{ ...filterChip(y === year), textDecoration: 'none', display: 'inline-block' }}>{y ?? 'All time'}</a>
+          ))}
+        </nav>
+      )}
+
+      {nothing ? (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.55 }}>
+          {year ? `Nothing shared from ${year}.` : 'Nothing shared here yet.'}
+        </p>
+      ) : (
+        <>
+          {stats.length > 0 && (
+            <div role="region" aria-label="Numbers" style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+              {stats.map((x, i) => <Stat key={x.label} n={x.n} label={x.label} tone={i === 0 ? C.accentDeep : undefined} />)}
+            </div>
+          )}
+
+          {points.length > 0 && (
+            <div style={{ ...mapFrame(), marginBottom: 12 }}>
+              <MapSlot height={300} render={(m) => (
+                <m.TripsMap points={points} height={300} dark={C.dark} renderPopup={(p) => {
+                  const t = trips.find((x) => x.id === p.tripId);
+                  return t ? <TripPopup trip={t} stop={p.stop} onOpen={() => document.getElementById(`trip-${t.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })} /> : null;
+                }} />
+              )} />
+            </div>
+          )}
+
+          {trips.length > 0 && (
+            <section aria-labelledby="page-trips" style={{ marginTop: 20 }}>
+              <h2 id="page-trips" style={{ margin: '0 0 10px', fontSize: 20, fontWeight: 600, letterSpacing: '-0.03em' }}>Trips</h2>
+              {trips.map((t) => (
+                <article key={t.id} id={`trip-${t.id}`} style={{ ...box, padding: '12px 15px' }}>
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.02em' }}>{t.title}</span>
+                    <span style={{ marginLeft: 'auto' }}><Stars n={t.rating} size={12.5} /></span>
+                  </div>
+                  <p style={{ margin: '3px 0 0', fontSize: 12.5, color: C.muted }}>
+                    {tripWhen(t).text}
+                    {t.stops.length > 0 && ` · ${[...new Set(t.stops.map((st) => st.name).filter(Boolean))].join(' → ')}`}
+                  </p>
+                  {t.excerpt && <p className="crm-serif" style={{ margin: '7px 0 0', fontSize: 15, lineHeight: 1.55 }}>{t.excerpt}</p>}
+                  <PostActions api={api} post={page.trips.find((x) => x.id === t.id) || {}} canAct={signedIn} />
+                </article>
+              ))}
+            </section>
+          )}
+
+          {page.outings.length > 0 && (
+            <section aria-labelledby="page-outings" style={{ marginTop: 20 }}>
+              <h2 id="page-outings" style={{ margin: '0 0 10px', fontSize: 20, fontWeight: 600, letterSpacing: '-0.03em' }}>Concerts, games and shows</h2>
+              {page.outings.map((o) => (
+                <article key={o.id} style={{ ...box, padding: '12px 15px' }}>
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.02em' }}>{o.title}</span>
+                    <span style={kindChip()}>{o.kind}</span>
+                    <span style={{ marginLeft: 'auto' }}><Stars n={o.rating} size={12.5} /></span>
+                  </div>
+                  <p style={{ margin: '3px 0 0', fontSize: 12.5, color: C.muted }}>{prettyDate(o.date)}</p>
+                  {o.review && <p className="crm-serif" style={{ margin: '7px 0 0', fontSize: 15, lineHeight: 1.55 }}>{o.review}</p>}
+                  {o.links.length > 0 && (
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 9 }}>
+                      {o.links.map((l) => (
+                        <a key={l.id} href={catalogPath(l.id)} onClick={(ev) => { ev.preventDefault(); go(catalogPath(l.id)); }}
+                          style={{ ...filterChip(false), padding: '3px 10px', fontSize: 12, textDecoration: 'none', display: 'inline-block' }}>{l.name}</a>
+                      ))}
+                    </div>
+                  )}
+                  <PostActions api={api} post={o} canAct={signedIn} />
+                </article>
+              ))}
+            </section>
+          )}
+        </>
+      )}
+
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginTop: 20 }}>
+        <Button onClick={copy}>Copy link to this page</Button>
+        {said && <span role="status" style={{ fontSize: 13, color: C.muted, wordBreak: 'break-all' }}>{said}</span>}
+      </div>
+      {!signedIn && (
+        <div style={{ ...box, padding: 16, marginTop: 24 }}>
+          <p style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Keep your own</p>
+          <p style={{ margin: '0 0 12px', fontSize: 13.5, color: C.muted, lineHeight: 1.5 }}>
+            Orbit keeps the people you care about, the places you have been, and the concerts, games and shows you went to, in one place.
+          </p>
+          <a href={BASE} onClick={() => { track('page.join', { where: 'bottom' }); flushUsage(); }} style={{ ...solidLink(), display: 'inline-block' }}>Join Orbit</a>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// A link that looks like the solid button.
+const solidLink = () => ({
+  font: 'inherit', fontSize: 14, fontWeight: 600, padding: '9px 14px', borderRadius: 7,
+  background: C.accent, color: C.onAccent, border: `1px solid ${C.accent}`, textDecoration: 'none',
+});
+
+// The public pages, drawn on their own, without signing in: a person's page
+// or a catalog entry's (see route.js). Moving between them stays on the page.
+export function PublicPage({ client, route: first }) {
+  const [route, setRoute] = useState(first);
+  const [signedIn, setSignedIn] = useState(false);
+  // No saved theme to go by: follow the device.
+  useState(() => {
+    const dark = typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+    applyTheme(dark ? 'orbit' : 'daylight');
+    return null;
+  });
+  const api = useMemo(() => publicApi(client), [client]);
+  useEffect(() => {
+    let live = true;
+    client.auth.getSession().then(({ data }) => { if (live) setSignedIn(Boolean(data?.session)); }, () => {});
+    const back = () => setRoute(readRoute(window.location.pathname));
+    window.addEventListener('popstate', back);
+    return () => { live = false; window.removeEventListener('popstate', back); };
+  }, [client]);
+  useEffect(() => {
+    if (route) track('page.view', { kind: route.kind, year: Boolean(route.year), signed_in: signedIn });
+  }, [route, signedIn]);
+  const go = useCallback((path) => {
+    window.history.pushState(null, '', path);
+    setRoute(readRoute(path));
+    window.scrollTo(0, 0);
+  }, []);
+
+  return (
+    <div style={{ background: C.ground, backgroundImage: C.sky, minHeight: '100%', color: C.ink, fontFamily: "'Bricolage Grotesque', 'Segoe UI', system-ui, sans-serif" }}>
+      <AppStyles />
+      <div style={{ maxWidth: 760, margin: '0 auto', padding: '18px 16px 48px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 22 }}>
+          <a href={BASE} style={{ display: 'flex', alignItems: 'center', gap: 8, color: C.ink, textDecoration: 'none', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', fontSize: 13 }}>
+            <OrbitMark /> Orbit
+          </a>
+          <a href={BASE} onClick={() => { track(signedIn ? 'page.open_app' : 'page.join', { where: 'top' }); flushUsage(); }}
+            style={{ ...solidLink(), marginLeft: 'auto', fontSize: 13, padding: '7px 12px' }}>{signedIn ? 'Open Orbit' : 'Join Orbit'}</a>
+        </div>
+        {!route ? (
+          <p style={{ fontSize: 14, color: C.muted }}>That page does not exist.</p>
+        ) : route.kind === 'profile' ? (
+          <ProfilePage key={`${route.username}/${route.year}`} api={api} username={route.username} year={route.year} go={go} signedIn={signedIn} />
+        ) : (
+          <CatalogPage key={route.id} api={api} id={route.id} canAct={signedIn} onOpen={(id) => go(catalogPath(id))} onPerson={(u) => go(profilePath(u))} />
+        )}
+      </div>
     </div>
   );
 }
@@ -5711,6 +7225,7 @@ const SharePanel = memo(function SharePanel({ c, people, owner }) {
   // The clipboard is refused outright on plain http and in some embeds, so
   // there is always a way to get at the text by hand.
   const copy = async (value, what) => {
+    track('share.list', { how: /link/i.test(what) ? 'link' : 'text' });
     try {
       await navigator.clipboard.writeText(value);
       setSaid(`${what} is copied. Paste it wherever you like.`);
@@ -5723,6 +7238,7 @@ const SharePanel = memo(function SharePanel({ c, people, owner }) {
 
   const sheet = async () => {
     try {
+      track('share.list', { how: 'sheet' });
       await navigator.share({ title: c.name, text });
     } catch (e) {
       if (e?.name !== 'AbortError') copy(text, 'The list');
@@ -6299,14 +7815,14 @@ const loadGeo = () => {
 // The outlines module once loaded, else null. where(stop) → { country, state },
 // or null until then (or if they cannot load, when the counts that need them
 // are left out).
-const useGeo = () => {
+const useGeo = (wanted = true) => {
   const [mod, setMod] = useState(geoModule);
   useEffect(() => {
-    if (mod) return undefined;
+    if (mod || !wanted) return undefined;
     let live = true;
     loadGeo().then((m) => { if (live) setMod(m); }).catch(() => { /* counted without them */ });
     return () => { live = false; };
-  }, [mod]);
+  }, [mod, wanted]);
   const where = useMemo(() => (mod ? (st) => mod.whereIs(st.lat, st.lng) : null), [mod]);
   return { geo: mod, where };
 };
@@ -7326,6 +8842,7 @@ const TripSharePanel = memo(function TripSharePanel({ trip, owner }) {
   }, [withPhotos, size, trip.photoIds]);
 
   const copy = async (value, what) => {
+    track('share.trip', { how: /link/i.test(what) ? 'link' : 'text' });
     try {
       await navigator.clipboard.writeText(value);
       setSaid(`${what} is copied. Send it however you like.`);
@@ -7337,6 +8854,7 @@ const TripSharePanel = memo(function TripSharePanel({ trip, owner }) {
   };
   const sheet = async () => {
     try {
+      track('share.trip', { how: 'sheet' });
       await navigator.share({ title: trip.title, text: `${opts.by || 'Someone'} shared a trip from Orbit: ${trip.title}.`, url: link });
     } catch (e) {
       if (e?.name !== 'AbortError') copy(link, 'The link');
@@ -7352,6 +8870,7 @@ const TripSharePanel = memo(function TripSharePanel({ trip, owner }) {
   };
 
   const saveFile = async (tryShare) => {
+    track('share.trip', { how: 'file', photos: withPhotos });
     setSaid('');
     setMaking(true);
     let file;
@@ -8381,8 +9900,12 @@ function ProfileSettings({ account }) {
   const start = () => ({
     pronouns: pr?.pronouns || '', bio: pr?.bio || '', location: pr?.location || '', phone: pr?.phone || '',
     contact_email: pr?.contact_email || '', website: pr?.website || '', socials: { ...(pr?.socials || {}) },
-    visibility: Object.fromEntries(PROFILE_FIELDS.map((f) => [f.key, visibilityOf(pr, f.key)])),
+    visibility: {
+      ...Object.fromEntries(PROFILE_FIELDS.map((f) => [f.key, visibilityOf(pr, f.key)])),
+      trips: pr?.visibility?.trips || 'me',
+    },
     searchable: pr?.searchable !== false,
+    publicPage: pr?.public_page === true,
   });
   const [draft, setDraft] = useState(start);
   const [as, setAs] = useState('none');
@@ -8410,7 +9933,10 @@ function ProfileSettings({ account }) {
       await account.updateProfile({
         pronouns: draft.pronouns, bio: draft.bio, location: draft.location, phone: draft.phone,
         contactEmail: draft.contact_email, website: site, socials, visibility: draft.visibility, searchable: draft.searchable,
+        // Only once the server has pages (schema part 5).
+        ...('public_page' in pr ? { publicPage: draft.publicPage } : {}),
       });
+      track('profile.save', { public_page: draft.publicPage, trips: draft.visibility.trips, searchable: draft.searchable });
       setDraft({ ...draft, website: site, socials });
       setSaid('Your profile is saved.');
     } catch (err) {
@@ -8420,14 +9946,51 @@ function ProfileSettings({ account }) {
     }
   };
   const preview = seenAs({ ...pr, ...draft }, as);
+  const pages = 'public_page' in pr;
+  const myPage = pageUrl(profilePath(pr.username));
 
   return (
     <div>
       <div style={settingsCard()}>
+        <p style={settingsHead}>Your page</p>
+        {!pages ? (
+          <p style={{ margin: 0, fontSize: 13, color: C.soonText, lineHeight: 1.5 }}>
+            Pages are not switched on yet. Run the updated setup script in Supabase, then come back.
+          </p>
+        ) : (
+          <>
+            <p style={{ margin: '0 0 10px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+              Everything you share, in one place: the concerts, games and shows you set to Everyone or Friends, and your trips if you show them.
+            </p>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
+              <a href={profilePath(pr.username)} style={{ fontSize: 13.5, fontWeight: 600, color: C.ink, wordBreak: 'break-all' }}>{myPage.replace(/^https?:\/\//, '')}</a>
+              <Button style={{ fontSize: 12.5, padding: '5px 10px' }} onClick={async () => {
+                try { await navigator.clipboard.writeText(myPage); setSaid('Your page’s link is copied.'); } catch { setSaid(myPage); }
+              }}>Copy link</Button>
+            </div>
+            <div style={{ padding: '10px 0', borderTop: `1px solid ${C.line}` }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span style={{ flex: 1, fontSize: 13.5, fontWeight: 600, color: C.ink }}>Trips you have taken</span>
+                <VisibilityPick label="Trips" value={draft.visibility.trips} onChange={(v) => setVis('trips', v)} />
+              </div>
+              <span style={hintStyle()}>
+                Their titles, dates, ratings, highlights and places, to about a kilometre. Never who went, notes, photos, or trips still to come.
+              </span>
+            </div>
+            <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
+              <Check on={draft.publicPage} onChange={(v) => set('publicPage', v)} label="Anyone with the link can see it"
+                hint="On: anyone on the web, without an Orbit account, sees what you set to Everyone. Off: only people signed in to Orbit." />
+            </div>
+            <span style={hintStyle()}>Saved with your profile, below.</span>
+          </>
+        )}
+      </div>
+
+      <div style={settingsCard()}>
         <p style={settingsHead}>What people see</p>
         <p style={{ margin: '0 0 12px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
           Your name (<strong style={{ color: C.ink }}>{pr.display_name}</strong>) and username (<strong style={{ color: C.ink }}>@{pr.username}</strong>)
-          are always visible, so people can find you. Choose who sees everything else. The email you sign in with is never shown.
+          are always visible, so people can find you. Choose who sees everything else. Everyone means everyone signed in to Orbit, and anyone on the web too if your page is open to anyone. The email you sign in with is never shown.
         </p>
         {PROFILE_FIELDS.map((f) => (
           <div key={f.key} style={{ padding: '10px 0', borderTop: `1px solid ${C.line}` }}>
@@ -8716,7 +10279,7 @@ function FriendsView({ account, startWith, onStarted, onSaveToPeople, onCount, o
 
 /* ---------- settings: preferences ---------- */
 const START_KEY = 'crm-start-v1';
-const START_VIEWS = [['list', 'People'], ['events', 'Events'], ['reminders', 'Reminders'], ['collections', 'Lists'], ['trips', 'Trips'], ['recap', 'Recap']];
+const START_VIEWS = [['list', 'People'], ['feed', 'Feed'], ['events', 'Events'], ['reminders', 'Reminders'], ['collections', 'Lists'], ['trips', 'Trips'], ['recap', 'Recap']];
 const hourLabel = (h) => `${h % 12 === 0 ? 12 : h % 12}${h < 12 ? 'am' : 'pm'}`;
 const HOURS = Array.from({ length: 24 }, (_, h) => [h, hourLabel(h)]);
 const BIRTHDAY_LEADS = [[0, 'On the day'], [1, 'The day before'], [3, '3 days before'], [7, 'A week before'], [14, 'Two weeks before']];
@@ -8727,6 +10290,34 @@ const PUSH_WHY = {
   install: 'On iPhone and iPad, add Orbit to your Home Screen first: tap Share, then Add to Home Screen, and open Orbit from there.',
   denied: 'Notifications are blocked for Orbit in this browser. Allow them in the browser’s site settings, then come back.',
 };
+
+// Whether this person shares which parts of Orbit they use (usage.js). Only
+// with an account whose server counts usage (schema part 8).
+function UsageChoice({ account }) {
+  const pr = account?.profile;
+  const [on, setOn] = useState(pr?.share_usage !== false);
+  const [said, setSaid] = useState('');
+  if (!pr || !('share_usage' in pr)) return null;
+  const change = async (v) => {
+    setOn(v);
+    setSaid('');
+    try {
+      await account.updateProfile({ shareUsage: v });
+      setSaid(v ? 'Thanks. That helps decide what to build.' : 'Nothing more is counted from you.');
+    } catch (err) {
+      setOn(!v);
+      setSaid(err?.message || 'That did not save.');
+    }
+  };
+  return (
+    <div style={settingsCard()}>
+      <p style={settingsHead}>Usage counts</p>
+      <Check on={on} onChange={change} label="Share which parts of Orbit I use"
+        hint="Counts of what you do, like “added an event” or “opened the feed”, so what gets built next follows what people use. Never what you write: no names, titles, notes or places." />
+      {said && <p aria-live="polite" style={{ margin: 0, fontSize: 13, color: C.muted }}>{said}</p>}
+    </div>
+  );
+}
 
 function PreferencesSettings({ account, theme, onTheme, start, onStart }) {
   const api = account?.notifications;
@@ -8774,7 +10365,7 @@ function PreferencesSettings({ account, theme, onTheme, start, onStart }) {
       </Group>
       <Field label="Open Orbit on">
         <select className="crm-select" value={start} onChange={(e) => onStart(e.target.value)} style={{ ...inputStyle, minHeight: 38, fontSize: 14 }}>
-          {START_VIEWS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          {START_VIEWS.filter(([v]) => v !== 'feed' || account?.profile).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
         </select>
       </Field>
     </div>
@@ -8937,6 +10528,7 @@ function SettingsView({ account, theme, onTheme, start, onStart, onBackup, onClo
       {account && tab === 'account' && <AccountSettings account={account} />}
       {account && tab === 'profile' && <ProfileSettings account={account} />}
       {(!account || tab === 'prefs') && <PreferencesSettings account={account} theme={theme} onTheme={onTheme} start={start} onStart={onStart} />}
+      {account && tab === 'prefs' && <UsageChoice account={account} />}
       {(!account || tab === 'prefs') && <StorageSettings onBackup={onBackup} />}
     </div>
   );
@@ -9003,6 +10595,7 @@ function ExportView({ people, events, reminders, collections, onClose }) {
     const stamp = todayStr();
     let saved = 0;
     parts.forEach(([name, csv]) => { if (downloadCsv(`orbit-${name}-${stamp}.csv`, csv)) saved += 1; });
+    track('data.export', { files: parts.length });
     setPreview(parts.map(([name, csv]) => `### ${name}\n${csv}`).join('\n\n'));
     setNote(saved === parts.length
       ? `Downloaded ${saved} file${saved === 1 ? '' : 's'}. The text is below too, in case the download was blocked.`
@@ -9175,6 +10768,7 @@ function ImportView({ people, events, reminders, collections, onPeople, onEvents
 
   const commit = () => {
     if (!found) return;
+    track('data.import', { kind: found.kind, rows: found.rows.length, mode });
     if (found.kind === 'people') {
       onPeople(mode === 'replace' ? found.rows : [...people, ...found.rows]);
     } else if (found.kind === 'reminders') {
@@ -9293,6 +10887,12 @@ export default function PersonalCRM({ account = null } = {}) {
   // Where Orbit opens, as chosen in Settings.
   const [startView, setStartView] = useState('list');
   const [events, setEvents] = useState([]);
+  // Whether the saved events were read. Until they are, nothing is shared
+  // from them: an events list that failed to load is not an empty one.
+  const eventsRead = useRef(false);
+  const tripsLoaded = useRef(false);
+  // Explore: the catalog entries opened, in order, so Back goes to the last.
+  const [explore, setExplore] = useState([]);
   const [eventDraft, setEventDraft] = useState(null);
   const [reminders, setReminders] = useState([]);
   const [reminderDraft, setReminderDraft] = useState(null);
@@ -9362,6 +10962,8 @@ export default function PersonalCRM({ account = null } = {}) {
       const load = async (key, cleanList, byIdentity, apply) => {
         try {
           const r = await window.storage.get(key);
+          if (key === EVENTS_KEY) eventsRead.current = true;
+          if (key === TRIPS_KEY) tripsLoaded.current = true;
           if (!r?.value) return;
           const { list, damaged } = readSaved(r.value, cleanList, byIdentity);
           if (damaged) {
@@ -9496,6 +11098,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const persist = async (next) => {
+    trackChanges('people', people, next);
     setPeople(next);
     if (holdBack(STORE_KEY)) return false;
     try {
@@ -9546,6 +11149,108 @@ export default function PersonalCRM({ account = null } = {}) {
       return rest;
     }));
   };
+
+  // Outings shared to the catalog follow the events. The whole set goes each
+  // time it changes (the server replaces what it had), and a fingerprint of
+  // the last set sent is kept on this device so an unchanged set is not sent
+  // again. A failure is quiet: the next change, or the next visit, tries again.
+  const catalogOn = Boolean(account?.catalog && account.profile);
+  const sharedOutings = useMemo(() => JSON.stringify(outingsToShare(events, OUTING_KINDS, todayStr())), [events]);
+  useEffect(() => {
+    if (!catalogOn || loading || !eventsRead.current) return undefined;
+    const key = `orbit-outings-sent:${account.profile.id}`;
+    const print = fingerprint(sharedOutings);
+    let last = null;
+    try { last = localStorage.getItem(key); } catch { /* sent again, harmlessly */ }
+    if (last === print) return undefined;
+    const t = setTimeout(() => {
+      account.catalog.sync(JSON.parse(sharedOutings)).then(() => {
+        try { localStorage.setItem(key, print); } catch { /* sent again next time */ }
+      }, () => {});
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [catalogOn, loading, sharedOutings, account]);
+
+  // Trips shown on your page follow the trips in the same way, once you have
+  // chosen to show them (Settings → Profile). While they are kept to you, an
+  // empty set goes, once, so no copy is left behind. Countries and states are
+  // worked out here, so the outlines load only when trips are shown.
+  const tripsShown = account?.profile?.visibility?.trips || 'me';
+  const showingTrips = catalogOn && tripsShown !== 'me' && 'public_page' in (account?.profile || {});
+  const { where: tripWhere } = useGeo(showingTrips && trips.length > 0);
+  const sharedTrips = useMemo(() => {
+    if (!showingTrips) return '[]';
+    if (trips.length && !tripWhere) return null;
+    return JSON.stringify(tripsToShare(trips, tripWhere, todayStr()));
+  }, [showingTrips, trips, tripWhere]);
+  useEffect(() => {
+    if (!catalogOn || !('public_page' in account.profile) || loading || !tripsLoaded.current || sharedTrips === null) return undefined;
+    const key = `orbit-trips-sent:${account.profile.id}`;
+    const print = fingerprint(`${tripsShown}|${sharedTrips}`);
+    let last = null;
+    try { last = localStorage.getItem(key); } catch { /* sent again, harmlessly */ }
+    if (last === print) return undefined;
+    const t = setTimeout(() => {
+      account.catalog.syncTrips(JSON.parse(sharedTrips)).then(() => {
+        try { localStorage.setItem(key, print); } catch { /* sent again next time */ }
+      }, () => {});
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [catalogOn, loading, sharedTrips, tripsShown, account]);
+
+  // The feed: whether friends have shared anything since you last looked.
+  // The newest item's time is read when Orbit opens, and the time of the
+  // newest you have seen is kept on this device.
+  const [feedNewest, setFeedNewest] = useState(null);
+  const [feedSeen, setFeedSeen] = useState(() => {
+    try { return account?.profile ? localStorage.getItem(`orbit-feed-seen:${account.profile.id}`) : null; } catch { return null; }
+  });
+  useEffect(() => {
+    if (!catalogOn) return undefined;
+    let live = true;
+    account.catalog.feed(null, 1).then((rows) => { if (live && rows[0]) setFeedNewest(rows[0].at); }, () => {});
+    return () => { live = false; };
+  }, [catalogOn, account]);
+  const feedFresh = Boolean(feedNewest && (!feedSeen || feedNewest > feedSeen));
+  const sawFeed = useCallback((at) => {
+    if (!at || !account?.profile) return;
+    setFeedNewest((n) => (n && n > at ? n : at));
+    setFeedSeen((was) => {
+      const next = was && was > at ? was : at;
+      try { localStorage.setItem(`orbit-feed-seen:${account.profile.id}`, next); } catch { /* the dot shows again next time */ }
+      return next;
+    });
+  }, [account]);
+  // A start view of Feed, where there is no feed (signed out, no username).
+  useEffect(() => {
+    if (!loading && view === 'feed' && !catalogOn) setView('list');
+  }, [loading, view, catalogOn]);
+
+  // Usage: whether this person shares it, when Orbit opens (with how much is
+  // in it, as numbers), and each tab opened.
+  const shareUsage = account?.profile?.share_usage !== false;
+  useEffect(() => { usageShare(shareUsage); }, [shareUsage]);
+  const opened = useRef(false);
+  useEffect(() => {
+    if (loading || opened.current) return;
+    opened.current = true;
+    track('app.open', {
+      ...deviceKind(), signed_in: Boolean(account), view,
+      people: people.length, events: events.length, reminders: reminders.length, lists: collections.length, trips: trips.length,
+    });
+  }, [loading, account, view, people.length, events.length, reminders.length, collections.length, trips.length]);
+  useEffect(() => {
+    if (!loading) track('view.open', { view });
+  }, [loading, view]);
+
+  // Whether this person is on Orbit's team and may see the usage report.
+  const [usageAdmin, setUsageAdmin] = useState(false);
+  useEffect(() => {
+    if (!account?.usage || !account.profile) return undefined;
+    let live = true;
+    account.usage.isAdmin().then((yes) => { if (live) setUsageAdmin(yes); }, () => {});
+    return () => { live = false; };
+  }, [account]);
 
   // How many friend requests wait, read once when Orbit opens.
   useEffect(() => {
@@ -9602,6 +11307,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const persistEvents = async (next) => {
+    trackChanges('events', events, next);
     setEvents(next);
     if (holdBack(EVENTS_KEY)) return false;
     try {
@@ -9621,6 +11327,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const persistReminders = async (next) => {
+    trackChanges('reminders', reminders, next);
     setReminders(next);
     if (holdBack(REMINDERS_KEY)) return false;
     try {
@@ -9646,6 +11353,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const persistCollections = async (next) => {
+    trackChanges('lists', collections, next);
     setCollections(next);
     if (holdBack(COLLECTIONS_KEY)) return false;
     try {
@@ -9690,6 +11398,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const persistTrips = async (next) => {
+    trackChanges('trips', trips, next);
     setTrips(next);
     if (holdBack(TRIPS_KEY)) return false;
     try {
@@ -9777,6 +11486,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const backedUp = () => {
+    track('data.backup', {});
     const today = todayStr();
     setLastBackup(today);
     dismissTripNotice();
@@ -9787,6 +11497,7 @@ export default function PersonalCRM({ account = null } = {}) {
   // matched by id (see mergeById), and photos are added only when missing.
   // Photos go in before the trips that point at them.
   const restoreFile = async (file) => {
+    track('data.restore', {});
     const { parts, photos } = await readBackupFile(file);
     const P = mergeById(people, parts.people);
     const E = mergeById(events, parts.events);
@@ -9896,12 +11607,14 @@ export default function PersonalCRM({ account = null } = {}) {
   const totalCount = (circle) => ofCircle(circle).length;
 
   const pickTheme = async (name) => {
+    track('settings.theme', { theme: name });
     applyTheme(name);
     setTheme(name);
     try { await window.storage.set(THEME_KEY, name); } catch { /* not fatal */ }
   };
 
   const pickStart = async (v) => {
+    track('settings.start', { view: v });
     setStartView(v);
     try { await window.storage.set(START_KEY, v); } catch { /* not fatal */ }
   };
@@ -10043,146 +11756,12 @@ export default function PersonalCRM({ account = null } = {}) {
 
   return (
     <div style={{ background: C.ground, backgroundImage: C.sky, minHeight: '100%', color: C.ink, fontFamily: "'Bricolage Grotesque', 'Segoe UI', system-ui, sans-serif" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600&family=Source+Serif+4:opsz,wght@8..60,400&display=swap');
-        .crm-serif { font-family: 'Source Serif 4', Georgia, serif; }
-        .crm-btn:hover { filter: brightness(0.94); }
-        .crm-row:hover { background: ${C.rowHover}; }
-        .crm-btn:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible {
-          outline: 2px solid ${C.ink}; outline-offset: 2px;
-        }
-        input, select, textarea { font-family: inherit; }
-        .crm-full { grid-column: 1 / -1; }
-        
-        /* Narrow: one column. The panel replaces the list rather than pushing it. */
-        .crm-shell { max-width: 460px; margin: 0 auto; padding: 22px 16px 60px; }
-        .crm-main.is-hidden { display: none; }
-        .crm-detail { display: none; }
-        .crm-detail.is-open { display: block; }
-        .crm-idle { display: none; }
-        .crm-tpl-wide { display: none; }
-
-        /* Wide: list and detail side by side, detail pinned while the list scrolls. */
-        @media (min-width: 880px) {
-          .crm-shell {
-            max-width: 1000px;
-            display: grid;
-            grid-template-columns: minmax(0, 1fr) 384px;
-            column-gap: 30px;
-            align-items: start;
-          }
-          .crm-head { grid-column: 1 / -1; }
-          .crm-main.is-hidden { display: block; }
-          .crm-detail { display: block; position: sticky; top: 20px; }
-          .crm-back { display: none; }
-          .crm-idle { display: block; }
-          .crm-tpl-wide { display: block; }
-          .crm-tpl-pick { display: none; }
-        }
-        .crm-person:last-child, .crm-entry:last-child { border-bottom: none !important; }
-        /* A list can hold thousands of entries. Rows off screen are skipped
-           until scrolled to, which is most of what a keystroke costs on a long
-           list. Still found by find-in-page and screen readers. */
-        .crm-entry { content-visibility: auto; contain-intrinsic-size: auto 62px; }
-        /* The same for people, who can run to hundreds. What every person
-           row shares is here too, rather than inline (see PersonRow). */
-        .crm-person {
-          content-visibility: auto; contain-intrinsic-size: auto 65px;
-          display: flex; border-bottom: 1px solid ${C.line};
-        }
-        .crm-person-bar { width: 4px; flex-shrink: 0; }
-        .crm-person-body, .crm-person-main { flex: 1; min-width: 0; }
-        .crm-person .crm-row { padding: 14px 15px; cursor: pointer; display: flex; align-items: baseline; gap: 10px; }
-        .crm-person-top { display: flex; align-items: baseline; gap: 7px; }
-        .crm-person-name {
-          font-size: 17px; font-weight: 600; letter-spacing: -0.02em; color: ${C.ink};
-          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-        }
-        .crm-person-age { font-size: 13px; color: ${C.faint}; flex-shrink: 0; }
-        .crm-person-sub { font-size: 13px; color: ${C.muted}; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .crm-person-when { text-align: right; flex-shrink: 0; max-width: 116px; white-space: nowrap; }
-        .crm-person-status { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
-        .crm-person-cadence { font-size: 12px; color: ${C.faint}; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
-        .crm-person-act {
-          flex-shrink: 0; cursor: pointer; background: transparent;
-          border: none; border-left: 1px solid ${C.line};
-          display: flex; align-items: center; justify-content: center;
-        }
-        /* That also clips painting to each row, which would cut off a focus
-           ring drawn outside a button that fills the row, so rings go inside. */
-        .crm-entry .crm-btn:focus-visible, .crm-entry a:focus-visible,
-        .crm-person .crm-btn:focus-visible { outline-offset: -3px; }
-        /* Important, because every select also takes the shared input style
-           inline, whose background and padding would otherwise paint over
-           the arrow and run the text underneath it. */
-        .crm-select {
-          appearance: none; -webkit-appearance: none;
-          background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.5 4.5 L6 8 L9.5 4.5' fill='none' stroke='${encodeURIComponent(C.muted)}' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>") !important;
-          background-repeat: no-repeat !important; background-position: right 11px center !important; background-size: 12px !important;
-          padding-right: 32px !important;
-        }
-        /* Hidden from sight, still there for keyboards and screen readers. */
-        .crm-sr {
-          position: absolute !important; width: 1px; height: 1px; margin: -1px; padding: 0;
-          overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
-        }
-        .crm-star input:focus-visible + span, .crm-file:focus-within {
-          outline: 2px solid ${C.ink}; outline-offset: 2px; border-radius: 6px;
-        }
-        .crm-clamp { -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-        /* Maps. Tiles, popups and controls all follow the theme. */
-        /* Close to the tiles' own sea, so any gap around the world reads as ocean. */
-        .orbit-map { font-family: inherit; background: ${C.dark ? '#1B1D20' : '#D6DCDE'}; }
-        .orbit-map .leaflet-bar { border: 1px solid ${C.line}; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.12); overflow: hidden; }
-        .orbit-map .leaflet-bar a {
-          width: 34px; height: 34px; line-height: 32px; font-size: 18px; font-weight: 500;
-          background: ${C.surface}; color: ${C.ink}; border-bottom: 1px solid ${C.line};
-        }
-        .orbit-map .leaflet-bar a:last-child { border-bottom: none; }
-        .orbit-map .leaflet-bar a:hover, .orbit-map .leaflet-bar a:focus-visible { background: ${C.rowHover}; color: ${C.ink}; }
-        .orbit-map .leaflet-bar a.leaflet-disabled { background: ${C.surface}; color: ${C.faint}; opacity: 0.5; }
-        .orbit-map .leaflet-control-attribution {
-          background: ${C.surface}cc; color: ${C.muted}; font-size: 10.5px; border-top-left-radius: 6px; padding: 1px 6px;
-        }
-        .orbit-map .leaflet-control-attribution a { color: ${C.muted}; }
-        .orbit-map .leaflet-popup-content-wrapper, .orbit-map .leaflet-popup-tip {
-          background: ${C.surface}; color: ${C.ink}; box-shadow: 0 6px 22px rgba(0,0,0,0.28);
-        }
-        .orbit-map .leaflet-popup-content { margin: 12px 14px; font-size: 13px; line-height: 1.4; }
-        .orbit-map a.leaflet-popup-close-button { color: ${C.muted}; }
-        .orbit-pin, .orbit-cluster { background: none; border: none; }
-        .orbit-pin span, .orbit-cluster span {
-          display: flex; align-items: center; justify-content: center; box-sizing: border-box;
-          border-radius: 50%; color: #fff; font-weight: 700; font-family: system-ui, sans-serif;
-        }
-        .orbit-pin span { width: 28px; height: 28px; font-size: 13px; border: 2px solid #fff; box-shadow: 0 1px 5px rgba(0,0,0,0.45); }
-        /* Trips to come: the colour moves from the fill to a thick ring. */
-        .orbit-pin-planned span, .orbit-pin-someday span {
-          background: #fff !important; box-shadow: 0 0 0 2px #fff, 0 1px 5px rgba(0,0,0,0.45);
-        }
-        .orbit-pin-planned span { border: 4px solid ${PLAN_COLORS.planned}; }
-        .orbit-pin-someday span { border: 3px dashed ${PLAN_COLORS.someday}; }
-        .orbit-cluster span {
-          width: 38px; height: 38px; font-size: 13px; background: #15211B;
-          border: 3px solid #72DE88; box-shadow: 0 1px 6px rgba(0,0,0,0.4);
-        }
-        .orbit-pin:focus-visible, .orbit-cluster:focus-visible { outline: none; }
-        .orbit-pin:focus-visible span, .orbit-cluster:focus-visible span { outline: 3px solid #15211B; outline-offset: 2px; }
-        .crm-open { animation: crmIn .16s ease-out; }
-        @keyframes crmIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
-        @media (prefers-reduced-motion: reduce) { .crm-open { animation: none; } }
-      `}</style>
+      <AppStyles />
 
       <div className="crm-shell">
         <div className="crm-head">
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 18 }}>
-          <svg width="19" height="19" viewBox="0 0 19 19" style={{ flexShrink: 0, overflow: 'visible' }}>
-            <ellipse cx="9.5" cy="9.5" rx="9" ry="4.4" fill="none"
-              stroke={C.accent} strokeWidth="1.1" opacity="0.65"
-              transform="rotate(-28 9.5 9.5)" />
-            <circle cx="9.5" cy="9.5" r="3.1" fill={C.accent} />
-            <circle cx="17.2" cy="5.7" r="1.7" fill={C.accent} />
-          </svg>
+          <OrbitMark />
           {namingOwner ? (
             <input
               autoFocus
@@ -10208,9 +11787,10 @@ export default function PersonalCRM({ account = null } = {}) {
           )}
           {!loading && (
             <div style={{ display: 'flex', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
-              {[['list', 'People'], ['events', 'Events'], ['reminders', 'Reminders'],
+              {[['list', 'People'], ...(catalogOn ? [['feed', 'Feed']] : []), ['events', 'Events'], ['reminders', 'Reminders'],
                 ['collections', 'Lists'], ['trips', 'Trips'], ['recap', 'Recap']].map(([v, l]) => {
                 const on = view === v;
+                const fresh = v === 'feed' && feedFresh && !on;
                 return (
                   <button
                     key={v}
@@ -10225,9 +11805,14 @@ export default function PersonalCRM({ account = null } = {}) {
                       color: on ? C.onAccent : C.muted,
                       background: on ? C.accent : 'transparent',
                       border: `1px solid ${on ? C.accent : C.line}`,
-                      padding: '5px 11px', borderRadius: 20,
+                      padding: '5px 11px', borderRadius: 20, position: 'relative',
                     }}
-                  >{l}</button>
+                    aria-label={fresh ? `${l}, new from friends` : undefined}
+                  >{l}{fresh && (
+                    <span aria-hidden="true" style={{
+                      position: 'absolute', top: -2, right: -2, width: 8, height: 8, borderRadius: 8, background: C.overdueBar,
+                    }} />
+                  )}</button>
                 );
               })}
 
@@ -10268,7 +11853,7 @@ export default function PersonalCRM({ account = null } = {}) {
                       boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
                     }}
                   >
-                    {[...(friendsOn ? [['friends', friendCount ? `Friends (${friendCount})` : 'Friends']] : []), ['settings', 'Settings'], ['import', 'Import'], ['export', 'Export'], ['backup', 'Backup file']].map(([v, l], i) => (
+                    {[...(friendsOn ? [['friends', friendCount ? `Friends (${friendCount})` : 'Friends']] : []), ['settings', 'Settings'], ['import', 'Import'], ['export', 'Export'], ['backup', 'Backup file'], ...(usageAdmin ? [['usage', 'Usage']] : [])].map(([v, l], i) => (
                       <button
                         key={v}
                         className="crm-btn"
@@ -10290,6 +11875,11 @@ export default function PersonalCRM({ account = null } = {}) {
                           margin: 0, padding: '9px 13px 0', fontSize: 12, color: C.muted,
                           maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                         }} title={account.email}>{account.profile ? `@${account.profile.username}` : account.email || 'Signed in'}</p>
+                        {account.profile && (
+                          <a href={profilePath(account.profile.username)} onClick={() => setMenuOpen(false)} style={{
+                            display: 'block', padding: '4px 13px 0', fontSize: 13.5, fontWeight: 600, color: C.ink, textDecoration: 'none',
+                          }}>Your page</a>
+                        )}
                         <button
                           className="crm-btn"
                           onClick={() => { setMenuOpen(false); account.signOut(); }}
@@ -10403,6 +11993,7 @@ export default function PersonalCRM({ account = null } = {}) {
               <EventForm
                 initial={eventDraft.id ? eventDraft : null}
                 people={people}
+                catalog={catalogOn ? account.catalog : null}
                 onSave={saveEvent}
                 onCancel={() => setEventDraft(null)}
               />
@@ -10413,8 +12004,32 @@ export default function PersonalCRM({ account = null } = {}) {
                 onAdd={() => setEventDraft({})}
                 onEdit={(e) => setEventDraft(e)}
                 onRemove={(id) => persistEvents(events.filter((x) => x.id !== id))}
+                onCatalog={catalogOn ? (id) => { setExplore([id]); setView('explore'); } : null}
+                onExplore={catalogOn ? () => { setExplore([]); setView('explore'); } : null}
               />
             )}
+          </div>
+        )}
+
+        {view === 'usage' && usageAdmin && (
+          <div className="crm-full">
+            <UsageView api={account.usage} />
+          </div>
+        )}
+
+        {view === 'feed' && catalogOn && (
+          <div className="crm-full">
+            <FeedView api={account.catalog} onSeen={sawFeed}
+              onCatalog={(id) => { setExplore([id]); setView('explore'); }}
+              onFriends={friendsOn ? () => setView('friends') : null} />
+          </div>
+        )}
+
+        {view === 'explore' && catalogOn && (
+          <div className="crm-full">
+            <ExploreView api={account.catalog} trail={explore}
+              onOpen={(id) => setExplore([...explore, id])}
+              onBack={() => (explore.length ? setExplore(explore.slice(0, -1)) : setView('events'))} />
           </div>
         )}
 
@@ -10637,6 +12252,10 @@ export default function PersonalCRM({ account = null } = {}) {
             <Recap people={people} year={year} years={years} onYear={setYear}
               trips={trips}
               onTrip={(id) => { setView('trips'); openTripById(id); }}
+              events={events}
+              onEvent={(e) => { setView('events'); setEventDraft(e); }}
+              owner={owner}
+              pageFor={account?.profile ? (y) => pageUrl(profilePath(account.profile.username, y)) : null}
               eventCount={events.filter((e) => Number(e.date.slice(0, 4)) === year).length}
               reminderCount={reminders.reduce((n, r) => n + (r.history || [])
                 .filter((h) => h?.date && Number(h.date.slice(0, 4)) === year).length, 0)}

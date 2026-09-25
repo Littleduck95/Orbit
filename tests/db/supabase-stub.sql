@@ -4,6 +4,8 @@
 -- way Supabase's does.
 create role anon nologin;
 create role authenticated nologin;
+-- The role Supabase's own functions use (the catalog service calls with it).
+create role service_role nologin;
 create schema auth;
 create table auth.users (
   id uuid primary key default gen_random_uuid(),

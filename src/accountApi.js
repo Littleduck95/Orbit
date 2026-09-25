@@ -5,6 +5,7 @@
  * The rules are checked here, as the person types, and again by the
  * database, so a hand-made request cannot get round them.
  */
+import { track } from './usage.js';
 
 export const MIN_AGE = 13;
 export const MIN_PASSWORD = 8;
@@ -137,7 +138,7 @@ export async function updateProfile(client, userId, changes) {
   if ('birthday' in changes) row.birthday = changes.birthday;
   for (const [from, to] of [['pronouns', 'pronouns'], ['bio', 'bio'], ['location', 'location'], ['phone', 'phone'],
     ['contactEmail', 'contact_email'], ['website', 'website'], ['socials', 'socials'], ['visibility', 'visibility'],
-    ['searchable', 'searchable']]) {
+    ['searchable', 'searchable'], ['publicPage', 'public_page'], ['shareUsage', 'share_usage']]) {
     if (from in changes) row[to] = typeof changes[from] === 'string' ? changes[from].trim() : changes[from];
   }
   const { data, error } = await client.from('profiles').update(row).eq('id', userId).select(PROFILE_COLS);
@@ -232,14 +233,86 @@ const rpc = async (client, fn, args) => {
   return data;
 };
 
+// Each call that changes something is also counted (see usage.js).
+const counted = (name, props, promise) => promise.then((v) => { track(name, props); return v; });
+
 export const friendsApi = (client) => ({
   search: async (q) => (await rpc(client, 'search_profiles', { q })) || [],
   get: (username) => rpc(client, 'get_profile', { uname: username }),
   list: async () => (await rpc(client, 'my_friends')) || [],
-  send: (id) => rpc(client, 'send_friend_request', { target: id }),
-  respond: (id, accept) => rpc(client, 'respond_friend_request', { other: id, accept }),
-  remove: (id) => rpc(client, 'remove_friend', { other: id }),
-  block: (id) => rpc(client, 'block_user', { other: id }),
+  send: (id) => counted('friends.request', {}, rpc(client, 'send_friend_request', { target: id })),
+  respond: (id, accept) => counted(accept ? 'friends.accept' : 'friends.decline', {}, rpc(client, 'respond_friend_request', { other: id, accept })),
+  remove: (id) => counted('friends.remove', {}, rpc(client, 'remove_friend', { other: id })),
+  block: (id) => counted('friends.block', {}, rpc(client, 'block_user', { other: id })),
   unblock: (id) => rpc(client, 'unblock_user', { other: id }),
   blocks: async () => (await rpc(client, 'my_blocks')) || [],
+});
+
+/* ---------- the shared catalog ---------- */
+
+const catalogRpc = async (client, fn, args) => {
+  const { data, error } = await client.rpc(fn, args);
+  if (error) throw new Error(/could not find the function|PGRST202/i.test(error.message || '') ? 'The catalog is not set up on the server yet.' : authMessage(error));
+  return data;
+};
+
+// Likes and comments on a post ({ owner, post, ref }: whose, 'outing' or
+// 'trip', and which), schema part 7. Signed in only.
+const postApi = (client) => ({
+  like: (p, on) => catalogRpc(client, 'like_post', { p_owner: p.owner, p_kind: p.post, p_ref: p.ref, p_on: on }),
+  comment: (p, body) => catalogRpc(client, 'comment_post', { p_owner: p.owner, p_kind: p.post, p_ref: p.ref, p_body: body }),
+  uncomment: (id) => catalogRpc(client, 'delete_comment', { p_id: id }),
+  thread: (p) => catalogRpc(client, 'post_thread', { p_owner: p.owner, p_kind: p.post, p_ref: p.ref }),
+});
+
+// See supabase/schema.sql, part 4. entry: { kind, name, about, source,
+// source_id } as Wikidata or the form gives it.
+export const catalogApi = (client) => ({
+  ...postApi(client),
+  search: async (q, kind = null) => (await catalogRpc(client, 'catalog_search', { q, p_kind: kind })) || [],
+  // Made in Orbit: straight to the database. From Wikidata: through the
+  // catalog service, which names it as Wikidata does, whatever this sends
+  // (supabase/functions/catalog).
+  add: async (entry) => {
+    if (entry.source !== 'wikidata') {
+      return catalogRpc(client, 'catalog_add', {
+        p_kind: entry.kind, p_name: entry.name, p_about: entry.about || '', p_source: entry.source, p_source_id: entry.source_id || null,
+      });
+    }
+    const lang = ((typeof navigator !== 'undefined' && navigator.language) || 'en').split('-')[0].toLowerCase();
+    const { data, error } = await client.functions.invoke('catalog', { body: { kind: entry.kind, id: entry.source_id, lang } });
+    if (!error) return data;
+    const res = error.context;
+    const said = res && typeof res.json === 'function' ? await res.json().catch(() => null) : null;
+    if (said?.error) throw new Error(said.error);
+    throw new Error(res?.status === 404
+      ? 'Linking from Wikidata is not set up on the server yet. Add it yourself instead.'
+      : 'Wikidata could not be reached. Try again, or add it yourself.');
+  },
+  page: (id) => catalogRpc(client, 'catalog_page', { p_id: id }),
+  sync: (items) => catalogRpc(client, 'sync_outings', { items }),
+  syncTrips: (items) => catalogRpc(client, 'sync_trips', { items }),
+  // Friends' outings and trips, newest first (friend_feed, schema part 6).
+  // after: the last item of the page before, to carry on from it.
+  feed: async (after = null, lim = 30) => (await catalogRpc(client, 'friend_feed', {
+    p_before_at: after?.at || null, p_before_id: after?.id || null, lim,
+  })) || [],
+});
+
+// What anyone, signed in or not, can ask for: a person's page (see
+// public_profile in the schema, part 5) and a catalog entry's.
+export const publicApi = (client) => ({
+  ...postApi(client),
+  profile: (username, year = null) => catalogRpc(client, 'public_profile', { uname: username, p_year: year }),
+  page: (id) => catalogRpc(client, 'catalog_page', { p_id: id }),
+});
+
+// Usage counts for Orbit's team (schema part 8): whether this person may see
+// the report, and the report for the last so many days.
+export const usageApi = (client) => ({
+  isAdmin: async () => {
+    const { data, error } = await client.rpc('is_usage_admin');
+    return !error && data === true;
+  },
+  report: (days) => catalogRpc(client, 'usage_report', { p_days: days }),
 });

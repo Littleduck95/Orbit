@@ -34,6 +34,33 @@ from (values
   (17, 'Part 3: devices with push on',         to_regclass('public.push_subscriptions') is not null
                                                 and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.push_subscriptions')), false)),
   (18, 'Part 3: what has been sent',           to_regclass('public.notification_log') is not null
-                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.notification_log')), false))
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.notification_log')), false)),
+  (19, 'Part 4: the shared catalog',           to_regclass('public.catalog') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.catalog')), false)),
+  (20, 'Part 4: shared ratings and thoughts',  to_regclass('public.outings') is not null and to_regclass('public.outing_links') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.outings')), false)
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.outing_links')), false)),
+  (21, 'Part 4: search, pages and sharing',    to_regprocedure('public.catalog_add(text, text, text, text, text)') is not null
+                                                and to_regprocedure('public.catalog_search(text, text)') is not null
+                                                and to_regprocedure('public.catalog_page(uuid)') is not null
+                                                and to_regprocedure('public.sync_outings(jsonb)') is not null),
+  (22, 'Part 5: public page setting',          exists (select 1 from information_schema.columns
+                                                  where table_schema = 'public' and table_name = 'profiles' and column_name = 'public_page')),
+  (23, 'Part 5: trips shown on pages',         to_regclass('public.shared_trips') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.shared_trips')), false)
+                                                and to_regprocedure('public.sync_trips(jsonb)') is not null),
+  (24, 'Part 5: public pages',                 case when to_regprocedure('public.public_profile(text, integer)') is null then false
+                                                else has_function_privilege('anon', to_regprocedure('public.public_profile(text, integer)')::oid, 'execute') end),
+  (25, 'Part 6: the friends feed',             to_regprocedure('public.friend_feed(timestamptz, text, integer)') is not null
+                                                and exists (select 1 from information_schema.columns
+                                                  where table_schema = 'public' and table_name = 'outings' and column_name = 'created_at')),
+  (26, 'Part 7: likes and comments',           to_regclass('public.post_likes') is not null and to_regclass('public.post_comments') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.post_comments')), false)
+                                                and to_regprocedure('public.post_thread(uuid, text, text)') is not null),
+  (27, 'Part 8: usage counts',                 to_regclass('public.usage_events') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.usage_events')), false)
+                                                and to_regprocedure('public.track_usage(jsonb, text)') is not null
+                                                and to_regprocedure('public.usage_report(integer)') is not null),
+  (28, 'Part 4: Wikidata items via the service', to_regprocedure('public.catalog_add_wikidata(text, text, text, text, uuid)') is not null)
 ) as t(n, item, ok)
 order by n;

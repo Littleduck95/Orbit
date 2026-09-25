@@ -4,6 +4,8 @@
  * sending is done by the notify function (supabase/functions/notify).
  */
 
+import { track } from './usage.js';
+
 // import.meta.env is Vite's; the tests load this file without it.
 const ENV = import.meta.env || {};
 export const VAPID_PUBLIC_KEY = ENV.VITE_VAPID_PUBLIC_KEY || '';
@@ -15,12 +17,14 @@ export const KINDS = [
   ['checkins', 'Check-ins', 'When it is time to catch up with someone.'],
   ['events', 'Events', 'The day before, and the day of.'],
   ['friend_requests', 'Friend requests', 'When someone asks to be friends, outside quiet hours.'],
+  ['friend_activity', 'Friends’ activity', 'When a friend rates a concert or a game, or shows a trip, outside quiet hours.'],
+  ['likes_comments', 'Likes and comments', 'When someone likes or comments on what you shared, outside quiet hours.'],
 ];
 
 export const DEFAULT_PREFS = {
   push: false, email: false, email_every: 'daily', send_hour: 9, time_zone: 'UTC',
   quiet_start: 22, quiet_end: 7, birthday_days: 1,
-  kinds: { birthdays: true, reminders: true, checkins: true, events: true, friend_requests: true },
+  kinds: { birthdays: true, reminders: true, checkins: true, events: true, friend_requests: true, friend_activity: true, likes_comments: true },
 };
 
 export const deviceTimeZone = () => {
@@ -70,7 +74,9 @@ const must = ({ data, error }) => {
 export const notificationsApi = (client, userId, functionsUrl) => ({
   async load() {
     const rows = must(await client.from('notification_prefs').select('*').eq('user_id', userId).limit(1));
-    return rows?.[0] ? { ...DEFAULT_PREFS, ...rows[0] } : { ...DEFAULT_PREFS, time_zone: deviceTimeZone() };
+    // Kinds added since a setting was saved start on, as they would have.
+    return rows?.[0] ? { ...DEFAULT_PREFS, ...rows[0], kinds: { ...DEFAULT_PREFS.kinds, ...rows[0].kinds } }
+      : { ...DEFAULT_PREFS, time_zone: deviceTimeZone() };
   },
   async save(prefs) {
     const row = {
@@ -81,6 +87,9 @@ export const notificationsApi = (client, userId, functionsUrl) => ({
       kinds: prefs.kinds, birthday_days: Number(prefs.birthday_days),
     };
     must(await client.from('notification_prefs').upsert(row, { onConflict: 'user_id' }));
+    // Which kinds people turn off says which notifications are unwanted.
+    track('notify.save', { push: row.push, email: row.email, every: row.email_every,
+      off: Object.entries(row.kinds || {}).filter(([, v]) => v === false).map(([k]) => k).sort().join(',') });
   },
   // Whether this very device is signed up for push.
   async deviceOn() {
@@ -101,6 +110,7 @@ export const notificationsApi = (client, userId, functionsUrl) => ({
     must(await client.from('push_subscriptions').upsert({
       endpoint: j.endpoint, user_id: userId, p256dh: j.keys.p256dh, auth: j.keys.auth, device: deviceName(),
     }, { onConflict: 'endpoint' }));
+    track('notify.push_on', {});
   },
   async disableDevice() {
     const reg = await navigator.serviceWorker?.getRegistration(BASE);
@@ -108,6 +118,7 @@ export const notificationsApi = (client, userId, functionsUrl) => ({
     if (!sub) return;
     must(await client.from('push_subscriptions').delete().eq('endpoint', sub.endpoint));
     await sub.unsubscribe().catch(() => {});
+    track('notify.push_off', {});
   },
   async devices() {
     return must(await client.from('push_subscriptions').select('endpoint, device, created_at').eq('user_id', userId)) || [];

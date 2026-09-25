@@ -30,7 +30,7 @@ Then open http://localhost:5173.
 | `npm run test:browser` | Drives the real app in Chromium; needs Playwright installed |
 | `npm run test:account` | Drives sign-in in Chromium against a stand-in for Supabase; needs Playwright |
 | `npm run test:db` | Runs `supabase/schema.sql` on a throwaway PostgreSQL and checks its security rules; needs PostgreSQL installed |
-| `npm run test:notify` | Tests the notify function under Deno (fetched by npx), including a real encrypted push |
+| `npm run test:notify` | Tests the notify and catalog functions under Deno (fetched by npx), including a real encrypted push |
 
 The tests are characterization tests: they pin down what the app does today,
 with the clock, timezone and locale fixed so dates are repeatable. Checks whose
@@ -56,6 +56,10 @@ src/Recovery.jsx      shown instead of a blank page if drawing ever fails
 src/PersonalCRM.jsx   the app
 src/photoStore.js     trip photos in IndexedDB, and preparing uploads
 src/TripMap.jsx       the Leaflet maps, loaded only when a map is shown
+src/recapCard.js      draws Recap's share card on a canvas
+src/catalog.js        the shared catalog: Wikidata search, and what of an event or trip is shared
+src/route.js          the public addresses (/u/name, /u/name/year, /c/id) that skip sign-in
+src/usage.js          usage counts: what people do (never what they write), in batches
 src/mapConfig.js      map tiles and place search: one entry each
 src/geo.js            country and US state outlines: which one a stop is in, and shading
 tests/                characterization tests (logic, storage, account, browser)
@@ -182,6 +186,39 @@ four latest years are buttons, and any before that are in an *Earlier* menu.
 When the year turns over while Orbit is open (or on coming back to it),
 Recap moves on to the new year by itself, unless an older one is being
 looked at on purpose.
+
+**The year in events** counts the concerts, games, shows and festivals that
+have happened, names the top-rated event of any kind, lists the outings with
+their stars, and says which are still to come. Tapping one opens it to edit.
+
+### Rated events
+
+Events can be a **Concert**, **Sports** (counted as games), **Theater**
+(counted as shows) or **Festival**, beside the kinds there were before. An
+event you went to can be rated in half stars, as trips are, once its day has
+come: concerts, games, shows, festivals, trips, celebrations and *Other*.
+Milestones, work and losses never are. The rating shows on the timeline, goes
+in and out of the events CSV (a `Rating` column), and carries over when a
+pinned event becomes a trip. Events saved before ratings existed read as they
+did.
+
+### Share your year
+
+**Share your year**, beside the year, makes a picture of it: 1080 × 1350, the
+shape of a phone screen and an Instagram post, in Orbit's night-sky colours
+whatever the theme. It has the year, a world map with the countries been to
+shaded and pins for outings that have a place, up to six numbers (trips,
+countries, concerts, games, days away, and so on), and the top-rated trip and
+event with their stars.
+
+It is drawn on a canvas on the device ([`src/recapCard.js`](src/recapCard.js)),
+so nothing is sent anywhere to make it. What goes on it is only ever counts,
+titles, places and ratings: never who anyone was with, never notes, and nothing
+from People but, when *Catch-ups* is ticked (it starts unticked), how many
+there were. Trips and Events can each be left off, and a name can go in the
+corner. **Share…** opens the device's share sheet with the picture where the
+browser can share files (phones, mostly); **Save image** downloads it as
+`orbit-<year>.png` everywhere.
 
 ## Trips
 
@@ -358,6 +395,224 @@ The database decides what each viewer receives: profiles are only read
 through functions that apply those settings, and friendships and blocks are
 only changed through functions that check who is asking.
 
+### The shared catalog and Explore
+
+Concerts, games, shows and festivals can be linked to a **shared catalog** of
+performers, teams, shows, festivals and venues, so everyone's *Kansas City
+Chiefs* is the same entry and what people thought of it can be gathered in
+one place. It needs an account with a username.
+
+**Linking.** In the event form, a concert asks *Who played* (artists, any
+number), a game asks *Who played* (teams), a show asks *Which show* and a
+festival *Which festival*, and each can have a *Venue*. Typing searches the
+catalog first, showing how many have logged each entry and its average,
+then [Wikidata](https://www.wikidata.org) for anything the catalog does not
+have yet (disambiguation pages left out), and last offers *Add "…"* for the
+local band or the high school game Wikidata has never heard of. Picking a
+Wikidata match adds it to the catalog; its item id (Q and digits) keeps it
+the same entry for everyone. One made in Orbit is matched by its kind and
+name.
+
+**Wikidata items are named by Wikidata, not by the app.** Since the entry is
+shared, an app that could name one could give "Taylor Swift" any name for
+everyone. So the app sends only the item id to Orbit's catalog service
+(`supabase/functions/catalog`), which asks Wikidata for the item's name and
+description (in the app's language, else English) and adds it with the
+service role through `catalog_add_wikidata`, which nothing else can call.
+`catalog_add` refuses Wikidata items outright. Picking an item already in
+the catalog refreshes its name and description from Wikidata, keeping its
+kind. Without the service deployed, picking a Wikidata match says so, and
+*Add "…"* still works. Picking a venue fills in *Where* if that was empty.
+
+**Sharing.** Once an outing has happened, the form has *Your thoughts* beside
+the rating, and *Who sees your rating and thoughts*: **Everyone**,
+**Friends** (the default) or **Only me**. The card on the timeline shows the
+thoughts and who they are shared with. An outing set to Everyone or Friends,
+that has happened and links to something, is copied to the account's
+database as an **outing**: its kind, title, date, rating, thoughts and links.
+Who went with you and the event's details are never copied. The app sends
+the whole set whenever it changes (the server replaces what it had), keeps a
+short fingerprint of the last set sent so an unchanged one is not sent
+again, and never sends anything before the events have been read, so an
+events list that failed to load can never empty what is shared.
+
+**Explore** (beside *Add an event*, or any link on an event card) searches
+the catalog, narrowed by kind if wanted. An entry's page has its average
+from the ratings shared with everyone, how many there are and how they
+spread across the half stars, a link to Wikidata, and **What people
+thought**: every outing the viewer may see, newest first, with who logged it
+(and *Friend* or *You*), their stars, title, date and thoughts, and what else
+it links to (tap to go there; *Back* retraces the way).
+
+**Who sees what** is decided by the database: an outing set to Everyone is
+seen by anyone signed in, one set to Friends only by friends, your own
+always, and nobody's across a block, either way. Only ratings shared with
+everyone count towards an average, so a friends-only rating is never
+revealed by a number. Searches count only the outings the viewer may see.
+
+The catalog, outings and their links are part 4 of `supabase/schema.sql`,
+reached only through `catalog_add`, `catalog_search`, `catalog_page` and
+`sync_outings`, each of which checks who is asking. Deleting an account
+deletes its outings; entries it added stay, without its name.
+
+*Known limits.* Anyone signed in can make entries in Orbit (not from
+Wikidata) with any name, as with anything people write. There is no
+reporting or merging of duplicates yet.
+
+### Public pages
+
+Everyone with a username has a page at `<site>/u/<username>`, and one per
+year at `<site>/u/<username>/<year>`. It shows their name and whatever
+profile details this viewer may see, the numbers (trips, countries, US
+states, days away, and concerts, games, shows and festivals), a map of their
+trips, the trips with their dates, stars and highlights, and their concerts,
+games and shows with what they thought and links to the catalog. Year chips
+move between all time and each year with anything in it; *Copy link to this
+page* copies the address. Catalog entries have pages too, at
+`<site>/c/<id>`, and on them each name links to that person's page.
+
+These open **without signing in** (`src/main.jsx` sends those addresses to
+`PublicPage` rather than the sign-in screen), follow the device's light or
+dark setting, and invite a visitor to join. Moving between them stays on the
+page; *Open Orbit* or *Join Orbit* goes to the app.
+
+**Who sees what.** Signed-in people see a page by the owner's settings, as
+everywhere else: Everyone, Friends, or only the owner, and nothing across a
+block. Signed-out visitors, anyone on the web, see only what is set to
+Everyone, and only once its owner ticks **Anyone with the link can see it**
+(Settings → Profile → *Your page*; off to start with). Until then they see
+the name and username, and a way to log in. "Everyone" meant everyone in
+Orbit before pages existed, so nobody's details reach the open web without
+their saying so. The same rule covers catalog pages: a signed-out visitor
+only sees outings, and counts ratings, from people whose pages are open.
+
+**Trips on the page** are off until chosen: *Trips you have taken* in the
+same card, Everyone, Friends or Only me. Once shown, the app copies the
+trips that are over (never ones planned, wished for or still going, which
+would say when someone is away) with their title, dates, rating, highlight and each stop's name,
+country and US state, and its position rounded to about a kilometre. Never
+who went, notes, tags, photos or street addresses. Countries and states are
+worked out on the device from the outlines, which load only for this. The
+copy follows the trips the way shared outings follow events: the whole set
+when it changes, never before the trips have been read, and an empty set
+once when trips go back to Only me (the database also stops showing them at
+once).
+
+**Links to it.** The ⋮ menu has *Your page* under your username, Settings
+shows the address with *Copy link*, and the Recap share card names the
+year's page in its footer (the share sheet sends the address with the
+picture).
+
+**GitHub Pages** has no routes of its own, so the build writes the app a
+second time as `404.html`, which Pages serves for any address it does not
+have; the app then reads the address. It works for people, but the answer
+carries a 404 status, and link previews (iMessage, Slack) and search
+engines see the generic page rather than the person. Proper previews need a
+host with rewrites and a server-rendered page or an Open Graph image per
+address.
+
+### The friends feed
+
+**Feed**, beside People once you are signed in with a username, is what your
+friends have been to and where they have been, newest first: every outing
+they share with Everyone or Friends ("Bea rated Chiefs vs Broncos", with the
+stars, what they thought, and the teams, artists and venues it links to),
+and the trips they show to friends or everyone (dates, places, highlight).
+Names link to that friend's page, and links to catalog pages. It comes 30 at
+a time, with *Load more*. Things one friend shared within two minutes of
+each other (a year of concerts linked in one go) are gathered: three show,
+then *N more from Bea*. With nothing in it yet, it says how it fills and
+offers *Find friends*.
+
+A red dot on the tab says friends have shared something since you last
+looked. The newest item's time is read when Orbit opens, and the newest you
+have seen is kept on this device (`orbit-feed-seen:<user id>`). Settings →
+Preferences can open Orbit on the feed.
+
+**Order.** The feed is ordered by when each thing was first shared, not by
+when it happened, the way a diary is. So the sharing functions now update
+each outing and trip where it is rather than replacing the lot: each keeps
+its `created_at` through every later sync, and `updated_at` only moves when
+something about it changed. Many things can be shared in the same moment,
+so pages carry on from the last item's time and id together, and nothing is
+skipped or repeated at a page break.
+
+**Who sees what.** Only friends' things, never a stranger's, even when
+shared with everyone (that is what Explore and pages are for), and never
+your own. A block ends the friendship and with it the feed; trips set back
+to Only me leave it at once. All of this is `friend_feed` in part 6 of
+`supabase/schema.sql`.
+
+### Likes and comments
+
+Every shared outing and trip, in the feed, on people's pages and on catalog
+pages, has a heart and comments underneath. Anyone signed in who may see a
+post can like it and comment on it (up to 1000 characters; Enter posts,
+Shift+Enter starts a new line). Comments open with who liked it. A comment
+can be deleted by whoever wrote it and by the post's owner. Signed-out
+visitors to an open page see the counts and *Log in to like or comment*,
+never the comments themselves, since those were written for people in
+Orbit.
+
+They belong to the post: when it is taken down (set to Only me, removed,
+or trips hidden) its likes and comments go with it. Someone blocked,
+either way, is not counted and their comments are not shown. More than 60
+comments in an hour from one person are refused. All of this is part 7 of
+`supabase/schema.sql` (`like_post`, `comment_post`, `delete_comment`,
+`post_thread`), and every post the feed, pages and catalog hand out carries
+its `owner`, `post`, `ref`, `likes`, `liked` and `comments`.
+
+### Usage counts
+
+Orbit counts what people do, so what gets built next, and what could be
+worth paying for, follows what people use. `track('event.add', { kind:
+'Concert', rated: true })` notes one action ([`src/usage.js`](src/usage.js)).
+Names are `area.action`; details are a few short words, numbers or
+true/false. **Never anything anyone wrote**: no names, titles, notes,
+places or comments. Actions wait on the device and go in batches every few
+seconds, and when the page is hidden or closed.
+
+What is counted:
+
+| Area | Actions |
+| --- | --- |
+| `app`, `view` | opening Orbit (phone or computer, from the Home Screen or not, signed in, and how many people, events, reminders, lists and trips are in it), each tab opened |
+| `person`, `catchup`, `event`, `reminder`, `list`, `trip` | added, edited, removed, catch-ups logged, reminders done, list entries added, finished and rated, trip photos added, with a few details of a single one (an event's kind, whether rated, linked or shared). Counted where the app saves, so nothing is missed; a pile at once (an import) is one count |
+| `share`, `recap`, `data` | sending a copy of a person, list or trip (how), the Recap card opened, saved or shared, import, export, backup, restore |
+| `catalog`, `explore`, `feed`, `post` | linking an entry (from Orbit or Wikidata), searching, opening a page, the feed viewed, more loaded, piles opened, likes and comments |
+| `friends`, `notify`, `settings`, `profile` | requests, accepts, blocks, push on or off, which notification kinds are turned off, theme, start tab, page settings |
+| `page` | public page views (signed in or not), *Join Orbit* clicks, links copied |
+
+**Turning it off.** Settings → Preferences → *Share which parts of Orbit I
+use*, on to start with. Off, the app stops sending, and the server keeps
+nothing from that person whatever arrives (`profiles.share_usage`).
+Signed-out visitors to public pages are counted by a random id for that
+visit only, and not at all when their browser asks not to be tracked (Do
+Not Track or Global Privacy Control). Without an account server nothing is
+counted. Deleting an account deletes its counts.
+
+**The report.** Nobody reads the rows directly. People added to
+`usage_admins` get *Usage* in the ⋮ menu: the last 7, 30 or 90 days as
+headline numbers, active people by day (a chart, or a table), each part of
+the app with the share of active people using it, **what engaged people
+rely on** (each part's use among people active 8 or more days against the
+rest: the best guide to what to build on, or charge for), how many days
+people come back, whether each week's new people stay (weeks 1, 2 and 4),
+tabs opened, the public page funnel (views, visitors, *Join Orbit* clicks,
+new accounts), devices, and every action. Add yourself once in the SQL
+Editor:
+
+```sql
+insert into public.usage_admins select id from public.profiles where username = 'yourname';
+```
+
+It is `track_usage`, `is_usage_admin` and `usage_report` in part 8 of
+`supabase/schema.sql`. `track_usage` takes at most 50 actions a call, keeps
+only well-formed names and plain details, and uses the server's clock.
+Anyone can call it (signed-out visitors are counted), so a determined
+person could add noise; if that happens, rate limiting belongs in front of
+it.
+
 ### Preferences and notifications
 
 **Settings → Preferences** holds the theme, which tab Orbit opens on, and
@@ -373,7 +628,13 @@ notifications:
   is something in it.
 - **What**: birthdays (on the day, or up to two weeks before), reminders (when
   they come into view and when due), check-ins falling overdue, events (the
-  day before and the day of), and friend requests.
+  day before and the day of), friend requests, **friends' activity** (a friend
+  rated a concert or a game, or showed a trip) and **likes and comments** on
+  what you shared. The last two are on to start with, including for settings
+  saved before they existed, and each can be turned off here. Like friend
+  requests, they go on any hourly run outside quiet hours, by push only;
+  more than two from one friend at once become one line ("Dora shared 5 new
+  things").
 - **When**: an hour of the day in the person's own time zone, and quiet hours
   that hold friend request pushes until they end.
 
@@ -418,7 +679,14 @@ under seven keys (`crm-people-v1`, `crm-events-v1`, `crm-reminders-v1`,
 more remember small things: that the Trips notice was read
 (`crm-trips-notice-v1`), that the pinned-events offer was answered
 (`crm-trips-events-offer-v1`), and when the last backup file was made
-(`crm-backup-file-v1`). Lists are called
+(`crm-backup-file-v1`). With the shared catalog, an event can also carry
+`links` (`{ id, kind, name }` for each catalog entry, the name kept so it
+reads the same offline), `review` (the thoughts shared with the rating) and
+`visibility` (`everyone`, `friends` or `me`); events saved before these
+existed read as kept to yourself. A fingerprint of the last set of outings
+shared is kept per account under `orbit-outings-sent:<user id>` in
+`localStorage`, outside the account's own keys, and one of the trips shown on
+your page under `orbit-trips-sent:<user id>`. Lists are called
 collections in the code, because "list" already means the people list there.
 The app reads and writes them through an async `window.storage` object.
 
@@ -495,6 +763,15 @@ harmless and left alone so the file stays as it was written:
 - A `useMemo` is flagged for not listing `ofCircle` in its deps. `ofCircle`
   only closes over `people`, which *is* in the dep array, so the memo is
   correct as written.
+
+### Setting up the catalog service
+
+Edge Functions → Deploy a new function → Via Editor. Name it `catalog`,
+paste `supabase/functions/catalog/index.ts`, and deploy. In its settings,
+turn **off** "Enforce JWT verification": it checks the signed-in person
+itself, and the browser's preflight request carries no token. It needs no
+secrets of its own (`APP_URL`, if set for `notify`, goes in the User-Agent
+Wikidata asks for).
 
 ### Setting up notifications
 

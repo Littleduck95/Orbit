@@ -7,7 +7,8 @@ import { createECDH, randomBytes } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import {
   type Db, type Kinds, type Prefs, type Senders, type Sub,
-  daysBetween, dueItems, emailFor, handle, inQuiet, localNow, nextBirthday, pushFor, realSenders, run,
+  type Social,
+  IN_CHUNK, daysBetween, dueItems, emailFor, handle, inQuiet, localNow, nextBirthday, pushFor, realSenders, run, socialItems, starText, supabaseDb,
 } from '../../supabase/functions/notify/index.ts';
 
 const ALL: Kinds = { birthdays: true, reminders: true, checkins: true, events: true, friend_requests: true };
@@ -106,7 +107,7 @@ const prefs = (over: Partial<Prefs> = {}): Prefs => ({
   quiet_start: 22, quiet_end: 7, kinds: ALL, birthday_days: 1, ...over,
 });
 
-function fakes(list: Prefs[], opts: { requests?: { id: string; name: string }[]; subs?: Sub[]; email?: boolean; failFor?: string } = {}) {
+function fakes(list: Prefs[], opts: { requests?: { id: string; name: string }[]; subs?: Sub[]; email?: boolean; failFor?: string; activity?: Social[]; reactions?: Social[] } = {}) {
   const log: { user_id: string; channel: string; ref: string }[] = [];
   const pushes: { endpoint: string; payload: Record<string, string> }[] = [];
   const emails: { to: string; subject: string }[] = [];
@@ -117,6 +118,8 @@ function fakes(list: Prefs[], opts: { requests?: { id: string; name: string }[];
     subs: async (u) => (opts.subs ?? [{ endpoint: `https://push.example/${u}`, p256dh: 'k', auth: 'a' }]).filter((s) => !dropped.includes(s.endpoint)),
     dropSub: async (e) => { dropped.push(e); },
     requests: async () => opts.requests ?? [],
+    activity: async () => opts.activity ?? [],
+    reactions: async () => opts.reactions ?? [],
     sent: async (u, ch, refs) => new Set(log.filter((l) => l.user_id === u && l.channel === ch && refs.includes(l.ref)).map((l) => l.ref)),
     log: async (rows) => { log.push(...rows); },
     emailOf: async (u) => `${u}@example.com`,
@@ -291,4 +294,80 @@ Deno.test('a push service saying the device is gone is reported as gone', async 
   const r = await trusting(() => senders.push({ endpoint: `https://127.0.0.1:${server.addr.port}/x`, p256dh: device.getPublicKey('base64url'), auth: randomBytes(16).toString('base64url') }, '{}'));
   await server.shutdown();
   assertEquals(r, 'gone');
+});
+
+const BEA_RATED = { ref: 'act:bea:o:e1', who: 'Bea Cho', text: 'Bea Cho rated Chiefs vs Broncos ★★★★½' };
+const DORA_PILE = Array.from({ length: 5 }, (_, i) => ({ ref: `act:dora:o:${i}`, who: 'Dora', text: `Dora went to Show ${i}` }));
+
+Deno.test('stars in text, halves and all', () => {
+  assertEquals([starText(4.5), starText(3), starText(0.5), starText(null)], ['★★★★½', '★★★', '½', '']);
+});
+
+Deno.test('friends\' activity and likes go out on any run, outside quiet hours', async () => {
+  const f = fakes([prefs()], { activity: [BEA_RATED], reactions: [{ ref: 'like:bea:outing:e9', who: 'Bea Cho', text: 'Bea Cho liked Lisbon' }] });
+  await run(f.db, f.send, new Date('2026-09-24T18:00:00Z'), 'u'); // 1pm, not their hour
+  assertEquals(f.pushes.length, 1);
+  assertEquals(f.pushes[0].payload.title, 'Orbit: 2 new from friends');
+  assertEquals(f.pushes[0].payload.body, 'Bea Cho rated Chiefs vs Broncos ★★★★½\nBea Cho liked Lisbon');
+  await run(f.db, f.send, new Date('2026-09-24T19:00:00Z'), 'u');
+  assertEquals(f.pushes.length, 1, 'never the same thing twice');
+  const q = fakes([prefs()], { activity: [BEA_RATED] });
+  await run(q.db, q.send, new Date('2026-09-25T04:00:00Z'), 'u'); // 11pm
+  assertEquals(q.pushes.length, 0, 'quiet hours hold it');
+});
+
+Deno.test('they start on, and each can be turned off', async () => {
+  const old = fakes([prefs({ kinds: { ...ALL } })], { activity: [BEA_RATED] });
+  await run(old.db, old.send, new Date('2026-09-24T18:00:00Z'), 'u');
+  assertEquals(old.pushes.length, 1, 'a setting saved before these kinds existed counts them as on');
+  const off = fakes([prefs({ kinds: { ...ALL, friend_activity: false, likes_comments: false } })],
+    { activity: [BEA_RATED], reactions: [{ ref: 'cmt:1', who: 'Bea', text: 'Bea commented on Lisbon: “Nice”' }] });
+  await run(off.db, off.send, new Date('2026-09-24T18:00:00Z'), 'u');
+  assertEquals(off.pushes.length, 0);
+});
+
+Deno.test('a pile from one friend is one line, and every part of it is logged', async () => {
+  const items = socialItems([...DORA_PILE, BEA_RATED].map((x) => ({ ...x, kind: 'friend_activity' as const })), new Set(['act:dora:o:0']), '2026-09-24');
+  assertEquals(items.map((i) => i.text), ['Dora shared 4 new things', 'Bea Cho rated Chiefs vs Broncos ★★★★½'], 'what was sent already is not counted');
+  const f = fakes([prefs()], { activity: DORA_PILE });
+  await run(f.db, f.send, new Date('2026-09-24T18:00:00Z'), 'u');
+  assertEquals(f.pushes[0].payload.body, 'Dora shared 5 new things');
+  assertEquals(f.log.map((l) => l.ref).sort(), DORA_PILE.map((x) => x.ref).sort());
+  await run(f.db, f.send, new Date('2026-09-24T19:00:00Z'), 'u');
+  assertEquals(f.pushes.length, 1, 'none of it goes again');
+});
+
+Deno.test('things coming up still say so, even beside friends\' news', () => {
+  assertEquals(pushFor([
+    { kind: 'events', ref: 'a', day: 'd', text: 'Tomorrow: Wedding' },
+    { kind: 'friend_activity', ref: 'b', day: 'd', text: 'Bea went to Lisbon' },
+  ]).title, 'Orbit: 2 things coming up');
+});
+
+// A stand-in for the Supabase client: each query records its .in() list and
+// answers with the rows whose value is in it.
+function fakeClient(rows: Record<string, Record<string, unknown>[]>) {
+  const lists: number[] = [];
+  const client = {
+    from(table: string) {
+      let col = '';
+      let list: unknown[] = [];
+      const q = {
+        select: () => q, eq: () => q, gte: () => q, order: () => q, or: () => q,
+        in: (c: string, l: unknown[]) => { col = c; list = l; lists.push(l.length); return q; },
+        then: (ok: (v: unknown) => void) => ok({ data: (rows[table] ?? []).filter((r) => !col || list.includes(r[col])), error: null }),
+      };
+      return q;
+    },
+  };
+  return { client, lists };
+}
+
+Deno.test('a long list is asked for in pieces, so the request stays short, and nothing is lost', async () => {
+  const refs = Array.from({ length: 173 }, (_, i) => `act:friend:o:${i}`);
+  const { client, lists } = fakeClient({ notification_log: refs.filter((_, i) => i % 2).map((ref) => ({ ref })) });
+  const done = await supabaseDb(client).sent('u', 'push', refs);
+  assertEquals(done.size, 86);
+  assert(lists.every((n) => n <= IN_CHUNK), `pieces of at most ${IN_CHUNK}: ${lists}`);
+  assertEquals(lists.reduce((a, b) => a + b, 0), 173);
 });

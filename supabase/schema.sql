@@ -163,7 +163,7 @@ begin
     end if;
   end loop;
   for k, v in select * from jsonb_each(coalesce(new.visibility, '{}'::jsonb)) loop
-    if k in ('pronouns', 'bio', 'location', 'birthday', 'phone', 'contact_email', 'website', 'socials')
+    if k in ('pronouns', 'bio', 'location', 'birthday', 'phone', 'contact_email', 'website', 'socials', 'trips')
        and v #>> '{}' in ('everyone', 'friends', 'me') then
       vis := vis || jsonb_build_object(k, v #>> '{}');
     end if;
@@ -428,11 +428,16 @@ create table if not exists public.notification_prefs (
   time_zone     text        not null default 'UTC' check (char_length(time_zone) between 1 and 64),
   quiet_start   smallint    check (quiet_start between 0 and 23),
   quiet_end     smallint    check (quiet_end between 0 and 23),
-  kinds         jsonb       not null default '{"birthdays": true, "reminders": true, "checkins": true, "events": true, "friend_requests": true}'::jsonb
+  kinds         jsonb       not null default '{"birthdays": true, "reminders": true, "checkins": true, "events": true, "friend_requests": true, "friend_activity": true, "likes_comments": true}'::jsonb
                             check (jsonb_typeof(kinds) = 'object'),
   birthday_days smallint    not null default 1 check (birthday_days between 0 and 14),
   updated_at    timestamptz not null default now()
 );
+
+-- Kinds added later start on for new settings too (an existing table keeps
+-- its old default otherwise). Settings saved before them read them as on.
+alter table public.notification_prefs alter column kinds set default
+  '{"birthdays": true, "reminders": true, "checkins": true, "events": true, "friend_requests": true, "friend_activity": true, "likes_comments": true}'::jsonb;
 
 -- One row per device that turned push on. The endpoint is the address the
 -- browser's push service gave that device.
@@ -496,7 +501,7 @@ declare
   k text;
   out jsonb := '{}'::jsonb;
 begin
-  foreach k in array array['birthdays', 'reminders', 'checkins', 'events', 'friend_requests'] loop
+  foreach k in array array['birthdays', 'reminders', 'checkins', 'events', 'friend_requests', 'friend_activity', 'likes_comments'] loop
     out := out || jsonb_build_object(k, coalesce(case when jsonb_typeof(new.kinds -> k) = 'boolean' then (new.kinds -> k)::boolean end, true));
   end loop;
   new.kinds := out;
@@ -507,6 +512,846 @@ end $$;
 drop trigger if exists notification_prefs_clean on public.notification_prefs;
 create trigger notification_prefs_clean before insert or update on public.notification_prefs
   for each row execute function public.clean_notification_prefs();
+
+-- ---------------------------------------------------------------------------
+-- Part 4: the shared catalog. Performers, teams, shows, festivals and venues
+-- that everyone's events can point at, so everyone's "Kansas City Chiefs" is
+-- the same one and ratings can be added up. An entry comes from Wikidata (its
+-- item id, Q and digits, is what makes it the same for everyone) or, for the
+-- local band or the high school game Wikidata has never heard of, is made in
+-- Orbit, where the same kind and name makes the same entry.
+--
+-- Events stay in each person's own saved data. What they choose to share
+-- (Everyone or Friends) is copied here as an outing: the kind, title, date,
+-- rating, their thoughts, and what it links to. Never who they went with,
+-- never their private notes. The app sends the whole set each time it
+-- changes (sync_outings), so this copy can never drift from the events.
+
+create table if not exists public.catalog (
+  id         uuid        primary key default gen_random_uuid(),
+  kind       text        not null check (kind in ('performer', 'team', 'show', 'festival', 'venue')),
+  name       text        not null check (char_length(name) between 1 and 200),
+  about      text        not null default '' check (char_length(about) <= 300),
+  source     text        not null check (source in ('wikidata', 'orbit')),
+  source_id  text        not null check (char_length(source_id) between 1 and 300),
+  created_by uuid        references auth.users (id) on delete set null,
+  created_at timestamptz not null default now(),
+  unique (source, source_id)
+);
+create index if not exists catalog_name on public.catalog (lower(name) text_pattern_ops);
+
+create table if not exists public.outings (
+  user_id    uuid         not null references auth.users (id) on delete cascade,
+  event_id   text         not null check (char_length(event_id) between 1 and 100),
+  kind       text         not null check (kind in ('Concert', 'Sports', 'Theater', 'Festival')),
+  title      text         not null check (char_length(title) between 1 and 200),
+  on_date    date         not null,
+  rating     numeric(2,1) check (rating is null or (rating between 0.5 and 5 and rating * 2 = trunc(rating * 2))),
+  review     text         not null default '' check (char_length(review) <= 2000),
+  visibility text         not null check (visibility in ('everyone', 'friends')),
+  updated_at timestamptz  not null default now(),
+  primary key (user_id, event_id)
+);
+
+-- When each outing was first shared, kept through every later sync, so a
+-- friend's feed can put the newest first (part 6).
+alter table public.outings add column if not exists created_at timestamptz not null default now();
+
+create table if not exists public.outing_links (
+  user_id    uuid not null,
+  event_id   text not null,
+  catalog_id uuid not null references public.catalog (id) on delete cascade,
+  primary key (user_id, event_id, catalog_id),
+  foreign key (user_id, event_id) references public.outings (user_id, event_id) on delete cascade
+);
+create index if not exists outing_links_catalog on public.outing_links (catalog_id);
+
+-- None of the three is read or written directly.
+alter table public.catalog enable row level security;
+alter table public.outings enable row level security;
+alter table public.outing_links enable row level security;
+revoke all on public.catalog from anon, authenticated;
+revoke all on public.outings from anon, authenticated;
+revoke all on public.outing_links from anon, authenticated;
+
+-- Whether someone has opened their page to the whole web: off until they
+-- turn it on. Part 5 has the pages themselves.
+alter table public.profiles add column if not exists public_page boolean not null default false;
+create or replace function public.page_is_public(who uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select coalesce((select public_page from public.profiles where id = who), false);
+$$;
+revoke all on function public.page_is_public(uuid) from public, anon, authenticated;
+
+-- An entry as it is handed out: never who added it.
+create or replace function public.catalog_entry(c public.catalog) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select jsonb_build_object('id', c.id, 'kind', c.kind, 'name', c.name, 'about', c.about, 'source', c.source, 'source_id', c.source_id);
+$$;
+
+-- Whether this viewer may see an outing: their own always; otherwise one set
+-- to Everyone, or to Friends when they are friends; never across a block. A
+-- signed-out viewer (null) sees one set to Everyone only when its owner has
+-- made their page public (see part 5).
+create or replace function public.can_see_outing(owner uuid, vis text, viewer uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select coalesce(owner = viewer, false)
+    or (not public.is_blocked(owner, viewer)
+        and ((vis = 'everyone' and (viewer is not null or public.page_is_public(owner)))
+             or (vis = 'friends' and viewer is not null and public.are_friends(owner, viewer))));
+$$;
+revoke all on function public.catalog_entry(public.catalog) from public, anon, authenticated;
+revoke all on function public.can_see_outing(uuid, text, uuid) from public, anon, authenticated;
+
+-- Adds an entry made in Orbit, or hands back the one already there: the kind
+-- and the name decide, whatever its case or spacing. Items from Wikidata do
+-- not come this way (see catalog_add_wikidata below).
+create or replace function public.catalog_add(p_kind text, p_name text, p_about text, p_source text, p_source_id text) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  nm text := btrim(regexp_replace(coalesce(p_name, ''), '\s+', ' ', 'g'));
+  sid text;
+  c public.catalog;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if p_kind is null or p_kind not in ('performer', 'team', 'show', 'festival', 'venue') then raise exception 'Unknown kind of entry'; end if;
+  if char_length(nm) not between 1 and 200 then raise exception 'An entry needs a name'; end if;
+  if p_source = 'wikidata' then
+    -- An app could name a Wikidata item anything, for everyone. Orbit's
+    -- catalog service asks Wikidata instead (supabase/functions/catalog).
+    raise exception 'Items from Wikidata are added through Orbit''s catalog service';
+  elsif p_source = 'orbit' then
+    sid := p_kind || ':' || lower(nm);
+  else
+    raise exception 'Unknown source';
+  end if;
+  insert into public.catalog (kind, name, about, source, source_id, created_by)
+    values (p_kind, nm, left(btrim(regexp_replace(coalesce(p_about, ''), '\s+', ' ', 'g')), 300), p_source, sid, me)
+    on conflict (source, source_id) do nothing;
+  select * into c from public.catalog where source = p_source and source_id = sid;
+  return public.catalog_entry(c);
+end $$;
+
+-- A Wikidata item, named as Wikidata names it. Only the catalog service calls
+-- this, with the service role, after asking Wikidata for the item: nothing an
+-- app sends reaches it. An item already here takes Wikidata's current name
+-- and description, which also corrects one ever given a made-up name. It
+-- keeps its kind, and who first added it.
+create or replace function public.catalog_add_wikidata(p_kind text, p_name text, p_about text, p_qid text, p_by uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  nm text := left(btrim(regexp_replace(coalesce(p_name, ''), '\s+', ' ', 'g')), 200);
+  c public.catalog;
+begin
+  if p_kind is null or p_kind not in ('performer', 'team', 'show', 'festival', 'venue') then raise exception 'Unknown kind of entry'; end if;
+  if coalesce(p_qid, '') !~ '^Q[1-9][0-9]{0,11}$' then raise exception 'That is not a Wikidata item'; end if;
+  if char_length(nm) < 1 then raise exception 'An entry needs a name'; end if;
+  insert into public.catalog (kind, name, about, source, source_id, created_by)
+    values (p_kind, nm, left(btrim(regexp_replace(coalesce(p_about, ''), '\s+', ' ', 'g')), 300), 'wikidata', p_qid, p_by)
+    on conflict (source, source_id) do update set name = excluded.name, about = excluded.about;
+  select * into c from public.catalog where source = 'wikidata' and source_id = p_qid;
+  return public.catalog_entry(c);
+end $$;
+revoke all on function public.catalog_add_wikidata(text, text, text, text, uuid) from public, anon, authenticated;
+grant execute on function public.catalog_add_wikidata(text, text, text, text, uuid) to service_role;
+
+-- Finding entries by any part of the name, the closest first, then the most
+-- logged. outings counts only what this viewer may see; average is of ratings
+-- shared with everyone.
+create or replace function public.catalog_search(q text, p_kind text default null) returns setof jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  term text := lower(btrim(regexp_replace(coalesce(q, ''), '\s+', ' ', 'g')));
+  pat text;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if char_length(term) < 2 then return; end if;
+  pat := replace(replace(replace(term, '\', '\\'), '%', '\%'), '_', '\_');
+  return query
+    select public.catalog_entry(c) || jsonb_build_object('outings', s.n, 'average', s.avg)
+    from public.catalog c
+    cross join lateral (
+      select count(*) filter (where public.can_see_outing(o.user_id, o.visibility, me)) as n,
+             round(avg(o.rating) filter (where o.visibility = 'everyone' and public.can_see_outing(o.user_id, o.visibility, me)), 2) as avg
+      from public.outing_links l join public.outings o on o.user_id = l.user_id and o.event_id = l.event_id
+      where l.catalog_id = c.id
+    ) s
+    where lower(c.name) like '%' || pat || '%' and (p_kind is null or c.kind = p_kind)
+    order by (lower(c.name) = term) desc, (lower(c.name) like pat || '%') desc, s.n desc, c.name
+    limit 20;
+end $$;
+
+-- One entry's page, for anyone, signed in or not: the entry, its ratings shared with everyone (how many,
+-- the average, and how many at each half star), and the outings this viewer
+-- may see, newest first, each with who logged it and what else it links to.
+create or replace function public.catalog_page(p_id uuid) returns jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  c public.catalog;
+  out jsonb;
+begin
+  -- Signed-out visitors may look too (a public page links here), and see
+  -- only what is shared with everyone.
+  select * into c from public.catalog where id = p_id;
+  if c.id is null then return null; end if;
+  with mine as (
+    select o.*, p.username, p.display_name
+    from public.outing_links l
+    join public.outings o on o.user_id = l.user_id and o.event_id = l.event_id
+    join public.profiles p on p.id = o.user_id
+    where l.catalog_id = c.id
+  ), public_ratings as (
+    select rating from mine where visibility = 'everyone' and rating is not null
+      and public.can_see_outing(user_id, visibility, me)
+  )
+  select jsonb_build_object(
+    'entry', public.catalog_entry(c),
+    'ratings', (select count(*) from public_ratings),
+    'average', (select round(avg(rating), 2) from public_ratings),
+    'spread', (select jsonb_agg((select count(*) from public_ratings r where r.rating = g / 2.0) order by g) from generate_series(1, 10) g),
+    'outings', coalesce((
+      select jsonb_agg(x.j order by x.on_date desc, x.updated_at desc)
+      from (
+        select m.on_date, m.updated_at, jsonb_build_object(
+          'by', jsonb_build_object('username', m.username, 'display_name', m.display_name, 'relation', public.relation_to(m.user_id, me)),
+          'kind', m.kind, 'title', m.title, 'date', m.on_date, 'rating', m.rating, 'review', m.review,
+          'links', coalesce((
+            select jsonb_agg(public.catalog_entry(oc) order by oc.kind, oc.name)
+            from public.outing_links ol join public.catalog oc on oc.id = ol.catalog_id
+            where ol.user_id = m.user_id and ol.event_id = m.event_id and oc.id <> c.id
+          ), '[]'::jsonb)
+        ) || public.post_counts(m.user_id, 'outing', m.event_id, me) as j
+        from mine m
+        where public.can_see_outing(m.user_id, m.visibility, me)
+        order by m.on_date desc, m.updated_at desc
+        limit 100
+      ) x
+    ), '[]'::jsonb)
+  ) into out;
+  return out;
+end $$;
+
+-- Replaces everything this person shares with the set given: an array of
+-- { event_id, kind, title, date, rating, review, visibility, links: [catalog
+-- ids] }. Anything malformed, still to come, or linking to nothing known is
+-- left out. Answers with how many were kept.
+create or replace function public.sync_outings(items jsonb) returns integer
+language plpgsql security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  it jsonb;
+  eid text;
+  keep text[] := '{}';
+  kept integer;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if not exists (select 1 from public.profiles where id = me) then raise exception 'Choose a username first'; end if;
+  if jsonb_typeof(items) is distinct from 'array' then raise exception 'Expected a list'; end if;
+  if jsonb_array_length(items) > 2000 then raise exception 'Too many to share at once'; end if;
+  -- Each outing is updated where it is, so it keeps when it was first shared;
+  -- updated_at only moves when something about it changed.
+  for it in select value from jsonb_array_elements(items) loop
+    begin
+      if jsonb_typeof(it) <> 'object' or (it ->> 'date')::date > current_date + 1 then continue; end if;
+      eid := it ->> 'event_id';
+      if eid is null or eid = any(keep) then continue; end if;
+      insert into public.outings as o (user_id, event_id, kind, title, on_date, rating, review, visibility)
+        values (me, eid, it ->> 'kind', btrim(it ->> 'title'), (it ->> 'date')::date,
+                (it ->> 'rating')::numeric, btrim(coalesce(it ->> 'review', '')), it ->> 'visibility')
+        on conflict (user_id, event_id) do update set
+          kind = excluded.kind, title = excluded.title, on_date = excluded.on_date, rating = excluded.rating,
+          review = excluded.review, visibility = excluded.visibility,
+          updated_at = case when (o.kind, o.title, o.on_date, o.rating, o.review, o.visibility)
+            is distinct from (excluded.kind, excluded.title, excluded.on_date, excluded.rating, excluded.review, excluded.visibility)
+            then now() else o.updated_at end;
+      delete from public.outing_links where user_id = me and event_id = eid;
+      insert into public.outing_links (user_id, event_id, catalog_id)
+        select me, eid, c.id from public.catalog c
+        where c.id::text in (
+          select jsonb_array_elements_text(case when jsonb_typeof(it -> 'links') = 'array' then it -> 'links' else '[]'::jsonb end) limit 10
+        )
+        on conflict do nothing;
+      keep := keep || eid;
+    exception when others then
+      null; -- this one is left out (and taken down, if it was there); the rest still go
+    end;
+  end loop;
+  delete from public.outings where user_id = me and not (event_id = any(keep));
+  -- An outing linking to nothing says nothing about the catalog.
+  delete from public.outings o where o.user_id = me
+    and not exists (select 1 from public.outing_links l where l.user_id = me and l.event_id = o.event_id);
+  select count(*) into kept from public.outings where user_id = me;
+  return kept;
+end $$;
+
+revoke all on function public.catalog_add(text, text, text, text, text) from public, anon;
+revoke all on function public.catalog_search(text, text) from public, anon;
+revoke all on function public.catalog_page(uuid) from public;
+revoke all on function public.sync_outings(jsonb) from public, anon;
+grant execute on function public.catalog_add(text, text, text, text, text) to authenticated;
+grant execute on function public.catalog_search(text, text) to authenticated;
+grant execute on function public.catalog_page(uuid) to anon, authenticated;
+grant execute on function public.sync_outings(jsonb) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Part 5: public pages. Each person has a page (/u/username, and one per
+-- year) with what they have chosen to show: the profile details, outings and
+-- trips each set to Everyone or Friends. Signed-in people see it by those
+-- settings. Signed-out visitors, anyone on the web, see only what is set to
+-- Everyone, and only once its owner turns on public_page: "Everyone" meant
+-- everyone in Orbit before pages existed, so nobody is put on the open web
+-- without saying so.
+--
+-- Trips live in each person's own saved data. When they choose to show them
+-- (visibility.trips), the trips they have taken are copied here: title,
+-- dates, rating, highlight, and each stop's name, country, US state and a
+-- position rounded to about a kilometre. Never who went, never notes or
+-- photos, and never trips still to come or still going, which would say
+-- when someone is away from home.
+
+-- public_page, whether signed-out visitors may see a page at all, is added
+-- in part 4 above, where outings first need it.
+
+create table if not exists public.shared_trips (
+  user_id    uuid         not null references auth.users (id) on delete cascade,
+  trip_id    text         not null check (char_length(trip_id) between 1 and 100),
+  title      text         not null check (char_length(title) between 1 and 200),
+  start_date date         not null,
+  end_date   date         check (end_date is null or end_date >= start_date),
+  rating     numeric(2,1) check (rating is null or (rating between 0.5 and 5 and rating * 2 = trunc(rating * 2))),
+  highlight  text         not null default '' check (char_length(highlight) <= 300),
+  stops      jsonb        not null default '[]'::jsonb check (jsonb_typeof(stops) = 'array' and jsonb_array_length(stops) <= 50),
+  updated_at timestamptz  not null default now(),
+  primary key (user_id, trip_id)
+);
+alter table public.shared_trips add column if not exists created_at timestamptz not null default now();
+alter table public.shared_trips enable row level security;
+revoke all on public.shared_trips from anon, authenticated;
+
+-- Replaces the trips this person shows with the set given: an array of
+-- { trip_id, title, start, end, rating, highlight, stops: [{ name, lat, lng,
+-- country, state }] }. Nothing is kept while their trips are set to Only me.
+-- Anything malformed or still to come is left out. Answers with how many
+-- were kept.
+create or replace function public.sync_trips(items jsonb) returns integer
+language plpgsql security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  vis text;
+  it jsonb;
+  st jsonb;
+  stops jsonb;
+  tid text;
+  keep text[] := '{}';
+  kept integer;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  select coalesce(visibility ->> 'trips', 'me') into vis from public.profiles where id = me;
+  if vis is null then raise exception 'Choose a username first'; end if;
+  if jsonb_typeof(items) is distinct from 'array' then raise exception 'Expected a list'; end if;
+  if jsonb_array_length(items) > 1000 then raise exception 'Too many to share at once'; end if;
+  if vis = 'me' then
+    delete from public.shared_trips where user_id = me;
+    return 0;
+  end if;
+  -- Updated where they are, as outings are, so each keeps when it was first shown.
+  for it in select value from jsonb_array_elements(items) loop
+    begin
+      -- Only trips that are over: one still going says its owner is away now.
+      if jsonb_typeof(it) <> 'object' or coalesce((it ->> 'end')::date, (it ->> 'start')::date) >= current_date then continue; end if;
+      tid := it ->> 'trip_id';
+      if tid is null or tid = any(keep) then continue; end if;
+      stops := '[]'::jsonb;
+      for st in select value from jsonb_array_elements(case when jsonb_typeof(it -> 'stops') = 'array' then it -> 'stops' else '[]'::jsonb end) limit 50 loop
+        if jsonb_typeof(st) = 'object' and (st ->> 'lat')::float8 between -90 and 90 and (st ->> 'lng')::float8 between -180 and 180 then
+          stops := stops || jsonb_build_array(jsonb_build_object(
+            'name', left(coalesce(st ->> 'name', ''), 200),
+            'lat', round((st ->> 'lat')::numeric, 2), 'lng', round((st ->> 'lng')::numeric, 2),
+            'country', left(coalesce(st ->> 'country', ''), 100), 'state', left(coalesce(st ->> 'state', ''), 100)));
+        end if;
+      end loop;
+      insert into public.shared_trips as t (user_id, trip_id, title, start_date, end_date, rating, highlight, stops)
+        values (me, tid, btrim(it ->> 'title'), (it ->> 'start')::date, (it ->> 'end')::date,
+                (it ->> 'rating')::numeric, left(btrim(coalesce(it ->> 'highlight', '')), 300), stops)
+        on conflict (user_id, trip_id) do update set
+          title = excluded.title, start_date = excluded.start_date, end_date = excluded.end_date, rating = excluded.rating,
+          highlight = excluded.highlight, stops = excluded.stops,
+          updated_at = case when (t.title, t.start_date, t.end_date, t.rating, t.highlight, t.stops)
+            is distinct from (excluded.title, excluded.start_date, excluded.end_date, excluded.rating, excluded.highlight, excluded.stops)
+            then now() else t.updated_at end;
+      keep := keep || tid;
+    exception when others then
+      null; -- this one is left out (and taken down, if it was there); the rest still go
+    end;
+  end loop;
+  delete from public.shared_trips where user_id = me and not (trip_id = any(keep));
+  select count(*) into kept from public.shared_trips where user_id = me;
+  return kept;
+end $$;
+
+-- One person's page, for anyone: their profile as this viewer may see it,
+-- the years with anything in them, and the trips and outings this viewer may
+-- see (all of them, or one year's). A signed-out visitor gets only the name
+-- and username, with hidden set, unless the page is public. Nothing across a
+-- block, and nothing for a username nobody has.
+create or replace function public.public_profile(uname text, p_year integer default null) returns jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  p public.profiles;
+  rel text;
+  tv text;
+  see_trips boolean;
+begin
+  select * into p from public.profiles where username = lower(ltrim(btrim(coalesce(uname, '')), '@'));
+  if p.id is null or public.is_blocked(p.id, me) then return null; end if;
+  if me is null and not p.public_page then
+    return jsonb_build_object('profile', jsonb_build_object('username', p.username, 'display_name', p.display_name), 'hidden', true);
+  end if;
+  rel := public.relation_to(p.id, me);
+  tv := coalesce(p.visibility ->> 'trips', 'me');
+  see_trips := rel = 'self' or tv = 'everyone' or (tv = 'friends' and rel = 'friends');
+  return jsonb_build_object(
+    'profile', public.profile_for(p, me),
+    'hidden', false,
+    'year', p_year,
+    'years', coalesce((
+      select jsonb_agg(y order by y desc) from (
+        select distinct extract(year from o.on_date)::integer as y from public.outings o
+          where o.user_id = p.id and public.can_see_outing(o.user_id, o.visibility, me)
+        union
+        select distinct extract(year from t.start_date)::integer from public.shared_trips t
+          where t.user_id = p.id and see_trips
+      ) ys
+    ), '[]'::jsonb),
+    'trips', case when not see_trips then '[]'::jsonb else coalesce((
+      select jsonb_agg(x.j order by x.start_date desc) from (
+        select t.start_date, jsonb_build_object('id', t.trip_id, 'title', t.title, 'start', t.start_date, 'end', t.end_date,
+          'rating', t.rating, 'highlight', t.highlight, 'stops', t.stops) || public.post_counts(p.id, 'trip', t.trip_id, me) as j
+        from public.shared_trips t
+        where t.user_id = p.id and (p_year is null
+          or p_year between extract(year from t.start_date) and extract(year from coalesce(t.end_date, t.start_date)))
+        order by t.start_date desc limit 500
+      ) x
+    ), '[]'::jsonb) end,
+    'outings', coalesce((
+      select jsonb_agg(x.j order by x.on_date desc) from (
+        select o.on_date, jsonb_build_object('id', o.event_id, 'kind', o.kind, 'title', o.title, 'date', o.on_date, 'rating', o.rating,
+          'review', o.review, 'links', coalesce((
+            select jsonb_agg(public.catalog_entry(c) order by c.kind, c.name)
+            from public.outing_links l join public.catalog c on c.id = l.catalog_id
+            where l.user_id = o.user_id and l.event_id = o.event_id
+          ), '[]'::jsonb)) || public.post_counts(o.user_id, 'outing', o.event_id, me) as j
+        from public.outings o
+        where o.user_id = p.id and public.can_see_outing(o.user_id, o.visibility, me)
+          and (p_year is null or extract(year from o.on_date) = p_year)
+        order by o.on_date desc limit 200
+      ) x
+    ), '[]'::jsonb)
+  );
+end $$;
+
+revoke all on function public.sync_trips(jsonb) from public, anon;
+revoke all on function public.public_profile(text, integer) from public;
+grant execute on function public.sync_trips(jsonb) to authenticated;
+grant execute on function public.public_profile(text, integer) to anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Part 6: the friends feed. What your friends have been to and where they
+-- have been, newest first by when each was first shared: their outings
+-- (whether set to Everyone or Friends, since you are a friend) and the trips
+-- they show to friends or everyone. Never anyone who is not a friend, and
+-- friendship already ends at a block.
+--
+-- Many things can be shared at the same moment (someone linking a year of
+-- concerts at once), so the order is by that moment and then by id, and a
+-- page carries on from the last item seen: (p_before_at, p_before_id).
+
+create index if not exists outings_created on public.outings (user_id, created_at desc);
+create index if not exists shared_trips_created on public.shared_trips (user_id, created_at desc);
+
+create or replace function public.friend_feed(p_before_at timestamptz default null, p_before_id text default null, lim integer default 30)
+returns setof jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  n integer := least(greatest(coalesce(lim, 30), 1), 100);
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  return query
+    with friends as (
+      select case when f.requester = me then f.addressee else f.requester end as id
+      from public.friendships f
+      where f.status = 'accepted' and me in (f.requester, f.addressee)
+    ), items as (
+      select o.created_at as at, o.user_id::text || ':o:' || o.event_id as id, jsonb_build_object(
+        'type', 'outing', 'kind', o.kind, 'title', o.title, 'date', o.on_date, 'rating', o.rating, 'review', o.review,
+        'links', coalesce((
+          select jsonb_agg(public.catalog_entry(c) order by c.kind, c.name)
+          from public.outing_links l join public.catalog c on c.id = l.catalog_id
+          where l.user_id = o.user_id and l.event_id = o.event_id
+        ), '[]'::jsonb)) || public.post_counts(o.user_id, 'outing', o.event_id, me) as body, o.user_id
+      from public.outings o join friends fr on fr.id = o.user_id
+      union all
+      select t.created_at, t.user_id::text || ':t:' || t.trip_id, jsonb_build_object(
+        'type', 'trip', 'title', t.title, 'start', t.start_date, 'end', t.end_date, 'rating', t.rating,
+        'highlight', t.highlight, 'stops', t.stops) || public.post_counts(t.user_id, 'trip', t.trip_id, me), t.user_id
+      from public.shared_trips t join friends fr on fr.id = t.user_id
+      join public.profiles tp on tp.id = t.user_id
+      where coalesce(tp.visibility ->> 'trips', 'me') in ('everyone', 'friends')
+    )
+    select i.body || jsonb_build_object('id', i.id, 'at', i.at,
+      'by', jsonb_build_object('username', p.username, 'display_name', p.display_name))
+    from items i join public.profiles p on p.id = i.user_id
+    where p_before_at is null or (i.at, i.id) < (p_before_at, coalesce(p_before_id, ''))
+    order by i.at desc, i.id desc
+    limit n;
+end $$;
+revoke all on function public.friend_feed(timestamptz, text, integer) from public, anon;
+grant execute on function public.friend_feed(timestamptz, text, integer) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Part 7: likes and comments. Anyone signed in who may see an outing or a
+-- shown trip can like it and comment on it. They belong to the post: when
+-- it is taken down (set to Only me, deleted, or its trips hidden) its likes
+-- and comments go with it. Someone blocked, either way, is not counted and
+-- their comments are not shown. Signed-out visitors see the counts only.
+
+create table if not exists public.post_likes (
+  owner      uuid        not null references auth.users (id) on delete cascade,
+  kind       text        not null check (kind in ('outing', 'trip')),
+  ref        text        not null check (char_length(ref) between 1 and 100),
+  liker      uuid        not null references auth.users (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  event_id   text generated always as (case when kind = 'outing' then ref end) stored,
+  trip_id    text generated always as (case when kind = 'trip' then ref end) stored,
+  primary key (owner, kind, ref, liker),
+  foreign key (owner, event_id) references public.outings (user_id, event_id) on delete cascade,
+  foreign key (owner, trip_id) references public.shared_trips (user_id, trip_id) on delete cascade
+);
+
+create table if not exists public.post_comments (
+  id         uuid        primary key default gen_random_uuid(),
+  owner      uuid        not null references auth.users (id) on delete cascade,
+  kind       text        not null check (kind in ('outing', 'trip')),
+  ref        text        not null check (char_length(ref) between 1 and 100),
+  author     uuid        not null references auth.users (id) on delete cascade,
+  body       text        not null check (char_length(body) between 1 and 1000),
+  created_at timestamptz not null default now(),
+  event_id   text generated always as (case when kind = 'outing' then ref end) stored,
+  trip_id    text generated always as (case when kind = 'trip' then ref end) stored,
+  foreign key (owner, event_id) references public.outings (user_id, event_id) on delete cascade,
+  foreign key (owner, trip_id) references public.shared_trips (user_id, trip_id) on delete cascade
+);
+create index if not exists post_comments_post on public.post_comments (owner, kind, ref, created_at);
+create index if not exists post_likes_owner on public.post_likes (owner, created_at desc);
+create index if not exists post_comments_owner on public.post_comments (owner, created_at desc);
+
+alter table public.post_likes enable row level security;
+alter table public.post_comments enable row level security;
+revoke all on public.post_likes from anon, authenticated;
+revoke all on public.post_comments from anon, authenticated;
+
+-- Whether this viewer may see a post: an outing by the outings' rule, a trip
+-- by its owner's trips setting (and, for a signed-out viewer, an open page).
+create or replace function public.can_see_post(p_owner uuid, p_kind text, p_ref text, viewer uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select case p_kind
+    when 'outing' then exists (select 1 from public.outings o
+      where o.user_id = p_owner and o.event_id = p_ref and public.can_see_outing(o.user_id, o.visibility, viewer))
+    when 'trip' then exists (select 1 from public.shared_trips t join public.profiles p on p.id = t.user_id
+      where t.user_id = p_owner and t.trip_id = p_ref and (
+        coalesce(p_owner = viewer, false)
+        or (not public.is_blocked(p_owner, viewer) and (
+          (coalesce(p.visibility ->> 'trips', 'me') = 'everyone' and (viewer is not null or p.public_page))
+          or (coalesce(p.visibility ->> 'trips', 'me') = 'friends' and viewer is not null and public.are_friends(p_owner, viewer))))))
+    else false
+  end;
+$$;
+
+-- What every post carries: whose it is and which, how many likes and
+-- comments (leaving out anyone blocked either way), and whether this viewer
+-- liked it.
+create or replace function public.post_counts(p_owner uuid, p_kind text, p_ref text, viewer uuid) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select jsonb_build_object(
+    'owner', p_owner, 'post', p_kind, 'ref', p_ref,
+    'likes', (select count(*) from public.post_likes l
+      where l.owner = p_owner and l.kind = p_kind and l.ref = p_ref and not public.is_blocked(l.liker, viewer)),
+    'liked', viewer is not null and exists (select 1 from public.post_likes l
+      where l.owner = p_owner and l.kind = p_kind and l.ref = p_ref and l.liker = viewer),
+    'comments', (select count(*) from public.post_comments c
+      where c.owner = p_owner and c.kind = p_kind and c.ref = p_ref and not public.is_blocked(c.author, viewer)));
+$$;
+revoke all on function public.can_see_post(uuid, text, text, uuid) from public, anon, authenticated;
+revoke all on function public.post_counts(uuid, text, text, uuid) from public, anon, authenticated;
+
+create or replace function public.like_post(p_owner uuid, p_kind text, p_ref text, p_on boolean default true) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare me uuid := auth.uid();
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if not public.can_see_post(p_owner, p_kind, p_ref, me) then raise exception 'That is not there any more'; end if;
+  if p_on then
+    insert into public.post_likes (owner, kind, ref, liker) values (p_owner, p_kind, p_ref, me) on conflict do nothing;
+  else
+    delete from public.post_likes where owner = p_owner and kind = p_kind and ref = p_ref and liker = me;
+  end if;
+  return public.post_counts(p_owner, p_kind, p_ref, me);
+end $$;
+
+-- A comment as it is handed out.
+create or replace function public.comment_for(c public.post_comments, viewer uuid) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select jsonb_build_object('id', c.id, 'body', c.body, 'at', c.created_at,
+    'by', jsonb_build_object('username', p.username, 'display_name', p.display_name),
+    'mine', c.author = viewer, 'can_delete', c.author = viewer or c.owner = viewer)
+  from public.profiles p where p.id = c.author;
+$$;
+revoke all on function public.comment_for(public.post_comments, uuid) from public, anon, authenticated;
+
+create or replace function public.comment_post(p_owner uuid, p_kind text, p_ref text, p_body text) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  b text := btrim(coalesce(p_body, ''));
+  c public.post_comments;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if not exists (select 1 from public.profiles where id = me) then raise exception 'Choose a username first'; end if;
+  if char_length(b) not between 1 and 1000 then raise exception 'A comment is 1 to 1000 characters'; end if;
+  if not public.can_see_post(p_owner, p_kind, p_ref, me) then raise exception 'That is not there any more'; end if;
+  if (select count(*) from public.post_comments where author = me and created_at > now() - interval '1 hour') >= 60 then
+    raise exception 'That is a lot of comments. Try again in a while.';
+  end if;
+  insert into public.post_comments (owner, kind, ref, author, body) values (p_owner, p_kind, p_ref, me, b) returning * into c;
+  return public.comment_for(c, me);
+end $$;
+
+-- The comment's author, or the post's owner, can take a comment down.
+create or replace function public.delete_comment(p_id uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+begin
+  if auth.uid() is null then raise exception 'Not signed in'; end if;
+  delete from public.post_comments where id = p_id and auth.uid() in (author, owner);
+end $$;
+
+-- One post's likes (who, as far as this viewer may see) and comments, oldest
+-- first. Signed in only: a comment is written for people in Orbit.
+create or replace function public.post_thread(p_owner uuid, p_kind text, p_ref text) returns jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare me uuid := auth.uid();
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if not public.can_see_post(p_owner, p_kind, p_ref, me) then return null; end if;
+  return public.post_counts(p_owner, p_kind, p_ref, me) || jsonb_build_object(
+    'likers', coalesce((
+      select jsonb_agg(jsonb_build_object('username', p.username, 'display_name', p.display_name) order by l.created_at desc)
+      from (select * from public.post_likes where owner = p_owner and kind = p_kind and ref = p_ref order by created_at desc limit 50) l
+      join public.profiles p on p.id = l.liker
+      where not public.is_blocked(l.liker, me)
+    ), '[]'::jsonb),
+    'thread', coalesce((
+      select jsonb_agg(public.comment_for(c, me) order by c.created_at)
+      from (select * from public.post_comments where owner = p_owner and kind = p_kind and ref = p_ref order by created_at limit 200) c
+      where not public.is_blocked(c.author, me)
+    ), '[]'::jsonb));
+end $$;
+
+revoke all on function public.like_post(uuid, text, text, boolean) from public, anon;
+revoke all on function public.comment_post(uuid, text, text, text) from public, anon;
+revoke all on function public.delete_comment(uuid) from public, anon;
+revoke all on function public.post_thread(uuid, text, text) from public, anon;
+grant execute on function public.like_post(uuid, text, text, boolean) to authenticated;
+grant execute on function public.comment_post(uuid, text, text, text) to authenticated;
+grant execute on function public.delete_comment(uuid) to authenticated;
+grant execute on function public.post_thread(uuid, text, text) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Part 8: usage counts. Which parts of Orbit people use, so what gets built
+-- next (and what could be worth paying for) follows what people do. Each row
+-- is one action by name ("event.add", "view.open") with a few small details
+-- ("kind": "Concert", "rated": true). Never anything anyone wrote: no names,
+-- titles, notes or places. Signed-in people can turn it off
+-- (profiles.share_usage), and the server then keeps nothing from them.
+-- Signed-out visitors to public pages are counted by a random id for their
+-- visit only. Deleting an account deletes its rows.
+--
+-- Nobody reads the rows directly. The people listed in usage_admins (added
+-- by hand, below) can ask for the report, which is counts only.
+
+alter table public.profiles add column if not exists share_usage boolean not null default true;
+
+create table if not exists public.usage_events (
+  id      bigint      generated always as identity primary key,
+  user_id uuid        references auth.users (id) on delete cascade,
+  session text        not null check (char_length(session) between 8 and 64),
+  name    text        not null check (char_length(name) <= 60 and name ~ '^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,3}$'),
+  props   jsonb       not null default '{}'::jsonb check (jsonb_typeof(props) = 'object' and pg_column_size(props) <= 2000),
+  at      timestamptz not null default now()
+);
+create index if not exists usage_events_at on public.usage_events (at);
+create index if not exists usage_events_user on public.usage_events (user_id, at);
+create index if not exists usage_events_name on public.usage_events (name, at);
+alter table public.usage_events enable row level security;
+revoke all on public.usage_events from anon, authenticated;
+
+create table if not exists public.usage_admins (
+  user_id uuid primary key references auth.users (id) on delete cascade
+);
+alter table public.usage_admins enable row level security;
+revoke all on public.usage_admins from anon, authenticated;
+-- To see the report, add yourself once, by username, in the SQL Editor:
+--   insert into public.usage_admins select id from public.profiles where username = 'yourname';
+
+-- Keeps a batch of actions: at most 50, each a known shape, with at most 12
+-- details, each a short text, a number or true/false. ago_ms says how long ago
+-- it happened (up to an hour), so the server's clock is the one that counts.
+create or replace function public.track_usage(events jsonb, p_session text) returns integer
+language plpgsql security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  e jsonb;
+  k text;
+  v jsonb;
+  clean jsonb;
+  n integer := 0;
+  sess text := left(coalesce(p_session, ''), 64);
+begin
+  if me is not null and exists (select 1 from public.profiles where id = me and not share_usage) then return 0; end if;
+  if jsonb_typeof(events) is distinct from 'array' or char_length(sess) < 8 then return 0; end if;
+  for e in select value from jsonb_array_elements(events) limit 50 loop
+    begin
+      if jsonb_typeof(e) <> 'object' then continue; end if;
+      clean := '{}'::jsonb;
+      for k, v in select * from jsonb_each(case when jsonb_typeof(e -> 'props') = 'object' then e -> 'props' else '{}'::jsonb end) limit 12 loop
+        if k ~ '^[a-z][a-z0-9_]{0,29}$' then
+          if jsonb_typeof(v) = 'string' then clean := clean || jsonb_build_object(k, left(v #>> '{}', 100));
+          elsif jsonb_typeof(v) in ('number', 'boolean') then clean := clean || jsonb_build_object(k, v);
+          end if;
+        end if;
+      end loop;
+      insert into public.usage_events (user_id, session, name, props, at)
+        values (me, sess, e ->> 'name', clean,
+                now() - make_interval(secs => least(greatest(coalesce((e ->> 'ago_ms')::numeric, 0), 0), 3600000) / 1000.0));
+      n := n + 1;
+    exception when others then
+      null; -- a malformed one is left out
+    end;
+  end loop;
+  return n;
+end $$;
+revoke all on function public.track_usage(jsonb, text) from public;
+grant execute on function public.track_usage(jsonb, text) to anon, authenticated;
+
+create or replace function public.is_usage_admin() returns boolean
+language sql stable security definer set search_path = '' as $$
+  select exists (select 1 from public.usage_admins where user_id = auth.uid());
+$$;
+revoke all on function public.is_usage_admin() from public, anon;
+grant execute on function public.is_usage_admin() to authenticated;
+
+-- The report, for the last p_days days (1 to 365), counts only:
+--   totals   people, new, active today / 7 days / window, visits from signed-out people
+--   daily    per day: active people, new people, actions
+--   areas    each part of the app (the name before the first dot): actions,
+--            people using it, and the share of active people who did
+--   actions  each action: how often, and by how many people
+--   views    which tabs people open
+--   depth    how many days in the window people were active on, in buckets
+--   heavy    per part of the app, the share of heavy users (active 8 or more
+--            days) and of light users who used it: what the most engaged rely on
+--   cohorts  people by the week they joined, and how many came back 1-7,
+--            8-14 and 22-28 days later
+--   devices  opens by phone or computer, and from the Home Screen or not
+--   public   public page views, join clicks from them, and sign-ups
+create or replace function public.usage_report(p_days integer default 30) returns jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  d integer := least(greatest(coalesce(p_days, 30), 1), 365);
+  since timestamptz := date_trunc('day', now()) - make_interval(days => d - 1);
+begin
+  if not public.is_usage_admin() then raise exception 'Only for Orbit''s team'; end if;
+  return (
+    with ev as (select * from public.usage_events where at >= since),
+    signed as (select * from ev where user_id is not null),
+    active as (select distinct user_id from signed),
+    days as (select user_id, count(distinct date_trunc('day', at)) as n from signed group by user_id),
+    heavy as (select user_id from days where n >= 8),
+    light as (select user_id from days where n < 8),
+    areas as (select split_part(name, '.', 1) as area, user_id, count(*) as n from signed group by 1, 2)
+    select jsonb_build_object(
+      'days', d,
+      'totals', jsonb_build_object(
+        'people', (select count(*) from public.profiles),
+        'joined', (select count(*) from public.profiles where created_at >= since),
+        'active_today', (select count(distinct user_id) from signed where at >= date_trunc('day', now())),
+        'active_week', (select count(distinct user_id) from signed where at >= date_trunc('day', now()) - interval '6 days'),
+        'active', (select count(*) from active),
+        'visits', (select count(distinct session) from ev where user_id is null)),
+      'daily', (
+        select jsonb_agg(jsonb_build_object('day', g.day::date,
+          'active', (select count(distinct user_id) from signed s where date_trunc('day', s.at) = g.day),
+          'joined', (select count(*) from public.profiles p where date_trunc('day', p.created_at) = g.day),
+          'actions', (select count(*) from ev e where date_trunc('day', e.at) = g.day)) order by g.day)
+        from generate_series(date_trunc('day', since), date_trunc('day', now()), interval '1 day') as g(day)),
+      'areas', coalesce((
+        select jsonb_agg(jsonb_build_object('area', a.area, 'actions', a.actions, 'people', a.people,
+          'share', round(100.0 * a.people / greatest((select count(*) from active), 1))) order by a.people desc, a.actions desc)
+        from (select area, sum(n) as actions, count(distinct user_id) as people from areas group by area) a), '[]'::jsonb),
+      'actions', coalesce((
+        select jsonb_agg(jsonb_build_object('name', x.name, 'count', x.c, 'people', x.p) order by x.c desc)
+        from (select name, count(*) as c, count(distinct coalesce(user_id::text, session)) as p from ev group by name order by count(*) desc limit 80) x), '[]'::jsonb),
+      'views', coalesce((
+        select jsonb_agg(jsonb_build_object('view', x.v, 'count', x.c, 'people', x.p) order by x.c desc)
+        from (select props ->> 'view' as v, count(*) as c, count(distinct user_id) as p from signed where name = 'view.open' group by 1) x), '[]'::jsonb),
+      'depth', (
+        select jsonb_build_object(
+          '1', count(*) filter (where n = 1), '2-3', count(*) filter (where n between 2 and 3),
+          '4-7', count(*) filter (where n between 4 and 7), '8-14', count(*) filter (where n between 8 and 14),
+          '15+', count(*) filter (where n >= 15))
+        from days),
+      'heavy', jsonb_build_object(
+        'heavy_people', (select count(*) from heavy), 'light_people', (select count(*) from light),
+        'areas', coalesce((
+          select jsonb_agg(jsonb_build_object('area', x.area,
+            'heavy', round(100.0 * x.h / greatest((select count(*) from heavy), 1)),
+            'light', round(100.0 * x.l / greatest((select count(*) from light), 1))) order by x.h desc, x.l desc)
+          from (select area,
+            count(distinct user_id) filter (where user_id in (select user_id from heavy)) as h,
+            count(distinct user_id) filter (where user_id in (select user_id from light)) as l
+            from areas group by area) x), '[]'::jsonb)),
+      'cohorts', coalesce((
+        select jsonb_agg(jsonb_build_object('week', c.week::date, 'joined', c.joined, 'week1', c.w1, 'week2', c.w2, 'week4', c.w4) order by c.week desc)
+        from (
+          select date_trunc('week', p.created_at) as week, count(*) as joined,
+            count(*) filter (where exists (select 1 from public.usage_events u where u.user_id = p.id
+              and u.at >= p.created_at + interval '1 day' and u.at < p.created_at + interval '8 days')) as w1,
+            count(*) filter (where exists (select 1 from public.usage_events u where u.user_id = p.id
+              and u.at >= p.created_at + interval '8 days' and u.at < p.created_at + interval '15 days')) as w2,
+            count(*) filter (where exists (select 1 from public.usage_events u where u.user_id = p.id
+              and u.at >= p.created_at + interval '22 days' and u.at < p.created_at + interval '29 days')) as w4
+          from public.profiles p
+          where p.created_at >= date_trunc('week', now()) - interval '7 weeks'
+          group by 1
+        ) c), '[]'::jsonb),
+      'devices', coalesce((
+        select jsonb_agg(jsonb_build_object('device', x.dev, 'installed', x.inst, 'opens', x.c) order by x.c desc)
+        from (select coalesce(props ->> 'device', '?') as dev, coalesce((props ->> 'installed')::boolean, false) as inst, count(*) as c
+          from ev where name = 'app.open' group by 1, 2) x), '[]'::jsonb),
+      'public', jsonb_build_object(
+        'views', (select count(*) from ev where name = 'page.view'),
+        'visitors', (select count(distinct session) from ev where name = 'page.view' and user_id is null),
+        'join_clicks', (select count(*) from ev where name = 'page.join'),
+        'joined', (select count(*) from public.profiles where created_at >= since))
+    )
+  );
+end $$;
+revoke all on function public.usage_report(integer) from public, anon;
+grant execute on function public.usage_report(integer) to authenticated;
 
 -- Tell the API about the table now. Without this it can briefly answer
 -- "Could not find the table 'public.orbit_data' in the schema cache".
