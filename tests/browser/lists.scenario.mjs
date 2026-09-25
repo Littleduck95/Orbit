@@ -279,6 +279,10 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
   check('your own list leaves the name for you', (await page.getByLabel('Name', { exact: true }).inputValue()) === '');
   check('your own list brings its no-stages setup', (await page.getByRole('button', { name: 'No, just a list' }).getAttribute('aria-pressed')) === 'true');
   await page.getByRole('button', { name: 'Change', exact: true }).click();
+  await template('Books').click();
+  check('a built-in template after a plain one turns stages back on', (await page.getByRole('button', { name: 'Yes, in stages' }).getAttribute('aria-pressed')) === 'true'
+    && (await page.getByLabel('Name for the under way stage').inputValue()) === 'Reading');
+  await page.getByRole('button', { name: 'Change', exact: true }).click();
   await page.getByRole('group', { name: 'Your lists' }).getByRole('button', { name: /^Shows to watch / }).click();
   check('your own list brings its stage words', (await page.getByLabel('Name for the finished stage').inputValue()) === 'Watched'
     && (await page.getByRole('button', { name: 'Yes, in stages' }).getAttribute('aria-pressed')) === 'true');

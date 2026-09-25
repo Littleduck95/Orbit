@@ -5191,14 +5191,18 @@ function CollectionForm({ initial, kind: startKind, mine, onSave, onCancel }) {
   // The templates take a lot of room, so once they have done their job they
   // fold down to a line. They start open, unless one was already chosen.
   const [open, setOpen] = useState(blank);
-  const yours = useMemo(() => (initial ? [] : ownTemplates(mine)), [initial, mine]);
+  // Taken once, when the form opens, so a sync landing mid-form cannot take
+  // away the list a new one is being modelled on.
+  const [yours] = useState(() => (initial ? [] : ownTemplates(mine)));
 
   // A template fills in every word it has, whatever was there before, so
   // switching from one to another never leaves the last one's words behind.
   // What the list is for is the owner's own, and no template touches it.
+  // Every built-in template moves through stages, so it turns them on.
   const pickTemplate = (t) => {
     setFrom({ kind: t.kind });
     setKind(t.kind);
+    setTrack(true);
     setName(t.name);
     setLabels({ ...t.labels });
     setDetail(t.detail);
@@ -5219,6 +5223,7 @@ function CollectionForm({ initial, kind: startKind, mine, onSave, onCancel }) {
   const startBlank = () => {
     setFrom(null);
     setKind('Other');
+    setTrack(true);
     setName('');
     setLabels({ ...BLANK_LABELS });
     setDetail('');
@@ -5276,7 +5281,8 @@ function CollectionForm({ initial, kind: startKind, mine, onSave, onCancel }) {
   };
 
   return (
-    <div onPointerDown={() => { pressing.current = true; }} onFocus={foldOnFocus} onClick={foldOnClick}
+    <div onPointerDown={() => { pressing.current = true; }} onPointerCancel={() => { pressing.current = false; }}
+      onFocus={foldOnFocus} onClick={foldOnClick}
       style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
       {/* On a phone the cards would fill the screen, so the same choice is a
           dropdown there, which opens the phone's own picker. */}
