@@ -6,18 +6,20 @@ import path from 'node:path';
 const DANA = { id: 'dana', name: 'Dana Whitfield', circle: 'friend', tier: 'friend', cadence: 30, email: 'dana@example.com', log: [] };
 const SAM = { id: 'sam', name: 'Sam Ortiz', circle: 'friend', tier: 'friend', cadence: 30, log: [] };
 
+const place = (name, label, lat, lng) => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [lng, lat] }, properties: { name, label } });
 const PLACES = {
-  lisbon: [{ name: 'Lisbon', display_name: 'Lisbon, Lisboa, Portugal', lat: '38.7077', lon: '-9.1365' }],
-  porto: [{ name: 'Porto', display_name: 'Porto, Portugal', lat: '41.1496', lon: '-8.6110' }],
+  lisbon: [place('Lisbon', 'Lisbon, Lisboa, Portugal', 38.7077, -9.1365)],
+  porto: [place('Porto', 'Porto, Portugal', 41.1496, -8.6110)],
 };
 
-// Answers place searches from PLACES and remembers when each was asked.
-const fakeNominatim = async (page) => {
+// Answers place searches from PLACES, the way Stadia's autocomplete does, and
+// remembers when each was asked.
+const fakeSearch = async (page) => {
   const asked = [];
-  await page.route('https://nominatim.openstreetmap.org/**', (r) => {
-    const q = new URL(r.request().url()).searchParams.get('q').toLowerCase();
+  await page.route('https://api.stadiamaps.com/geocoding/**', (r) => {
+    const q = new URL(r.request().url()).searchParams.get('text').toLowerCase();
     asked.push({ q, at: Date.now() });
-    r.fulfill({ contentType: 'application/json', body: JSON.stringify(PLACES[q.split(',')[0].trim()] || []) });
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ type: 'FeatureCollection', features: PLACES[q.split(',')[0].trim()] || [] }) });
   });
   return asked;
 };
@@ -56,7 +58,7 @@ export default async function trips({ newPage, check, tab, shots }) {
   const { page, ctx, open, stored, done, url } = await newPage({
     seed: { 'crm-people-v1': [DANA, SAM] },
   });
-  const asked = await fakeNominatim(page);
+  const asked = await fakeSearch(page);
   await open();
 
   // ---- empty ----
@@ -92,11 +94,11 @@ export default async function trips({ newPage, check, tab, shots }) {
   await search.fill('Porto');
   await page.getByRole('option', { name: /Porto/ }).click();
   check('two searches, two stops', await page.getByLabel('Name of place 2').inputValue() === 'Porto');
-  check('searches keep at least a second apart', asked.length === 2 && asked[1].at - asked[0].at >= 950,
+  check('searches keep a gap between them', asked.length === 2 && asked[1].at - asked[0].at >= 290,
     asked.map((a) => a.at - asked[0].at));
 
   // ---- offline search ----
-  await page.route('https://nominatim.openstreetmap.org/**', (r) => r.abort());
+  await page.route('https://api.stadiamaps.com/geocoding/**', (r) => r.abort());
   await search.fill('Faro');
   await page.getByText('Could not reach the place search').waitFor();
   check('a failed search says so and offers the other ways', await page.getByRole('button', { name: 'Try again' }).isVisible());

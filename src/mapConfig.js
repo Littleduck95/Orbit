@@ -8,8 +8,11 @@
  * without one. Commercial use needs a paid Stadia plan.
  *   https://docs.stadiamaps.com/authentication/
  *
- * Search: still OpenStreetMap's free Nominatim, which is only fit for light
- * personal use. https://operations.osmfoundation.org/policies/nominatim/
+ * Search: Stadia's geocoding autocomplete, recognised by domain the same way,
+ * and built for search-as-you-type. Each request uses Stadia credits, so the
+ * app waits for a pause in typing, keeps a small gap between requests and
+ * remembers answers for the visit.
+ *   https://docs.stadiamaps.com/geocoding-search-autocomplete/
  */
 
 const STADIA = 'https://tiles.stadiamaps.com/tiles';
@@ -25,9 +28,9 @@ export const TILE_LAYER = {
 };
 
 export const GEOCODER = {
-  url: 'https://nominatim.openstreetmap.org/search',
-  // Nominatim allows one request a second from any one user, at most.
-  minGapMs: 1000,
+  url: 'https://api.stadiamaps.com/geocoding/v1/autocomplete',
+  // Not a rule of Stadia's: a floor, so a fast typist cannot run up credits.
+  minGapMs: 300,
   limit: 5,
 };
 

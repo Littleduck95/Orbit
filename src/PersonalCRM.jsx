@@ -3524,10 +3524,9 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
 }
 
 /* ---------- place lookup ---------- */
-// Nominatim, OpenStreetMap's free place search. Its usage policy allows one
-// request a second from any one user, so every lookup waits its turn here,
-// however many search boxes are asking. Answers are remembered for the visit,
-// so asking again costs nothing.
+// Stadia Maps' place search (see mapConfig.js). Every lookup waits its turn
+// here, however many search boxes are asking, and answers are remembered for
+// the visit, so asking again costs nothing.
 const placeCache = new Map();
 let placeNext = 0;
 
@@ -3538,8 +3537,8 @@ const pause = (ms, signal) => new Promise((resolve, reject) => {
   signal?.addEventListener('abort', () => { clearTimeout(t); stop(); }, { once: true });
 });
 
-// A short name for a place: Nominatim's own, or the first part of its address.
-const placeName = (r) => clip(r?.name, 200) || clip(String(r?.display_name || '').split(',')[0], 200);
+// A short name for a place: the search's own, or the first part of its address.
+const placeName = (p) => clip(p?.name, 200) || clip(String(p?.label || '').split(',')[0], 200);
 
 // -> { status: 'ok' | 'none' | 'offline' | 'aborted', results: [{ label, name, lat, lon }] }
 const searchPlaces = async (raw, { signal } = {}) => {
@@ -3553,14 +3552,20 @@ const searchPlaces = async (raw, { signal } = {}) => {
     placeNext = at + GEOCODER.minGapMs;
     if (at > now) await pause(at - now, signal);
     const params = new URLSearchParams({
-      q, format: 'jsonv2', limit: String(GEOCODER.limit),
-      'accept-language': (typeof navigator !== 'undefined' && navigator.language) || 'en',
+      text: q, size: String(GEOCODER.limit),
+      lang: ((typeof navigator !== 'undefined' && navigator.language) || 'en').split('-')[0],
     });
     const res = await fetch(`${GEOCODER.url}?${params}`, { signal, headers: { Accept: 'application/json' } });
     if (!res.ok) return { status: 'offline', results: [] };
     const data = await res.json();
-    const good = (Array.isArray(data) ? data : [])
-      .map((r) => ({ label: clip(r?.display_name, 300), name: placeName(r), lat: Number(r?.lat), lon: Number(r?.lon) }))
+    // GeoJSON: each place is a feature, its point given as [longitude, latitude].
+    const good = (Array.isArray(data?.features) ? data.features : [])
+      .map((f) => ({
+        label: clip(f?.properties?.label, 300),
+        name: placeName(f?.properties),
+        lat: Number(f?.geometry?.coordinates?.[1]),
+        lon: Number(f?.geometry?.coordinates?.[0]),
+      }))
       .filter((r) => r.label && Number.isFinite(r.lat) && Number.isFinite(r.lon)
         && Math.abs(r.lat) <= 90 && Math.abs(r.lon) <= 180);
     const out = good.length ? { status: 'ok', results: good } : { status: 'none', results: [] };
@@ -6455,8 +6460,8 @@ const iconButton = (disabled) => ({
 const labelText = () => ({ display: 'block', fontSize: 13, color: C.muted, marginBottom: 5, fontWeight: 500 });
 
 /* ---------- trips: adding a place ---------- */
-// Type to search. Waits for a pause in typing, and the search itself keeps to
-// Nominatim's one request a second.
+// Type to search. Waits for a pause in typing, and the search itself keeps a
+// small gap between requests (see searchPlaces).
 // initial: something to search for straight away, such as a Places list entry.
 function PlaceSearch({ onPick, initial = '' }) {
   const [q, setQ] = useState(initial);
@@ -6514,7 +6519,7 @@ function PlaceSearch({ onPick, initial = '' }) {
     : found.status === 'none' ? 'No match. Check the spelling, or try just the town or city.'
     : found.status === 'offline' ? 'Could not reach the place search. Check the connection, or pick the spot on the map or enter coordinates instead.'
     : term ? 'Keep typing…'
-    : 'A town, landmark or address. Results come from OpenStreetMap.';
+    : 'A town, landmark or address.';
 
   return (
     <div>

@@ -233,10 +233,10 @@ every trip shown, and with none it shows the world and an offer to add one.
 
 **Adding a stop** works three ways: search by name, tap the map to drop a
 pin and name it, or type the coordinates. Search uses
-[Nominatim](https://nominatim.org), OpenStreetMap's free place search. Its
-policy allows one request a second, so every search in the app waits its
-turn, typing is given a pause before anything is sent, and answers are
-remembered for the visit. The event form's Find button uses the same search.
+[Stadia Maps' autocomplete](https://docs.stadiamaps.com/geocoding-search-autocomplete/),
+recognised by the site's domain like the tiles. Each request uses Stadia
+credits, so typing is given a pause before anything is sent, requests keep at
+least 300 ms apart, and answers are remembered for the visit. The event form's Find button uses the same search.
 
 **Photos** are redrawn on a canvas before they are kept: at most 1600 pixels
 on the long edge, as JPEG at 0.8 quality, with a separate thumbnail of about
@@ -476,9 +476,10 @@ site by its domain, set on the property in the Stadia dashboard, so no key is
 in the code; `localhost` works without one. The free plan is for
 non-commercial use only; a commercial Orbit needs a paid plan.
 
-Place search still comes from `nominatim.openstreetmap.org`, which is free
-and keyless but asks for light use and no search-as-you-type: fine for one
-person's Orbit, but not for an app with many users. Both are entries in
+Place search comes from Stadia too (its geocoding autocomplete), recognised
+by domain the same way. A search costs more credits than a tile, so the app
+waits for a pause in typing, keeps requests at least 300 ms apart and
+remembers answers for the visit. Both are entries in
 [`src/mapConfig.js`](src/mapConfig.js).
 
 When either service cannot be reached, the app says so and keeps working:

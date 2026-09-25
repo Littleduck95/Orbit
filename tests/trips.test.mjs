@@ -288,19 +288,29 @@ describe('place search', () => {
   const realFetch = globalThis.fetch;
   after(() => { globalThis.fetch = realFetch; });
 
-  it('asks Nominatim, keeps a second between requests, and remembers answers', async () => {
+  it('asks Stadia, keeps a gap between requests, and remembers answers', async () => {
     const asked = [];
     globalThis.fetch = async (url) => {
       asked.push({ url: String(url), at: performance.now() });
-      return { ok: true, json: async () => [{ name: 'Porto', display_name: 'Porto, Portugal', lat: '41.1', lon: '-8.6' }, { lat: 'x' }] };
+      return {
+        ok: true,
+        json: async () => ({
+          type: 'FeatureCollection',
+          features: [
+            { type: 'Feature', geometry: { type: 'Point', coordinates: [-8.6, 41.1] }, properties: { name: 'Porto', label: 'Porto, Portugal' } },
+            { type: 'Feature', geometry: { type: 'Point', coordinates: ['x', 1] }, properties: { name: 'Broken', label: 'Broken' } },
+          ],
+        }),
+      };
     };
     const a = await A.searchPlaces('Porto one');
     const b = await A.searchPlaces('Porto two');
     const c = await A.searchPlaces('porto ONE');
     assert.equal(asked.length, 2, 'the repeated search is answered from memory');
-    assert.ok(asked[0].url.startsWith('https://nominatim.openstreetmap.org/search?'));
-    assert.ok(asked[0].url.includes('format=jsonv2'));
-    assert.ok(asked[1].at - asked[0].at >= 990, `requests ${asked[1].at - asked[0].at}ms apart`);
+    assert.ok(asked[0].url.startsWith('https://api.stadiamaps.com/geocoding/v1/autocomplete?'));
+    assert.ok(asked[0].url.includes('text=Porto+one') && asked[0].url.includes('size=5'), asked[0].url);
+    assert.ok(!/api_key/.test(asked[0].url), 'no key: the site is recognised by its domain');
+    assert.ok(asked[1].at - asked[0].at >= 290, `requests ${asked[1].at - asked[0].at}ms apart`);
     assert.deepEqual(a, { status: 'ok', results: [{ label: 'Porto, Portugal', name: 'Porto', lat: 41.1, lon: -8.6 }] });
     assert.deepEqual(b, a);
     assert.equal(c, a);
@@ -311,7 +321,7 @@ describe('place search', () => {
     assert.equal((await A.searchPlaces('Nowhere at all')).status, 'offline');
     globalThis.fetch = async () => ({ ok: false, status: 429 });
     assert.equal((await A.searchPlaces('Too many')).status, 'offline');
-    globalThis.fetch = async () => ({ ok: true, json: async () => [] });
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ type: 'FeatureCollection', features: [] }) });
     assert.equal((await A.searchPlaces('Xyzzy')).status, 'none');
   });
 });
