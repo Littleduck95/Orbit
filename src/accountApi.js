@@ -270,9 +270,25 @@ const postApi = (client) => ({
 export const catalogApi = (client) => ({
   ...postApi(client),
   search: async (q, kind = null) => (await catalogRpc(client, 'catalog_search', { q, p_kind: kind })) || [],
-  add: (entry) => catalogRpc(client, 'catalog_add', {
-    p_kind: entry.kind, p_name: entry.name, p_about: entry.about || '', p_source: entry.source, p_source_id: entry.source_id || null,
-  }),
+  // Made in Orbit: straight to the database. From Wikidata: through the
+  // catalog service, which names it as Wikidata does, whatever this sends
+  // (supabase/functions/catalog).
+  add: async (entry) => {
+    if (entry.source !== 'wikidata') {
+      return catalogRpc(client, 'catalog_add', {
+        p_kind: entry.kind, p_name: entry.name, p_about: entry.about || '', p_source: entry.source, p_source_id: entry.source_id || null,
+      });
+    }
+    const lang = ((typeof navigator !== 'undefined' && navigator.language) || 'en').split('-')[0].toLowerCase();
+    const { data, error } = await client.functions.invoke('catalog', { body: { kind: entry.kind, id: entry.source_id, lang } });
+    if (!error) return data;
+    const res = error.context;
+    const said = res && typeof res.json === 'function' ? await res.json().catch(() => null) : null;
+    if (said?.error) throw new Error(said.error);
+    throw new Error(res?.status === 404
+      ? 'Linking from Wikidata is not set up on the server yet. Add it yourself instead.'
+      : 'Wikidata could not be reached. Try again, or add it yourself.');
+  },
   page: (id) => catalogRpc(client, 'catalog_page', { p_id: id }),
   sync: (items) => catalogRpc(client, 'sync_outings', { items }),
   syncTrips: (items) => catalogRpc(client, 'sync_trips', { items }),

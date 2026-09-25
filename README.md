@@ -30,7 +30,7 @@ Then open http://localhost:5173.
 | `npm run test:browser` | Drives the real app in Chromium; needs Playwright installed |
 | `npm run test:account` | Drives sign-in in Chromium against a stand-in for Supabase; needs Playwright |
 | `npm run test:db` | Runs `supabase/schema.sql` on a throwaway PostgreSQL and checks its security rules; needs PostgreSQL installed |
-| `npm run test:notify` | Tests the notify function under Deno (fetched by npx), including a real encrypted push |
+| `npm run test:notify` | Tests the notify and catalog functions under Deno (fetched by npx), including a real encrypted push |
 
 The tests are characterization tests: they pin down what the app does today,
 with the clock, timezone and locale fixed so dates are repeatable. Checks whose
@@ -411,7 +411,18 @@ have yet (disambiguation pages left out), and last offers *Add "…"* for the
 local band or the high school game Wikidata has never heard of. Picking a
 Wikidata match adds it to the catalog; its item id (Q and digits) keeps it
 the same entry for everyone. One made in Orbit is matched by its kind and
-name. Picking a venue fills in *Where* if that was empty.
+name.
+
+**Wikidata items are named by Wikidata, not by the app.** Since the entry is
+shared, an app that could name one could give "Taylor Swift" any name for
+everyone. So the app sends only the item id to Orbit's catalog service
+(`supabase/functions/catalog`), which asks Wikidata for the item's name and
+description (in the app's language, else English) and adds it with the
+service role through `catalog_add_wikidata`, which nothing else can call.
+`catalog_add` refuses Wikidata items outright. Picking an item already in
+the catalog refreshes its name and description from Wikidata, keeping its
+kind. Without the service deployed, picking a Wikidata match says so, and
+*Add "…"* still works. Picking a venue fills in *Where* if that was empty.
 
 **Sharing.** Once an outing has happened, the form has *Your thoughts* beside
 the rating, and *Who sees your rating and thoughts*: **Everyone**,
@@ -444,9 +455,9 @@ reached only through `catalog_add`, `catalog_search`, `catalog_page` and
 `sync_outings`, each of which checks who is asking. Deleting an account
 deletes its outings; entries it added stay, without its name.
 
-*Known limits.* An entry's name and description are whatever its first
-adder's app sent (for Wikidata, what Wikidata said), and anyone signed in
-can add entries. There is no reporting or merging of duplicates yet.
+*Known limits.* Anyone signed in can make entries in Orbit (not from
+Wikidata) with any name, as with anything people write. There is no
+reporting or merging of duplicates yet.
 
 ### Public pages
 
@@ -752,6 +763,15 @@ harmless and left alone so the file stays as it was written:
 - A `useMemo` is flagged for not listing `ofCircle` in its deps. `ofCircle`
   only closes over `people`, which *is* in the dep array, so the memo is
   correct as written.
+
+### Setting up the catalog service
+
+Edge Functions → Deploy a new function → Via Editor. Name it `catalog`,
+paste `supabase/functions/catalog/index.ts`, and deploy. In its settings,
+turn **off** "Enforce JWT verification": it checks the signed-in person
+itself, and the browser's preflight request carries no token. It needs no
+secrets of its own (`APP_URL`, if set for `notify`, goes in the User-Agent
+Wikidata asks for).
 
 ### Setting up notifications
 

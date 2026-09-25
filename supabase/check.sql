@@ -60,6 +60,7 @@ from (values
   (27, 'Part 8: usage counts',                 to_regclass('public.usage_events') is not null
                                                 and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.usage_events')), false)
                                                 and to_regprocedure('public.track_usage(jsonb, text)') is not null
-                                                and to_regprocedure('public.usage_report(integer)') is not null)
+                                                and to_regprocedure('public.usage_report(integer)') is not null),
+  (28, 'Part 4: Wikidata items via the service', to_regprocedure('public.catalog_add_wikidata(text, text, text, text, uuid)') is not null)
 ) as t(n, item, ok)
 order by n;

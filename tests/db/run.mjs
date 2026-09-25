@@ -80,7 +80,7 @@ try {
   };
   const before = report();
   check('the setup check runs on an empty database and reports everything missing',
-    before.length === 27 && before.every(([, st]) => st.startsWith('MISSING')), before);
+    before.length === 28 && before.every(([, st]) => st.startsWith('MISSING')), before);
   // Part 1 alone, as it was merged, before friends existed.
   const partOne = schema.slice(0, schema.indexOf('-- Profiles as others see them.'));
   if (partOne.length < schema.length) {
@@ -94,7 +94,7 @@ try {
   const again = psql(schema);
   check('and runs again without harm, as its header promises', again.ok, again.err);
   const after = report();
-  check('after the whole schema, the setup check says OK to everything', after.length === 27 && after.every(([, st]) => st === 'OK'), after);
+  check('after the whole schema, the setup check says OK to everything', after.length === 28 && after.every(([, st]) => st === 'OK'), after);
 
   // ---- signing up ----
   check('a password sign-up makes the profile in the same step',
@@ -253,13 +253,29 @@ try {
   for (const fn of ["catalog_search('ch')", "sync_outings('[]'::jsonb)"]) {
     check(`nor call ${fn.split('(')[0]}`, !as('anon', `select public.${fn};`).ok);
   }
-  const chiefs = add(A, 'team', 'Kansas City Chiefs', 'wikidata', 'Q223455', 'NFL team in Kansas City');
-  const arrowhead = add(A, 'venue', 'Arrowhead Stadium', 'wikidata', 'Q1128848');
+  // Wikidata items come through the catalog service, with the service role,
+  // named as Wikidata names them.
+  const service = (sql) => psql(`begin;\nset local role service_role;\n${sql}\ncommit;`);
+  const wiki = (by, kind, name, qid, about = '') => {
+    const r = service(`select public.catalog_add_wikidata('${kind}', '${name}', '${about}', '${qid}', '${by}');`);
+    return r.ok ? JSON.parse(r.out.split('\n').pop()) : { error: r.err };
+  };
+  const appNamed = add(A, 'team', 'Scam Tickets', 'wikidata', 'Q223455');
+  check('an app cannot add a Wikidata item, and so cannot name one', /catalog service/.test(appNamed.error || '')
+    && psql("select count(*) from public.catalog where source = 'wikidata'").out === '0', appNamed);
+  const serviceOnly = as(A, `select public.catalog_add_wikidata('team', 'Scam', '', 'Q223455', '${A}');`);
+  check('nor call the service\'s own function', !serviceOnly.ok && /permission denied/.test(serviceOnly.err), serviceOnly.err);
+  check('nor can a signed-out visitor', !as('anon', `select public.catalog_add_wikidata('team', 'Scam', '', 'Q223455', null);`).ok);
+  const chiefs = wiki(A, 'team', 'Kansas City Chiefs', 'Q223455', 'NFL team in Kansas City');
+  const arrowhead = wiki(A, 'venue', 'Arrowhead Stadium', 'Q1128848');
   check('an entry from Wikidata is added', chiefs.id && chiefs.name === 'Kansas City Chiefs' && chiefs.about === 'NFL team in Kansas City', chiefs);
   check('and never says who added it', !JSON.stringify(chiefs).includes(A) && !('created_by' in chiefs));
-  const again2 = add(B, 'team', 'Renamed Chiefs', 'wikidata', 'Q223455');
-  check('the same Wikidata item is the same entry for everyone, and keeps its name', again2.id === chiefs.id && again2.name === 'Kansas City Chiefs', again2);
-  check('a made-up Wikidata id is refused', /not a Wikidata item/.test(add(A, 'team', 'X', 'wikidata', 'Q0; drop').error || ''));
+  psql(`update public.catalog set name = 'Made-up name' where source_id = 'Q223455';`);
+  const again2 = wiki(B, 'performer', 'Kansas City Chiefs', 'Q223455', 'NFL team in Kansas City');
+  check('the same Wikidata item is the same entry for everyone, and takes Wikidata\'s name, correcting a made-up one', again2.id === chiefs.id
+    && again2.name === 'Kansas City Chiefs', again2);
+  check('and keeps its kind', again2.kind === 'team');
+  check('a made-up Wikidata id is refused, even from the service', /not a Wikidata item/.test(wiki(A, 'team', 'X', 'Q0; drop').error || ''));
   check('as is an unknown kind', /Unknown kind/.test(add(A, 'car', 'X', 'orbit', null).error || ''));
   check('and a blank name', /needs a name/.test(add(A, 'team', '   ', 'orbit', null).error || ''));
   const rackets = add(A, 'performer', 'The Rackets', 'orbit', 'ignored');

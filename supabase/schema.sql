@@ -603,9 +603,9 @@ $$;
 revoke all on function public.catalog_entry(public.catalog) from public, anon, authenticated;
 revoke all on function public.can_see_outing(uuid, text, uuid) from public, anon, authenticated;
 
--- Adds an entry, or hands back the one already there. For Wikidata the item
--- id decides; for one made in Orbit, the kind and the name, whatever its case
--- or spacing.
+-- Adds an entry made in Orbit, or hands back the one already there: the kind
+-- and the name decide, whatever its case or spacing. Items from Wikidata do
+-- not come this way (see catalog_add_wikidata below).
 create or replace function public.catalog_add(p_kind text, p_name text, p_about text, p_source text, p_source_id text) returns jsonb
 language plpgsql security definer set search_path = '' as $$
 declare
@@ -618,8 +618,9 @@ begin
   if p_kind is null or p_kind not in ('performer', 'team', 'show', 'festival', 'venue') then raise exception 'Unknown kind of entry'; end if;
   if char_length(nm) not between 1 and 200 then raise exception 'An entry needs a name'; end if;
   if p_source = 'wikidata' then
-    if coalesce(p_source_id, '') !~ '^Q[1-9][0-9]{0,11}$' then raise exception 'That is not a Wikidata item'; end if;
-    sid := p_source_id;
+    -- An app could name a Wikidata item anything, for everyone. Orbit's
+    -- catalog service asks Wikidata instead (supabase/functions/catalog).
+    raise exception 'Items from Wikidata are added through Orbit''s catalog service';
   elsif p_source = 'orbit' then
     sid := p_kind || ':' || lower(nm);
   else
@@ -631,6 +632,29 @@ begin
   select * into c from public.catalog where source = p_source and source_id = sid;
   return public.catalog_entry(c);
 end $$;
+
+-- A Wikidata item, named as Wikidata names it. Only the catalog service calls
+-- this, with the service role, after asking Wikidata for the item: nothing an
+-- app sends reaches it. An item already here takes Wikidata's current name
+-- and description, which also corrects one ever given a made-up name. It
+-- keeps its kind, and who first added it.
+create or replace function public.catalog_add_wikidata(p_kind text, p_name text, p_about text, p_qid text, p_by uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  nm text := left(btrim(regexp_replace(coalesce(p_name, ''), '\s+', ' ', 'g')), 200);
+  c public.catalog;
+begin
+  if p_kind is null or p_kind not in ('performer', 'team', 'show', 'festival', 'venue') then raise exception 'Unknown kind of entry'; end if;
+  if coalesce(p_qid, '') !~ '^Q[1-9][0-9]{0,11}$' then raise exception 'That is not a Wikidata item'; end if;
+  if char_length(nm) < 1 then raise exception 'An entry needs a name'; end if;
+  insert into public.catalog (kind, name, about, source, source_id, created_by)
+    values (p_kind, nm, left(btrim(regexp_replace(coalesce(p_about, ''), '\s+', ' ', 'g')), 300), 'wikidata', p_qid, p_by)
+    on conflict (source, source_id) do update set name = excluded.name, about = excluded.about;
+  select * into c from public.catalog where source = 'wikidata' and source_id = p_qid;
+  return public.catalog_entry(c);
+end $$;
+revoke all on function public.catalog_add_wikidata(text, text, text, text, uuid) from public, anon, authenticated;
+grant execute on function public.catalog_add_wikidata(text, text, text, text, uuid) to service_role;
 
 -- Finding entries by any part of the name, the closest first, then the most
 -- logged. outings counts only what this viewer may see; average is of ratings

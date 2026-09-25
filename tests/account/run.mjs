@@ -166,6 +166,19 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
       if (fn === 'unblock_user') { db.blocked = db.blocked.filter((x) => x.id !== a.other); return reply(null); }
       if (fn === 'my_blocks') return reply(db.blocked.map(({ id, username, display_name }) => ({ id, username, display_name })));
     }
+    // The catalog service: names a Wikidata item as WIKIDATA does, whatever the app sent.
+    if (u.pathname === '/functions/v1/catalog') {
+      const a = JSON.parse(req.postData() || '{}');
+      db.serviceAsked = [...(db.serviceAsked || []), { ...a, auth: req.headers().authorization }];
+      const w = WIKIDATA.find((x) => x.id === a.id);
+      if (!w) return r.fulfill({ status: 404, headers, body: JSON.stringify({ error: 'Wikidata does not know that item.' }) });
+      let e = db.catalog.find((x) => x.source === 'wikidata' && x.source_id === a.id);
+      if (!e) {
+        e = { id: `00000000-0000-4000-8000-${String(db.catalog.length + 1).padStart(12, '0')}`, kind: a.kind, name: w.label, about: w.description, source: 'wikidata', source_id: a.id };
+        db.catalog.push(e);
+      }
+      return r.fulfill({ status: 200, headers, body: JSON.stringify(e) });
+    }
     if (u.pathname === '/rest/v1/rpc/public_profile') {
       const a = JSON.parse(req.postData() || '{}');
       db.asked.push({ ...a, signedIn: Boolean(req.headers().authorization?.includes('test-access')) });
@@ -649,7 +662,9 @@ const scenarios = {
     check('picking one links it', await page.getByRole('button', { name: 'Remove Kansas City Chiefs' }).isVisible());
     await who.fill('Broncos');
     await page.getByRole('group', { name: 'Matches for Broncos' }).getByRole('button', { name: /^Denver Broncos/ }).click();
-    check('a Wikidata match is added to the catalog as it is picked', db.added?.[0]?.p_source === 'wikidata' && db.added[0].p_source_id === 'Q223507' && db.added[0].p_kind === 'team', db.added);
+    check('a Wikidata match goes through the catalog service, which names it, and only by its id', db.serviceAsked?.[0]?.id === 'Q223507'
+      && db.serviceAsked[0].kind === 'team' && db.serviceAsked[0].lang === 'en' && !('name' in db.serviceAsked[0])
+      && /test-access/.test(db.serviceAsked[0].auth || '') && !db.added, [db.serviceAsked, db.added]);
     await page.getByLabel('Venue').fill('Arrowhead');
     await page.getByRole('group', { name: 'Matches for Arrowhead' }).getByRole('button', { name: /^Arrowhead Stadium/ }).click();
     check('picking a venue fills in where, when that was empty', await page.getByPlaceholder('Cincinnati, Ohio').inputValue() === 'Arrowhead Stadium');
