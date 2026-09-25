@@ -67,7 +67,7 @@ const session = () => ({
  * already in use. Sign-ups, password logins, resets and profile changes are
  * all recorded on db for the checks to look at.
  */
-const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = signedIn ? PROFILE : null, taken = ['bea'], others = [], catalog = [], pages = {} } = {}) => {
+const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = signedIn ? PROFILE : null, taken = ['bea'], others = [], catalog = [], pages = {}, publicPages = {} } = {}) => {
   const db = {
     rows: new Map(Object.entries(rows).map(([u, kv]) => [u, new Map(Object.entries(kv))])), down: false, calls: [], profile, taken: new Set(taken),
     // Other people, as the friends functions hand them out: each with how
@@ -76,6 +76,8 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
     // The shared catalog: its entries, the pages it hands out by id, and
     // every set of outings the app has shared.
     catalog: catalog.map((e) => ({ ...e })), pages: { ...pages }, synced: [], wikidata: [],
+    // People's pages by username, and every set of trips the app has shown.
+    publicPages: { ...publicPages }, tripsSynced: [], asked: [],
   };
   const mine = () => {
     if (!db.rows.has(USER.id)) db.rows.set(USER.id, new Map());
@@ -159,6 +161,16 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
       }
       if (fn === 'unblock_user') { db.blocked = db.blocked.filter((x) => x.id !== a.other); return reply(null); }
       if (fn === 'my_blocks') return reply(db.blocked.map(({ id, username, display_name }) => ({ id, username, display_name })));
+    }
+    if (u.pathname === '/rest/v1/rpc/public_profile') {
+      const a = JSON.parse(req.postData() || '{}');
+      db.asked.push({ ...a, signedIn: Boolean(req.headers().authorization?.includes('test-access')) });
+      const pg = db.publicPages[a.uname];
+      return r.fulfill({ status: 200, headers, body: JSON.stringify(pg ? { ...pg, year: a.p_year } : null) });
+    }
+    if (u.pathname === '/rest/v1/rpc/sync_trips') {
+      db.tripsSynced.push(JSON.parse(req.postData()).items);
+      return r.fulfill({ status: 200, headers, body: '1' });
     }
     if (u.pathname.startsWith('/rest/v1/rpc/') && ['catalog_search', 'catalog_add', 'catalog_page', 'sync_outings'].includes(u.pathname.slice(13))) {
       const fn = u.pathname.slice(13);
@@ -269,6 +281,94 @@ const localKeys = (page) => page.evaluate(() => Object.keys(localStorage).filter
 const shown = (loc) => loc.waitFor({ timeout: 8000 }).then(() => true, () => false);
 
 const scenarios = {
+  async 'a public page, signed out'() {
+    const CHIEFS = { id: '00000000-0000-4000-8000-00000000c41f', kind: 'team', name: 'Kansas City Chiefs', about: 'NFL team', source: 'wikidata', source_id: 'Q223455' };
+    const BROCK = {
+      hidden: false, years: [2026, 2025],
+      profile: { username: 'brock', display_name: 'Brock B', relation: 'none', bio: 'Chiefs, vinyl, and long drives.', pronouns: 'he/him' },
+      trips: [
+        { id: 't1', title: 'Lisbon', start: '2025-05-10', end: '2025-05-17', rating: 4.5, highlight: 'Tram 28 at dawn.',
+          stops: [{ name: 'Lisbon', lat: 38.72, lng: -9.14, country: 'Portugal', state: '' }] },
+        { id: 't2', title: 'Chicago', start: '2026-03-01', end: '2026-03-03', rating: 3, highlight: '',
+          stops: [{ name: 'Chicago', lat: 41.88, lng: -87.63, country: 'United States', state: 'Illinois' }] },
+      ],
+      outings: [{ id: 'e1', kind: 'Sports', title: 'Chiefs vs Broncos', date: '2026-01-05', rating: 4, review: 'Cold, loud, worth it.', links: [CHIEFS] }],
+    };
+    const PAGE = { entry: CHIEFS, ratings: 1, average: 4, spread: [0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
+      outings: [{ by: { username: 'bea', display_name: 'Bea', relation: 'none' }, kind: 'Sports', title: 'Home opener', date: '2025-09-07', rating: 4, review: 'Great.', links: [] }] };
+    const { page, db, problems, close } = await newPage({
+      publicPages: { brock: BROCK, shy: { hidden: true, profile: { username: 'shy', display_name: 'Shy Person' } } },
+      catalog: [CHIEFS], pages: { [CHIEFS.id]: PAGE },
+    });
+    await page.goto(`${url}u/brock`);
+    check('a page opens without signing in', await shown(page.getByRole('heading', { name: 'Brock B', level: 1 }))
+      && !(await page.getByRole('heading', { name: 'Welcome back' }).isVisible()));
+    check('asked for as a signed-out visitor', db.asked[0]?.uname === 'brock' && db.asked[0]?.p_year === null && !db.asked[0]?.signedIn, db.asked);
+    check('with the profile as it may be seen', await page.getByText('Chiefs, vinyl, and long drives.').isVisible() && await page.getByText('he/him').isVisible());
+    const nums = (await page.getByRole('region', { name: 'Numbers' }).innerText()).replace(/\s+/g, ' ');
+    check('the numbers from the trips and outings shown', /2 trips/.test(nums) && /2 countries/.test(nums) && /1 US state/.test(nums) && /11 days away/.test(nums) && /1 game/.test(nums), nums);
+    check('the trips, with their highlights', await page.getByRole('heading', { name: 'Trips' }).isVisible() && await page.getByText('Tram 28 at dawn.').isVisible());
+    check('the outings, with what they thought', await page.getByText('Cold, loud, worth it.').isVisible());
+    check('named in the tab', (await page.title()).startsWith('Brock B (@brock)'), await page.title());
+    check('and an invitation to join', await page.getByRole('link', { name: 'Join Orbit' }).first().isVisible());
+
+    await page.getByRole('link', { name: '2025', exact: true }).click();
+    check('a year opens its own page', await shown(page.getByRole('link', { name: '2025', exact: true }).and(page.locator('[aria-current="page"]')))
+      && new URL(page.url()).pathname === '/u/brock/2025' && db.asked.some((a) => a.p_year === 2025), page.url());
+    await page.goBack();
+    check('Back returns to all time', await shown(page.getByRole('link', { name: 'All time' }).and(page.locator('[aria-current="page"]'))) && new URL(page.url()).pathname === '/u/brock');
+
+    await page.getByRole('link', { name: 'Kansas City Chiefs' }).click();
+    check('a linked team opens its page, still signed out', await shown(page.getByRole('heading', { name: 'Kansas City Chiefs', level: 1 }))
+      && new URL(page.url()).pathname === `/c/${CHIEFS.id}`);
+    await page.getByRole('link', { name: 'Bea' }).click();
+    check('and whoever logged it links to their page', await shown(page.getByRole('heading', { name: 'Nobody here by that name' })) && new URL(page.url()).pathname === '/u/bea');
+
+    await page.goto(`${url}u/shy`);
+    check('a page not open to the web shows only the name, and a way in', await shown(page.getByText('Shy’s page is only for people signed in to Orbit.'))
+      && await page.getByRole('link', { name: 'Log in or join Orbit' }).isVisible());
+    await page.goto(`${url}u/NO!`);
+    check('an address that is not a page opens the app, behind sign-in', await shown(page.getByRole('heading', { name: 'Welcome back' })));
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
+  async 'your own page'() {
+    const FULL = { ...PROFILE, pronouns: '', bio: '', location: '', phone: '', contact_email: '', website: '', socials: {}, visibility: {}, searchable: true, public_page: false };
+    const TRIPS = [
+      { id: 'tA', title: 'Lisbon', stops: [{ name: 'Lisbon', displayAddress: '', lat: 38.72231, lng: -9.13934 }], startDate: '2025-05-10', endDate: '2025-05-17',
+        rating: 4.5, excerpt: 'Tram 28', notes: 'private trip notes', companions: ['p1'], photoIds: ['ph1'], tags: ['food'], createdAt: '2025-01-01T00:00:00.000Z', updatedAt: '2025-01-01T00:00:00.000Z' },
+      { id: 'tB', title: 'Tokyo', stops: [{ name: 'Tokyo', displayAddress: '', lat: 35.68, lng: 139.69 }], startDate: '2099-11-02', endDate: null, status: 'planned',
+        rating: null, excerpt: '', notes: '', companions: [], photoIds: [], tags: [], createdAt: '2025-01-01T00:00:00.000Z', updatedAt: '2025-01-01T00:00:00.000Z' },
+    ];
+    const { page, db, problems, close } = await newPage({ signedIn: true, profile: FULL,
+      rows: { [USER.id]: { 'crm-owner-v1': 'Sam', 'crm-trips-v1': JSON.stringify(TRIPS), 'crm-trips-notice-v1': '1' } } });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    await page.waitForTimeout(1600);
+    check('trips kept to yourself: only an empty set goes, to clear any copy', db.tripsSynced.every((t) => t.length === 0), db.tripsSynced);
+    await page.getByRole('button', { name: /^More/ }).click();
+    check('the menu links to your page', (await page.getByRole('link', { name: 'Your page' }).getAttribute('href')) === '/u/sam');
+    await page.getByRole('button', { name: 'Settings' }).click();
+    await page.getByRole('button', { name: 'Profile', exact: true }).click();
+    check('Settings shows your page\'s address', await shown(page.getByRole('link', { name: /\/u\/sam$/ })));
+    check('trips start kept to yourself, and the page closed to the web', (await page.getByLabel('Who sees trips').inputValue()) === 'me'
+      && !(await page.getByRole('checkbox', { name: /Anyone with the link/ }).isChecked()));
+    await page.getByLabel('Who sees trips').selectOption('friends');
+    await page.getByRole('checkbox', { name: /Anyone with the link/ }).check();
+    await page.getByRole('button', { name: 'Save profile' }).click();
+    check('both are saved with the profile', await shown(page.getByText('Your profile is saved.'))
+      && db.profile.public_page === true && db.profile.visibility?.trips === 'friends', db.profile);
+    await page.waitForFunction(() => true);
+    for (let i = 0; i < 20 && !db.tripsSynced.some((t) => t.length); i += 1) await page.waitForTimeout(300);
+    const sent = db.tripsSynced.find((t) => t.length) || [];
+    check('then the trips taken are shown', sent.length === 1 && sent[0].trip_id === 'tA' && sent[0].highlight === 'Tram 28' && sent[0].rating === 4.5, sent);
+    check('each stop with its country, to about a kilometre', sent[0]?.stops[0]?.country === 'Portugal' && sent[0].stops[0].lat === 38.72 && sent[0].stops[0].lng === -9.14, sent[0]?.stops);
+    check('never who went, notes, photos, tags, or trips still to come', !/p1|private trip notes|ph1|food|Tokyo/.test(JSON.stringify(db.tripsSynced)), JSON.stringify(sent));
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
   async 'linking events to the shared catalog'() {
     const CHIEFS = { id: '00000000-0000-4000-8000-00000000c41f', kind: 'team', name: 'Kansas City Chiefs', about: 'NFL team', source: 'wikidata', source_id: 'Q223455', outings: 3, average: 4.2 };
     const ARROWHEAD = { id: '00000000-0000-4000-8000-0000000a4404', kind: 'venue', name: 'Arrowhead Stadium', about: 'Stadium', source: 'wikidata', source_id: 'Q1128848', outings: 1, average: null };

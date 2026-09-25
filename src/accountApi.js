@@ -137,7 +137,7 @@ export async function updateProfile(client, userId, changes) {
   if ('birthday' in changes) row.birthday = changes.birthday;
   for (const [from, to] of [['pronouns', 'pronouns'], ['bio', 'bio'], ['location', 'location'], ['phone', 'phone'],
     ['contactEmail', 'contact_email'], ['website', 'website'], ['socials', 'socials'], ['visibility', 'visibility'],
-    ['searchable', 'searchable']]) {
+    ['searchable', 'searchable'], ['publicPage', 'public_page']]) {
     if (from in changes) row[to] = typeof changes[from] === 'string' ? changes[from].trim() : changes[from];
   }
   const { data, error } = await client.from('profiles').update(row).eq('id', userId).select(PROFILE_COLS);
@@ -261,4 +261,12 @@ export const catalogApi = (client) => ({
   }),
   page: (id) => catalogRpc(client, 'catalog_page', { p_id: id }),
   sync: (items) => catalogRpc(client, 'sync_outings', { items }),
+  syncTrips: (items) => catalogRpc(client, 'sync_trips', { items }),
+});
+
+// What anyone, signed in or not, can ask for: a person's page (see
+// public_profile in the schema, part 5) and a catalog entry's.
+export const publicApi = (client) => ({
+  profile: (username, year = null) => catalogRpc(client, 'public_profile', { uname: username, p_year: year }),
+  page: (id) => catalogRpc(client, 'catalog_page', { p_id: id }),
 });

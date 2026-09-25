@@ -2,13 +2,14 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, use
 import Papa from 'papaparse';
 import { KINDS, deviceTimeZone, pushSupport } from './notifications.js';
 import {
-  MIN_PASSWORD, PROFILE_FIELDS, SOCIAL_KEYS, VISIBILITY, birthdayProblem, cleanUsername, displayNameProblem, emailProblem,
+  MIN_PASSWORD, PROFILE_FIELDS, publicApi, SOCIAL_KEYS, VISIBILITY, birthdayProblem, cleanUsername, displayNameProblem, emailProblem,
   passwordProblem, seenAs, usernameProblem, visibilityOf,
 } from './accountApi.js';
 import * as photoStore from './photoStore.js';
 import { GEOCODER } from './mapConfig.js';
 import { CARD_W, CARD_H, drawRecapCard, cardBlob, cardFontsReady } from './recapCard.js';
-import { CATALOG_KINDS, LINKS_FOR, OUTING_VISIBILITY, WIKIDATA, cleanLinks, outingsToShare, searchWikidata } from './catalog.js';
+import { BASE, catalogPath, pageUrl, profilePath, readRoute } from './route.js';
+import { CATALOG_KINDS, LINKS_FOR, OUTING_VISIBILITY, WIKIDATA, cleanLinks, outingsToShare, searchWikidata, tripsToShare } from './catalog.js';
 
 /* ---------- palette ---------- */
 const THEMES = {
@@ -370,6 +371,19 @@ function OrbitDial({ p, size = 38 }) {
 }
 
 // Empty screens have nothing to compete with, so an illustration is free here.
+// The planet and its moon, beside the name.
+function OrbitMark() {
+  return (
+    <svg width="19" height="19" viewBox="0 0 19 19" style={{ flexShrink: 0, overflow: 'visible' }}>
+      <ellipse cx="9.5" cy="9.5" rx="9" ry="4.4" fill="none"
+        stroke={C.accent} strokeWidth="1.1" opacity="0.65"
+        transform="rotate(-28 9.5 9.5)" />
+      <circle cx="9.5" cy="9.5" r="3.1" fill={C.accent} />
+      <circle cx="17.2" cy="5.7" r="1.7" fill={C.accent} />
+    </svg>
+  );
+}
+
 function EmptySky({ width = 132 }) {
   return (
     <svg width={width} height={width * 0.62} viewBox="0 0 132 82"
@@ -506,6 +520,142 @@ const applyTheme = (name) => {
     ...linkStyle, color: C.ink, borderBottom: `1px solid ${C.line}`,
   };
 };
+
+// The app's own stylesheet: fonts, hover states, the map's pins. Shared with
+// the public pages, which are drawn without the rest of the app.
+function AppStyles() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600&family=Source+Serif+4:opsz,wght@8..60,400&display=swap');
+      .crm-serif { font-family: 'Source Serif 4', Georgia, serif; }
+      .crm-btn:hover { filter: brightness(0.94); }
+      .crm-row:hover { background: ${C.rowHover}; }
+      .crm-btn:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible {
+        outline: 2px solid ${C.ink}; outline-offset: 2px;
+      }
+      input, select, textarea { font-family: inherit; }
+      .crm-full { grid-column: 1 / -1; }
+      
+      /* Narrow: one column. The panel replaces the list rather than pushing it. */
+      .crm-shell { max-width: 460px; margin: 0 auto; padding: 22px 16px 60px; }
+      .crm-main.is-hidden { display: none; }
+      .crm-detail { display: none; }
+      .crm-detail.is-open { display: block; }
+      .crm-idle { display: none; }
+      .crm-tpl-wide { display: none; }
+
+      /* Wide: list and detail side by side, detail pinned while the list scrolls. */
+      @media (min-width: 880px) {
+        .crm-shell {
+          max-width: 1000px;
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) 384px;
+          column-gap: 30px;
+          align-items: start;
+        }
+        .crm-head { grid-column: 1 / -1; }
+        .crm-main.is-hidden { display: block; }
+        .crm-detail { display: block; position: sticky; top: 20px; }
+        .crm-back { display: none; }
+        .crm-idle { display: block; }
+        .crm-tpl-wide { display: block; }
+        .crm-tpl-pick { display: none; }
+      }
+      .crm-person:last-child, .crm-entry:last-child { border-bottom: none !important; }
+      /* A list can hold thousands of entries. Rows off screen are skipped
+         until scrolled to, which is most of what a keystroke costs on a long
+         list. Still found by find-in-page and screen readers. */
+      .crm-entry { content-visibility: auto; contain-intrinsic-size: auto 62px; }
+      /* The same for people, who can run to hundreds. What every person
+         row shares is here too, rather than inline (see PersonRow). */
+      .crm-person {
+        content-visibility: auto; contain-intrinsic-size: auto 65px;
+        display: flex; border-bottom: 1px solid ${C.line};
+      }
+      .crm-person-bar { width: 4px; flex-shrink: 0; }
+      .crm-person-body, .crm-person-main { flex: 1; min-width: 0; }
+      .crm-person .crm-row { padding: 14px 15px; cursor: pointer; display: flex; align-items: baseline; gap: 10px; }
+      .crm-person-top { display: flex; align-items: baseline; gap: 7px; }
+      .crm-person-name {
+        font-size: 17px; font-weight: 600; letter-spacing: -0.02em; color: ${C.ink};
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .crm-person-age { font-size: 13px; color: ${C.faint}; flex-shrink: 0; }
+      .crm-person-sub { font-size: 13px; color: ${C.muted}; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .crm-person-when { text-align: right; flex-shrink: 0; max-width: 116px; white-space: nowrap; }
+      .crm-person-status { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+      .crm-person-cadence { font-size: 12px; color: ${C.faint}; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
+      .crm-person-act {
+        flex-shrink: 0; cursor: pointer; background: transparent;
+        border: none; border-left: 1px solid ${C.line};
+        display: flex; align-items: center; justify-content: center;
+      }
+      /* That also clips painting to each row, which would cut off a focus
+         ring drawn outside a button that fills the row, so rings go inside. */
+      .crm-entry .crm-btn:focus-visible, .crm-entry a:focus-visible,
+      .crm-person .crm-btn:focus-visible { outline-offset: -3px; }
+      /* Important, because every select also takes the shared input style
+         inline, whose background and padding would otherwise paint over
+         the arrow and run the text underneath it. */
+      .crm-select {
+        appearance: none; -webkit-appearance: none;
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.5 4.5 L6 8 L9.5 4.5' fill='none' stroke='${encodeURIComponent(C.muted)}' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>") !important;
+        background-repeat: no-repeat !important; background-position: right 11px center !important; background-size: 12px !important;
+        padding-right: 32px !important;
+      }
+      /* Hidden from sight, still there for keyboards and screen readers. */
+      .crm-sr {
+        position: absolute !important; width: 1px; height: 1px; margin: -1px; padding: 0;
+        overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+      }
+      .crm-star input:focus-visible + span, .crm-file:focus-within {
+        outline: 2px solid ${C.ink}; outline-offset: 2px; border-radius: 6px;
+      }
+      .crm-clamp { -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+      /* Maps. Tiles, popups and controls all follow the theme. */
+      /* Close to the tiles' own sea, so any gap around the world reads as ocean. */
+      .orbit-map { font-family: inherit; background: ${C.dark ? '#1B1D20' : '#D6DCDE'}; }
+      .orbit-map .leaflet-bar { border: 1px solid ${C.line}; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.12); overflow: hidden; }
+      .orbit-map .leaflet-bar a {
+        width: 34px; height: 34px; line-height: 32px; font-size: 18px; font-weight: 500;
+        background: ${C.surface}; color: ${C.ink}; border-bottom: 1px solid ${C.line};
+      }
+      .orbit-map .leaflet-bar a:last-child { border-bottom: none; }
+      .orbit-map .leaflet-bar a:hover, .orbit-map .leaflet-bar a:focus-visible { background: ${C.rowHover}; color: ${C.ink}; }
+      .orbit-map .leaflet-bar a.leaflet-disabled { background: ${C.surface}; color: ${C.faint}; opacity: 0.5; }
+      .orbit-map .leaflet-control-attribution {
+        background: ${C.surface}cc; color: ${C.muted}; font-size: 10.5px; border-top-left-radius: 6px; padding: 1px 6px;
+      }
+      .orbit-map .leaflet-control-attribution a { color: ${C.muted}; }
+      .orbit-map .leaflet-popup-content-wrapper, .orbit-map .leaflet-popup-tip {
+        background: ${C.surface}; color: ${C.ink}; box-shadow: 0 6px 22px rgba(0,0,0,0.28);
+      }
+      .orbit-map .leaflet-popup-content { margin: 12px 14px; font-size: 13px; line-height: 1.4; }
+      .orbit-map a.leaflet-popup-close-button { color: ${C.muted}; }
+      .orbit-pin, .orbit-cluster { background: none; border: none; }
+      .orbit-pin span, .orbit-cluster span {
+        display: flex; align-items: center; justify-content: center; box-sizing: border-box;
+        border-radius: 50%; color: #fff; font-weight: 700; font-family: system-ui, sans-serif;
+      }
+      .orbit-pin span { width: 28px; height: 28px; font-size: 13px; border: 2px solid #fff; box-shadow: 0 1px 5px rgba(0,0,0,0.45); }
+      /* Trips to come: the colour moves from the fill to a thick ring. */
+      .orbit-pin-planned span, .orbit-pin-someday span {
+        background: #fff !important; box-shadow: 0 0 0 2px #fff, 0 1px 5px rgba(0,0,0,0.45);
+      }
+      .orbit-pin-planned span { border: 4px solid ${PLAN_COLORS.planned}; }
+      .orbit-pin-someday span { border: 3px dashed ${PLAN_COLORS.someday}; }
+      .orbit-cluster span {
+        width: 38px; height: 38px; font-size: 13px; background: #15211B;
+        border: 3px solid #72DE88; box-shadow: 0 1px 6px rgba(0,0,0,0.4);
+      }
+      .orbit-pin:focus-visible, .orbit-cluster:focus-visible { outline: none; }
+      .orbit-pin:focus-visible span, .orbit-cluster:focus-visible span { outline: 3px solid #15211B; outline-offset: 2px; }
+      .crm-open { animation: crmIn .16s ease-out; }
+      @keyframes crmIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+      @media (prefers-reduced-motion: reduce) { .crm-open { animation: none; } }
+    `}</style>
+  );
+}
 
 /* ---------- add / edit ---------- */
 function PersonForm({ initial, defaultCircle, inline, families, allGroups, companies, onSave, onCancel }) {
@@ -3552,13 +3702,15 @@ const recapCardText = (card) => [
   ...card.highlights.map((h) => `${h.label}: ${h.title}${h.rating ? ` (${stars(h.rating)})` : ''}`),
 ].filter(Boolean).join('\n');
 
-function RecapShare({ people, events, trips, year, owner }) {
+// page: the address of this year on your page, when you have one, which the
+// picture names and the share sheet sends with it.
+function RecapShare({ people, events, trips, year, owner, page = '' }) {
   const { geo, where } = useGeo();
   const [include, setInclude] = useState({ trips: true, events: true, people: false });
   const [by, setBy] = useState(owner || '');
   const [said, setSaid] = useState('');
   const canvas = useRef(null);
-  const site = typeof location === 'undefined' ? '' : location.host;
+  const site = page ? page.replace(/^https?:\/\//, '') : typeof location === 'undefined' ? '' : location.host;
   const card = useMemo(() => recapCard({ people, events, trips, where, year, include, name: by, site }),
     [people, events, trips, where, year, include, by, site]);
   // Which card the canvas holds, so nothing is sent from a picture of the
@@ -3601,7 +3753,7 @@ function RecapShare({ people, events, trips, year, owner }) {
     try {
       const f = new File([await picture()], file, { type: 'image/png' });
       if (!navigator.canShare({ files: [f] })) { await save(); return; }
-      await navigator.share({ files: [f], title: `My ${year} in Orbit` });
+      await navigator.share({ files: [f], title: `My ${year} in Orbit`, ...(page ? { text: page } : {}) });
     } catch (e) {
       if (e?.name !== 'AbortError') setSaid('Sharing did not work here. Save the picture instead.');
     }
@@ -3639,7 +3791,7 @@ function RecapShare({ people, events, trips, year, owner }) {
   );
 }
 
-function Recap({ people, year, years, onYear, eventCount, reminderCount, listCount, trips = [], onTrip, events = [], onEvent, owner }) {
+function Recap({ people, year, years, onYear, eventCount, reminderCount, listCount, trips = [], onTrip, events = [], onEvent, owner, pageFor = null }) {
   const r = buildRecap(people, year);
   const maxMonth = Math.max(1, ...r.months);
   const tripCount = trips.filter((t) => tripYears(t).includes(year)).length;
@@ -3660,7 +3812,7 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
         )}
       </div>
 
-      {sharing && shareable && <RecapShare people={people} events={events} trips={trips} year={year} owner={owner} />}
+      {sharing && shareable && <RecapShare people={people} events={events} trips={trips} year={year} owner={owner} page={pageFor ? pageFor(year) : ''} />}
 
       {r.total === 0 && r.added === 0 && !eventCount && !reminderCount && !listCount ? (tripCount ? null : (
         <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.6, margin: 0 }}>
@@ -5061,7 +5213,7 @@ function CatalogSearch({ api, onOpen }) {
   );
 }
 
-function CatalogPage({ api, id, onOpen }) {
+function CatalogPage({ api, id, onOpen, onPerson }) {
   const [page, setPage] = useState({ state: 'loading' });
   useEffect(() => {
     let live = true;
@@ -5109,7 +5261,10 @@ function CatalogPage({ api, id, onOpen }) {
       ) : outings.map((o, i) => (
         <article key={`${o.by.username}-${o.date}-${i}`} style={{ ...box, padding: '13px 15px' }}>
           <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
-            <span style={{ fontSize: 14, fontWeight: 600 }}>{o.by.display_name}</span>
+            {onPerson ? (
+              <a href={profilePath(o.by.username)} onClick={(ev) => { ev.preventDefault(); onPerson(o.by.username); }}
+                style={{ fontSize: 14, fontWeight: 600, color: C.ink, textDecoration: 'none' }}>{o.by.display_name}</a>
+            ) : <span style={{ fontSize: 14, fontWeight: 600 }}>{o.by.display_name}</span>}
             <span style={{ fontSize: 12.5, color: C.faint }}>@{o.by.username}</span>
             {o.by.relation === 'self' && <span style={kindChip()}>You</span>}
             {o.by.relation === 'friends' && <span style={kindChip()}>Friend</span>}
@@ -5127,6 +5282,257 @@ function CatalogPage({ api, id, onOpen }) {
           )}
         </article>
       ))}
+    </div>
+  );
+}
+
+/* ---------- public pages ---------- */
+// A shared trip as the rest of the app knows trips, so the same map, dates
+// and stars work on it.
+const pageTrip = (t) => ({
+  id: t.id, title: t.title, startDate: t.start, endDate: t.end || null, rating: t.rating || null, excerpt: t.highlight || '',
+  notes: '', companions: [], photoIds: [], tags: [],
+  stops: (t.stops || []).map((st) => ({ name: st.name, displayAddress: '', lat: st.lat, lng: st.lng, country: st.country, state: st.state })),
+});
+
+// The numbers across the top of a page: trips, countries, US states, days
+// away and places from the trips shown; the outings by kind.
+const pageStats = (trips, outings, year = null) => {
+  const stops = trips.flatMap((t) => t.stops);
+  const countries = new Set(stops.map((st) => st.country).filter(Boolean));
+  const states = new Set(stops.filter((st) => st.country === 'United States').map((st) => st.state).filter(Boolean));
+  const days = year ? daysAway(trips, year) : trips.reduce((n, t) => n + tripWhen(t).days, 0);
+  const word = (n, one, many) => (n === 1 ? one : many);
+  return [
+    { n: trips.length, label: word(trips.length, 'trip', 'trips') },
+    { n: countries.size, label: word(countries.size, 'country', 'countries') },
+    { n: states.size, label: word(states.size, 'US state', 'US states') },
+    { n: days, label: word(days, 'day away', 'days away') },
+    ...OUTING_KINDS.map((k) => {
+      const n = outings.filter((o) => o.kind === k).length;
+      return { n, label: OUTING_WORDS[k][n === 1 ? 0 : 1] };
+    }),
+  ].filter((x) => x.n > 0);
+};
+
+// Someone's page. go(path) moves to another public page.
+function ProfilePage({ api, username, year, go, signedIn }) {
+  const [page, setPage] = useState({ state: 'loading' });
+  const [said, setSaid] = useState('');
+  useEffect(() => {
+    let live = true;
+    api.profile(username, year).then(
+      (p) => { if (live) setPage(p ? { state: 'ok', ...p } : { state: 'gone' }); },
+      (e) => { if (live) setPage({ state: 'failed', problem: e.message }); },
+    );
+    return () => { live = false; };
+  }, [api, username, year]);
+  const trips = useMemo(() => (page.trips || []).map(pageTrip), [page.trips]);
+  const points = useMemo(() => tripPoints(trips), [trips]);
+  const pr = page.profile;
+  useEffect(() => {
+    if (pr) document.title = `${pr.display_name} (@${pr.username})${year ? ` · ${year}` : ''} · Orbit`;
+  }, [pr, year]);
+
+  if (page.state === 'loading') return <p style={{ fontSize: 14, color: C.muted }}>Loading…</p>;
+  if (page.state === 'gone') {
+    return (
+      <div>
+        <h1 style={{ margin: '0 0 8px', fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Nobody here by that name</h1>
+        <p style={{ fontSize: 14, color: C.muted }}>There is no page for @{username}. Check the link.</p>
+      </div>
+    );
+  }
+  if (page.state !== 'ok') return <p role="alert" style={{ fontSize: 14, color: C.muted }}>{page.problem || 'That page could not be loaded.'}</p>;
+
+  const link = pageUrl(profilePath(pr.username, year));
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(link); setSaid('Link copied.'); } catch { setSaid(link); }
+  };
+  const box = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, marginBottom: 12 };
+  const head = (
+    <header style={{ marginBottom: 18 }}>
+      <h1 style={{ margin: 0, fontSize: 30, fontWeight: 600, letterSpacing: '-0.04em' }}>{pr.display_name}</h1>
+      <p style={{ margin: '3px 0 0', fontSize: 14, color: C.muted, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline' }}>
+        <span>@{pr.username}</span>
+        {pr.pronouns && <span>{pr.pronouns}</span>}
+        {pr.location && <span>{pr.location}</span>}
+        {pr.relation === 'self' && <span style={kindChip()}>You</span>}
+        {pr.relation === 'friends' && <span style={kindChip()}>Friend</span>}
+      </p>
+      {pr.bio && <p className="crm-serif" style={{ margin: '10px 0 0', fontSize: 15.5, lineHeight: 1.55 }}>{pr.bio}</p>}
+      {pr.website && safeLink(pr.website) && (
+        <a href={safeLink(pr.website)} target="_blank" rel="noopener noreferrer nofollow" style={{ display: 'inline-block', marginTop: 8, fontSize: 13, color: C.muted }}>
+          {safeLink(pr.website).replace(/^https?:\/\//, '')}
+        </a>
+      )}
+    </header>
+  );
+
+  if (page.hidden) {
+    return (
+      <div>
+        {head}
+        <div style={{ ...box, padding: 16 }}>
+          <p style={{ margin: '0 0 12px', fontSize: 14, lineHeight: 1.55 }}>
+            {pr.display_name.split(' ')[0]}’s page is only for people signed in to Orbit.
+          </p>
+          <a href={BASE} style={{ ...solidLink(), display: 'inline-block' }}>Log in or join Orbit</a>
+        </div>
+      </div>
+    );
+  }
+
+  const stats = pageStats(trips, page.outings, year);
+  const nothing = !trips.length && !page.outings.length;
+  return (
+    <div>
+      {head}
+      {(page.years.length > 0 || year) && (
+        <nav aria-label="Years" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 16 }}>
+          {[null, ...[...new Set([...page.years, ...(year ? [year] : [])])].sort((a, b) => b - a)].map((y) => (
+            <a key={y ?? 'all'} href={profilePath(pr.username, y)} aria-current={y === year ? 'page' : undefined}
+              onClick={(ev) => { ev.preventDefault(); go(profilePath(pr.username, y)); }}
+              style={{ ...filterChip(y === year), textDecoration: 'none', display: 'inline-block' }}>{y ?? 'All time'}</a>
+          ))}
+        </nav>
+      )}
+
+      {nothing ? (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.55 }}>
+          {year ? `Nothing shared from ${year}.` : 'Nothing shared here yet.'}
+        </p>
+      ) : (
+        <>
+          {stats.length > 0 && (
+            <div role="region" aria-label="Numbers" style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+              {stats.map((x, i) => <Stat key={x.label} n={x.n} label={x.label} tone={i === 0 ? C.accentDeep : undefined} />)}
+            </div>
+          )}
+
+          {points.length > 0 && (
+            <div style={{ ...mapFrame(), marginBottom: 12 }}>
+              <MapSlot height={300} render={(m) => (
+                <m.TripsMap points={points} height={300} dark={C.dark} renderPopup={(p) => {
+                  const t = trips.find((x) => x.id === p.tripId);
+                  return t ? <TripPopup trip={t} stop={p.stop} onOpen={() => document.getElementById(`trip-${t.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })} /> : null;
+                }} />
+              )} />
+            </div>
+          )}
+
+          {trips.length > 0 && (
+            <section aria-labelledby="page-trips" style={{ marginTop: 20 }}>
+              <h2 id="page-trips" style={{ margin: '0 0 10px', fontSize: 20, fontWeight: 600, letterSpacing: '-0.03em' }}>Trips</h2>
+              {trips.map((t) => (
+                <article key={t.id} id={`trip-${t.id}`} style={{ ...box, padding: '12px 15px' }}>
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.02em' }}>{t.title}</span>
+                    <span style={{ marginLeft: 'auto' }}><Stars n={t.rating} size={12.5} /></span>
+                  </div>
+                  <p style={{ margin: '3px 0 0', fontSize: 12.5, color: C.muted }}>
+                    {tripWhen(t).text}
+                    {t.stops.length > 0 && ` · ${[...new Set(t.stops.map((st) => st.name).filter(Boolean))].join(' → ')}`}
+                  </p>
+                  {t.excerpt && <p className="crm-serif" style={{ margin: '7px 0 0', fontSize: 15, lineHeight: 1.55 }}>{t.excerpt}</p>}
+                </article>
+              ))}
+            </section>
+          )}
+
+          {page.outings.length > 0 && (
+            <section aria-labelledby="page-outings" style={{ marginTop: 20 }}>
+              <h2 id="page-outings" style={{ margin: '0 0 10px', fontSize: 20, fontWeight: 600, letterSpacing: '-0.03em' }}>Concerts, games and shows</h2>
+              {page.outings.map((o) => (
+                <article key={o.id} style={{ ...box, padding: '12px 15px' }}>
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 16, fontWeight: 600, letterSpacing: '-0.02em' }}>{o.title}</span>
+                    <span style={kindChip()}>{o.kind}</span>
+                    <span style={{ marginLeft: 'auto' }}><Stars n={o.rating} size={12.5} /></span>
+                  </div>
+                  <p style={{ margin: '3px 0 0', fontSize: 12.5, color: C.muted }}>{prettyDate(o.date)}</p>
+                  {o.review && <p className="crm-serif" style={{ margin: '7px 0 0', fontSize: 15, lineHeight: 1.55 }}>{o.review}</p>}
+                  {o.links.length > 0 && (
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 9 }}>
+                      {o.links.map((l) => (
+                        <a key={l.id} href={catalogPath(l.id)} onClick={(ev) => { ev.preventDefault(); go(catalogPath(l.id)); }}
+                          style={{ ...filterChip(false), padding: '3px 10px', fontSize: 12, textDecoration: 'none', display: 'inline-block' }}>{l.name}</a>
+                      ))}
+                    </div>
+                  )}
+                </article>
+              ))}
+            </section>
+          )}
+        </>
+      )}
+
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginTop: 20 }}>
+        <Button onClick={copy}>Copy link to this page</Button>
+        {said && <span role="status" style={{ fontSize: 13, color: C.muted, wordBreak: 'break-all' }}>{said}</span>}
+      </div>
+      {!signedIn && (
+        <div style={{ ...box, padding: 16, marginTop: 24 }}>
+          <p style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 600 }}>Keep your own</p>
+          <p style={{ margin: '0 0 12px', fontSize: 13.5, color: C.muted, lineHeight: 1.5 }}>
+            Orbit keeps the people you care about, the places you have been, and the concerts, games and shows you went to, in one place.
+          </p>
+          <a href={BASE} style={{ ...solidLink(), display: 'inline-block' }}>Join Orbit</a>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// A link that looks like the solid button.
+const solidLink = () => ({
+  font: 'inherit', fontSize: 14, fontWeight: 600, padding: '9px 14px', borderRadius: 7,
+  background: C.accent, color: C.onAccent, border: `1px solid ${C.accent}`, textDecoration: 'none',
+});
+
+// The public pages, drawn on their own, without signing in: a person's page
+// or a catalog entry's (see route.js). Moving between them stays on the page.
+export function PublicPage({ client, route: first }) {
+  const [route, setRoute] = useState(first);
+  const [signedIn, setSignedIn] = useState(false);
+  // No saved theme to go by: follow the device.
+  useState(() => {
+    const dark = typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+    applyTheme(dark ? 'orbit' : 'daylight');
+    return null;
+  });
+  const api = useMemo(() => publicApi(client), [client]);
+  useEffect(() => {
+    let live = true;
+    client.auth.getSession().then(({ data }) => { if (live) setSignedIn(Boolean(data?.session)); }, () => {});
+    const back = () => setRoute(readRoute(window.location.pathname));
+    window.addEventListener('popstate', back);
+    return () => { live = false; window.removeEventListener('popstate', back); };
+  }, [client]);
+  const go = useCallback((path) => {
+    window.history.pushState(null, '', path);
+    setRoute(readRoute(path));
+    window.scrollTo(0, 0);
+  }, []);
+
+  return (
+    <div style={{ background: C.ground, backgroundImage: C.sky, minHeight: '100%', color: C.ink, fontFamily: "'Bricolage Grotesque', 'Segoe UI', system-ui, sans-serif" }}>
+      <AppStyles />
+      <div style={{ maxWidth: 760, margin: '0 auto', padding: '18px 16px 48px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 22 }}>
+          <a href={BASE} style={{ display: 'flex', alignItems: 'center', gap: 8, color: C.ink, textDecoration: 'none', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', fontSize: 13 }}>
+            <OrbitMark /> Orbit
+          </a>
+          <a href={BASE} style={{ ...solidLink(), marginLeft: 'auto', fontSize: 13, padding: '7px 12px' }}>{signedIn ? 'Open Orbit' : 'Join Orbit'}</a>
+        </div>
+        {!route ? (
+          <p style={{ fontSize: 14, color: C.muted }}>That page does not exist.</p>
+        ) : route.kind === 'profile' ? (
+          <ProfilePage key={`${route.username}/${route.year}`} api={api} username={route.username} year={route.year} go={go} signedIn={signedIn} />
+        ) : (
+          <CatalogPage key={route.id} api={api} id={route.id} onOpen={(id) => go(catalogPath(id))} onPerson={(u) => go(profilePath(u))} />
+        )}
+      </div>
     </div>
   );
 }
@@ -6869,14 +7275,14 @@ const loadGeo = () => {
 // The outlines module once loaded, else null. where(stop) → { country, state },
 // or null until then (or if they cannot load, when the counts that need them
 // are left out).
-const useGeo = () => {
+const useGeo = (wanted = true) => {
   const [mod, setMod] = useState(geoModule);
   useEffect(() => {
-    if (mod) return undefined;
+    if (mod || !wanted) return undefined;
     let live = true;
     loadGeo().then((m) => { if (live) setMod(m); }).catch(() => { /* counted without them */ });
     return () => { live = false; };
-  }, [mod]);
+  }, [mod, wanted]);
   const where = useMemo(() => (mod ? (st) => mod.whereIs(st.lat, st.lng) : null), [mod]);
   return { geo: mod, where };
 };
@@ -8951,8 +9357,12 @@ function ProfileSettings({ account }) {
   const start = () => ({
     pronouns: pr?.pronouns || '', bio: pr?.bio || '', location: pr?.location || '', phone: pr?.phone || '',
     contact_email: pr?.contact_email || '', website: pr?.website || '', socials: { ...(pr?.socials || {}) },
-    visibility: Object.fromEntries(PROFILE_FIELDS.map((f) => [f.key, visibilityOf(pr, f.key)])),
+    visibility: {
+      ...Object.fromEntries(PROFILE_FIELDS.map((f) => [f.key, visibilityOf(pr, f.key)])),
+      trips: pr?.visibility?.trips || 'me',
+    },
     searchable: pr?.searchable !== false,
+    publicPage: pr?.public_page === true,
   });
   const [draft, setDraft] = useState(start);
   const [as, setAs] = useState('none');
@@ -8980,6 +9390,8 @@ function ProfileSettings({ account }) {
       await account.updateProfile({
         pronouns: draft.pronouns, bio: draft.bio, location: draft.location, phone: draft.phone,
         contactEmail: draft.contact_email, website: site, socials, visibility: draft.visibility, searchable: draft.searchable,
+        // Only once the server has pages (schema part 5).
+        ...('public_page' in pr ? { publicPage: draft.publicPage } : {}),
       });
       setDraft({ ...draft, website: site, socials });
       setSaid('Your profile is saved.');
@@ -8990,14 +9402,51 @@ function ProfileSettings({ account }) {
     }
   };
   const preview = seenAs({ ...pr, ...draft }, as);
+  const pages = 'public_page' in pr;
+  const myPage = pageUrl(profilePath(pr.username));
 
   return (
     <div>
       <div style={settingsCard()}>
+        <p style={settingsHead}>Your page</p>
+        {!pages ? (
+          <p style={{ margin: 0, fontSize: 13, color: C.soonText, lineHeight: 1.5 }}>
+            Pages are not switched on yet. Run the updated setup script in Supabase, then come back.
+          </p>
+        ) : (
+          <>
+            <p style={{ margin: '0 0 10px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
+              Everything you share, in one place: the concerts, games and shows you set to Everyone or Friends, and your trips if you show them.
+            </p>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
+              <a href={profilePath(pr.username)} style={{ fontSize: 13.5, fontWeight: 600, color: C.ink, wordBreak: 'break-all' }}>{myPage.replace(/^https?:\/\//, '')}</a>
+              <Button style={{ fontSize: 12.5, padding: '5px 10px' }} onClick={async () => {
+                try { await navigator.clipboard.writeText(myPage); setSaid('Your page’s link is copied.'); } catch { setSaid(myPage); }
+              }}>Copy link</Button>
+            </div>
+            <div style={{ padding: '10px 0', borderTop: `1px solid ${C.line}` }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span style={{ flex: 1, fontSize: 13.5, fontWeight: 600, color: C.ink }}>Trips you have taken</span>
+                <VisibilityPick label="Trips" value={draft.visibility.trips} onChange={(v) => setVis('trips', v)} />
+              </div>
+              <span style={hintStyle()}>
+                Their titles, dates, ratings, highlights and places, to about a kilometre. Never who went, notes, photos, or trips still to come.
+              </span>
+            </div>
+            <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
+              <Check on={draft.publicPage} onChange={(v) => set('publicPage', v)} label="Anyone with the link can see it"
+                hint="On: anyone on the web, without an Orbit account, sees what you set to Everyone. Off: only people signed in to Orbit." />
+            </div>
+            <span style={hintStyle()}>Saved with your profile, below.</span>
+          </>
+        )}
+      </div>
+
+      <div style={settingsCard()}>
         <p style={settingsHead}>What people see</p>
         <p style={{ margin: '0 0 12px', fontSize: 13, color: C.muted, lineHeight: 1.5 }}>
           Your name (<strong style={{ color: C.ink }}>{pr.display_name}</strong>) and username (<strong style={{ color: C.ink }}>@{pr.username}</strong>)
-          are always visible, so people can find you. Choose who sees everything else. The email you sign in with is never shown.
+          are always visible, so people can find you. Choose who sees everything else. Everyone means everyone signed in to Orbit, and anyone on the web too if your page is open to anyone. The email you sign in with is never shown.
         </p>
         {PROFILE_FIELDS.map((f) => (
           <div key={f.key} style={{ padding: '10px 0', borderTop: `1px solid ${C.line}` }}>
@@ -9866,6 +10315,7 @@ export default function PersonalCRM({ account = null } = {}) {
   // Whether the saved events were read. Until they are, nothing is shared
   // from them: an events list that failed to load is not an empty one.
   const eventsRead = useRef(false);
+  const tripsLoaded = useRef(false);
   // Explore: the catalog entries opened, in order, so Back goes to the last.
   const [explore, setExplore] = useState([]);
   const [eventDraft, setEventDraft] = useState(null);
@@ -9938,6 +10388,7 @@ export default function PersonalCRM({ account = null } = {}) {
         try {
           const r = await window.storage.get(key);
           if (key === EVENTS_KEY) eventsRead.current = true;
+          if (key === TRIPS_KEY) tripsLoaded.current = true;
           if (!r?.value) return;
           const { list, damaged } = readSaved(r.value, cleanList, byIdentity);
           if (damaged) {
@@ -10143,6 +10594,33 @@ export default function PersonalCRM({ account = null } = {}) {
     }, 1200);
     return () => clearTimeout(t);
   }, [catalogOn, loading, sharedOutings, account]);
+
+  // Trips shown on your page follow the trips in the same way, once you have
+  // chosen to show them (Settings → Profile). While they are kept to you, an
+  // empty set goes, once, so no copy is left behind. Countries and states are
+  // worked out here, so the outlines load only when trips are shown.
+  const tripsShown = account?.profile?.visibility?.trips || 'me';
+  const showingTrips = catalogOn && tripsShown !== 'me' && 'public_page' in (account?.profile || {});
+  const { where: tripWhere } = useGeo(showingTrips && trips.length > 0);
+  const sharedTrips = useMemo(() => {
+    if (!showingTrips) return '[]';
+    if (trips.length && !tripWhere) return null;
+    return JSON.stringify(tripsToShare(trips, tripWhere, todayStr()));
+  }, [showingTrips, trips, tripWhere]);
+  useEffect(() => {
+    if (!catalogOn || !('public_page' in account.profile) || loading || !tripsLoaded.current || sharedTrips === null) return undefined;
+    const key = `orbit-trips-sent:${account.profile.id}`;
+    const print = fingerprint(`${tripsShown}|${sharedTrips}`);
+    let last = null;
+    try { last = localStorage.getItem(key); } catch { /* sent again, harmlessly */ }
+    if (last === print) return undefined;
+    const t = setTimeout(() => {
+      account.catalog.syncTrips(JSON.parse(sharedTrips)).then(() => {
+        try { localStorage.setItem(key, print); } catch { /* sent again next time */ }
+      }, () => {});
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [catalogOn, loading, sharedTrips, tripsShown, account]);
 
   // How many friend requests wait, read once when Orbit opens.
   useEffect(() => {
@@ -10640,146 +11118,12 @@ export default function PersonalCRM({ account = null } = {}) {
 
   return (
     <div style={{ background: C.ground, backgroundImage: C.sky, minHeight: '100%', color: C.ink, fontFamily: "'Bricolage Grotesque', 'Segoe UI', system-ui, sans-serif" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600&family=Source+Serif+4:opsz,wght@8..60,400&display=swap');
-        .crm-serif { font-family: 'Source Serif 4', Georgia, serif; }
-        .crm-btn:hover { filter: brightness(0.94); }
-        .crm-row:hover { background: ${C.rowHover}; }
-        .crm-btn:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible {
-          outline: 2px solid ${C.ink}; outline-offset: 2px;
-        }
-        input, select, textarea { font-family: inherit; }
-        .crm-full { grid-column: 1 / -1; }
-        
-        /* Narrow: one column. The panel replaces the list rather than pushing it. */
-        .crm-shell { max-width: 460px; margin: 0 auto; padding: 22px 16px 60px; }
-        .crm-main.is-hidden { display: none; }
-        .crm-detail { display: none; }
-        .crm-detail.is-open { display: block; }
-        .crm-idle { display: none; }
-        .crm-tpl-wide { display: none; }
-
-        /* Wide: list and detail side by side, detail pinned while the list scrolls. */
-        @media (min-width: 880px) {
-          .crm-shell {
-            max-width: 1000px;
-            display: grid;
-            grid-template-columns: minmax(0, 1fr) 384px;
-            column-gap: 30px;
-            align-items: start;
-          }
-          .crm-head { grid-column: 1 / -1; }
-          .crm-main.is-hidden { display: block; }
-          .crm-detail { display: block; position: sticky; top: 20px; }
-          .crm-back { display: none; }
-          .crm-idle { display: block; }
-          .crm-tpl-wide { display: block; }
-          .crm-tpl-pick { display: none; }
-        }
-        .crm-person:last-child, .crm-entry:last-child { border-bottom: none !important; }
-        /* A list can hold thousands of entries. Rows off screen are skipped
-           until scrolled to, which is most of what a keystroke costs on a long
-           list. Still found by find-in-page and screen readers. */
-        .crm-entry { content-visibility: auto; contain-intrinsic-size: auto 62px; }
-        /* The same for people, who can run to hundreds. What every person
-           row shares is here too, rather than inline (see PersonRow). */
-        .crm-person {
-          content-visibility: auto; contain-intrinsic-size: auto 65px;
-          display: flex; border-bottom: 1px solid ${C.line};
-        }
-        .crm-person-bar { width: 4px; flex-shrink: 0; }
-        .crm-person-body, .crm-person-main { flex: 1; min-width: 0; }
-        .crm-person .crm-row { padding: 14px 15px; cursor: pointer; display: flex; align-items: baseline; gap: 10px; }
-        .crm-person-top { display: flex; align-items: baseline; gap: 7px; }
-        .crm-person-name {
-          font-size: 17px; font-weight: 600; letter-spacing: -0.02em; color: ${C.ink};
-          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-        }
-        .crm-person-age { font-size: 13px; color: ${C.faint}; flex-shrink: 0; }
-        .crm-person-sub { font-size: 13px; color: ${C.muted}; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .crm-person-when { text-align: right; flex-shrink: 0; max-width: 116px; white-space: nowrap; }
-        .crm-person-status { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
-        .crm-person-cadence { font-size: 12px; color: ${C.faint}; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
-        .crm-person-act {
-          flex-shrink: 0; cursor: pointer; background: transparent;
-          border: none; border-left: 1px solid ${C.line};
-          display: flex; align-items: center; justify-content: center;
-        }
-        /* That also clips painting to each row, which would cut off a focus
-           ring drawn outside a button that fills the row, so rings go inside. */
-        .crm-entry .crm-btn:focus-visible, .crm-entry a:focus-visible,
-        .crm-person .crm-btn:focus-visible { outline-offset: -3px; }
-        /* Important, because every select also takes the shared input style
-           inline, whose background and padding would otherwise paint over
-           the arrow and run the text underneath it. */
-        .crm-select {
-          appearance: none; -webkit-appearance: none;
-          background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.5 4.5 L6 8 L9.5 4.5' fill='none' stroke='${encodeURIComponent(C.muted)}' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>") !important;
-          background-repeat: no-repeat !important; background-position: right 11px center !important; background-size: 12px !important;
-          padding-right: 32px !important;
-        }
-        /* Hidden from sight, still there for keyboards and screen readers. */
-        .crm-sr {
-          position: absolute !important; width: 1px; height: 1px; margin: -1px; padding: 0;
-          overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
-        }
-        .crm-star input:focus-visible + span, .crm-file:focus-within {
-          outline: 2px solid ${C.ink}; outline-offset: 2px; border-radius: 6px;
-        }
-        .crm-clamp { -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-        /* Maps. Tiles, popups and controls all follow the theme. */
-        /* Close to the tiles' own sea, so any gap around the world reads as ocean. */
-        .orbit-map { font-family: inherit; background: ${C.dark ? '#1B1D20' : '#D6DCDE'}; }
-        .orbit-map .leaflet-bar { border: 1px solid ${C.line}; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.12); overflow: hidden; }
-        .orbit-map .leaflet-bar a {
-          width: 34px; height: 34px; line-height: 32px; font-size: 18px; font-weight: 500;
-          background: ${C.surface}; color: ${C.ink}; border-bottom: 1px solid ${C.line};
-        }
-        .orbit-map .leaflet-bar a:last-child { border-bottom: none; }
-        .orbit-map .leaflet-bar a:hover, .orbit-map .leaflet-bar a:focus-visible { background: ${C.rowHover}; color: ${C.ink}; }
-        .orbit-map .leaflet-bar a.leaflet-disabled { background: ${C.surface}; color: ${C.faint}; opacity: 0.5; }
-        .orbit-map .leaflet-control-attribution {
-          background: ${C.surface}cc; color: ${C.muted}; font-size: 10.5px; border-top-left-radius: 6px; padding: 1px 6px;
-        }
-        .orbit-map .leaflet-control-attribution a { color: ${C.muted}; }
-        .orbit-map .leaflet-popup-content-wrapper, .orbit-map .leaflet-popup-tip {
-          background: ${C.surface}; color: ${C.ink}; box-shadow: 0 6px 22px rgba(0,0,0,0.28);
-        }
-        .orbit-map .leaflet-popup-content { margin: 12px 14px; font-size: 13px; line-height: 1.4; }
-        .orbit-map a.leaflet-popup-close-button { color: ${C.muted}; }
-        .orbit-pin, .orbit-cluster { background: none; border: none; }
-        .orbit-pin span, .orbit-cluster span {
-          display: flex; align-items: center; justify-content: center; box-sizing: border-box;
-          border-radius: 50%; color: #fff; font-weight: 700; font-family: system-ui, sans-serif;
-        }
-        .orbit-pin span { width: 28px; height: 28px; font-size: 13px; border: 2px solid #fff; box-shadow: 0 1px 5px rgba(0,0,0,0.45); }
-        /* Trips to come: the colour moves from the fill to a thick ring. */
-        .orbit-pin-planned span, .orbit-pin-someday span {
-          background: #fff !important; box-shadow: 0 0 0 2px #fff, 0 1px 5px rgba(0,0,0,0.45);
-        }
-        .orbit-pin-planned span { border: 4px solid ${PLAN_COLORS.planned}; }
-        .orbit-pin-someday span { border: 3px dashed ${PLAN_COLORS.someday}; }
-        .orbit-cluster span {
-          width: 38px; height: 38px; font-size: 13px; background: #15211B;
-          border: 3px solid #72DE88; box-shadow: 0 1px 6px rgba(0,0,0,0.4);
-        }
-        .orbit-pin:focus-visible, .orbit-cluster:focus-visible { outline: none; }
-        .orbit-pin:focus-visible span, .orbit-cluster:focus-visible span { outline: 3px solid #15211B; outline-offset: 2px; }
-        .crm-open { animation: crmIn .16s ease-out; }
-        @keyframes crmIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
-        @media (prefers-reduced-motion: reduce) { .crm-open { animation: none; } }
-      `}</style>
+      <AppStyles />
 
       <div className="crm-shell">
         <div className="crm-head">
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 18 }}>
-          <svg width="19" height="19" viewBox="0 0 19 19" style={{ flexShrink: 0, overflow: 'visible' }}>
-            <ellipse cx="9.5" cy="9.5" rx="9" ry="4.4" fill="none"
-              stroke={C.accent} strokeWidth="1.1" opacity="0.65"
-              transform="rotate(-28 9.5 9.5)" />
-            <circle cx="9.5" cy="9.5" r="3.1" fill={C.accent} />
-            <circle cx="17.2" cy="5.7" r="1.7" fill={C.accent} />
-          </svg>
+          <OrbitMark />
           {namingOwner ? (
             <input
               autoFocus
@@ -10887,6 +11231,11 @@ export default function PersonalCRM({ account = null } = {}) {
                           margin: 0, padding: '9px 13px 0', fontSize: 12, color: C.muted,
                           maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                         }} title={account.email}>{account.profile ? `@${account.profile.username}` : account.email || 'Signed in'}</p>
+                        {account.profile && (
+                          <a href={profilePath(account.profile.username)} onClick={() => setMenuOpen(false)} style={{
+                            display: 'block', padding: '4px 13px 0', fontSize: 13.5, fontWeight: 600, color: C.ink, textDecoration: 'none',
+                          }}>Your page</a>
+                        )}
                         <button
                           className="crm-btn"
                           onClick={() => { setMenuOpen(false); account.signOut(); }}
@@ -11248,6 +11597,7 @@ export default function PersonalCRM({ account = null } = {}) {
               events={events}
               onEvent={(e) => { setView('events'); setEventDraft(e); }}
               owner={owner}
+              pageFor={account?.profile ? (y) => pageUrl(profilePath(account.profile.username, y)) : null}
               eventCount={events.filter((e) => Number(e.date.slice(0, 4)) === year).length}
               reminderCount={reminders.reduce((n, r) => n + (r.history || [])
                 .filter((h) => h?.date && Number(h.date.slice(0, 4)) === year).length, 0)}

@@ -105,3 +105,25 @@ export const outingsToShare = (events, outingKinds, today) => events
     links: cleanLinks(e.links).map((l) => l.id),
   }))
   .sort((a, b) => (a.event_id < b.event_id ? -1 : a.event_id > b.event_id ? 1 : 0));
+
+// Trips shown on a person's page (see sync_trips in the schema, part 5):
+// only trips taken, never ones still to come, which would say when someone is
+// away. Title, dates, rating, highlight, and each stop's name, country and US
+// state with its position rounded to about a kilometre. Never who went,
+// notes, tags or photos. where(stop) gives { country, state } (see geo.js).
+const km = (n) => Math.round(n * 100) / 100;
+export const tripsToShare = (trips, where, today) => trips
+  .filter((t) => t && !t.status && t.startDate && t.startDate <= today)
+  .map((t) => ({
+    trip_id: String(t.id).slice(0, 100),
+    title: String(t.title).trim().slice(0, 200),
+    start: t.startDate,
+    end: t.endDate || null,
+    rating: t.rating || null,
+    highlight: String(t.excerpt || '').trim().slice(0, 300),
+    stops: (t.stops || []).filter((st) => typeof st.lat === 'number' && typeof st.lng === 'number').slice(0, 50).map((st) => {
+      const w = (where && where(st)) || {};
+      return { name: String(st.name || '').slice(0, 200), lat: km(st.lat), lng: km(st.lng), country: w.country || '', state: w.state || '' };
+    }),
+  }))
+  .sort((a, b) => (a.trip_id < b.trip_id ? -1 : a.trip_id > b.trip_id ? 1 : 0));

@@ -80,7 +80,7 @@ try {
   };
   const before = report();
   check('the setup check runs on an empty database and reports everything missing',
-    before.length === 21 && before.every(([, st]) => st.startsWith('MISSING')), before);
+    before.length === 24 && before.every(([, st]) => st.startsWith('MISSING')), before);
   // Part 1 alone, as it was merged, before friends existed.
   const partOne = schema.slice(0, schema.indexOf('-- Profiles as others see them.'));
   if (partOne.length < schema.length) {
@@ -94,7 +94,7 @@ try {
   const again = psql(schema);
   check('and runs again without harm, as its header promises', again.ok, again.err);
   const after = report();
-  check('after the whole schema, the setup check says OK to everything', after.length === 21 && after.every(([, st]) => st === 'OK'), after);
+  check('after the whole schema, the setup check says OK to everything', after.length === 24 && after.every(([, st]) => st === 'OK'), after);
 
   // ---- signing up ----
   check('a password sign-up makes the profile in the same step',
@@ -247,7 +247,7 @@ try {
   const add = (who, kind, name, source, sid, about = '') => one(who, `select public.catalog_add('${kind}', '${name}', '${about}', '${source}', ${sid === null ? 'null' : `'${sid}'`});`);
   const anonAdd = as('anon', "select public.catalog_add('team', 'X', '', 'orbit', null);");
   check('signed-out visitors cannot add to the catalog', !anonAdd.ok, anonAdd.err);
-  for (const fn of ["catalog_search('ch')", `catalog_page('${A}')`, "sync_outings('[]'::jsonb)"]) {
+  for (const fn of ["catalog_search('ch')", "sync_outings('[]'::jsonb)"]) {
     check(`nor call ${fn.split('(')[0]}`, !as('anon', `select public.${fn};`).ok);
   }
   const chiefs = add(A, 'team', 'Kansas City Chiefs', 'wikidata', 'Q223455', 'NFL team in Kansas City');
@@ -313,12 +313,69 @@ try {
   check('sharing needs a username first', !early.ok && /username/.test(early.err), early.err);
   check('share one with everyone again', sync(A, items).ok);
 
+  // ---- public pages ----
+  const pub = (who, name, year = null) => one(who, `select public.public_profile('${name}', ${year === null ? 'null' : year});`);
+  const hiddenPage = pub('anon', 'brock');
+  check('a signed-out visitor sees only the name of a page that is not public', hiddenPage.hidden === true
+    && JSON.stringify(Object.keys(hiddenPage.profile).sort()) === '["display_name","username"]' && !('outings' in hiddenPage), hiddenPage);
+  const anonCat = page('anon', chiefs.id);
+  check('nor its outings on a catalog page, even those shared with everyone', anonCat.outings.length === 0 && anonCat.ratings === 0, anonCat);
+  check('an unknown username has no page', pub(D, 'nobody_here') === null && pub('anon', 'nobody_here') === null);
+
+  const tripItems = [
+    { trip_id: 't1', title: 'Lisbon', start: '2025-05-10', end: '2025-05-17', rating: 4.5, highlight: 'Tram 28',
+      stops: [{ name: 'Lisbon', lat: 38.72231, lng: -9.13934, country: 'Portugal', state: '' }, { name: 'Bad', lat: 999, lng: 0 }] },
+    { trip_id: 't2', title: 'Later', start: '2099-01-01', stops: [] },
+    { trip_id: 't3', title: 'Bad dates', start: '2025-05-10', end: '2025-05-01', stops: [] },
+  ];
+  const syncTrips = (who, list) => as(who, `select public.sync_trips('${JSON.stringify(list).replace(/'/g, "''")}'::jsonb);`);
+  check('trips set to only me are never kept', syncTrips(A, tripItems).out.split('\n').pop() === '0'
+    && psql(`select count(*) from public.shared_trips where user_id = '${A}'`).out === '0');
+  check('A shows trips to friends', as(A, `update public.profiles set visibility = visibility || '{"trips":"friends"}'::jsonb where id = '${A}';`).ok);
+  check('then trips that have happened are kept, and malformed ones are not', syncTrips(A, tripItems).out.split('\n').pop() === '1');
+  check('each stop keeps a position rounded to about a kilometre, and bad stops are dropped',
+    psql(`select stops::text from public.shared_trips where user_id = '${A}'`).out === '[{"lat": 38.72, "lng": -9.14, "name": "Lisbon", "state": "", "country": "Portugal"}]',
+    psql(`select stops::text from public.shared_trips where user_id = '${A}'`).out);
+  const byFriend = pub(B, 'brock');
+  check('a friend sees the trips and every outing they may see', byFriend.trips.length === 1 && byFriend.trips[0].highlight === 'Tram 28'
+    && byFriend.outings.length === 2 && byFriend.profile.relation === 'friends', byFriend);
+  check('with the years there is anything in', JSON.stringify(byFriend.years) === '[2026,2025]', byFriend.years);
+  check('outings carry what they link to', byFriend.outings.find((o) => o.id === 'e1')?.links.map((l) => l.name).sort().join() === 'Arrowhead Stadium,Kansas City Chiefs');
+  const year = pub(B, 'brock', 2025);
+  check('one year shows only that year', year.trips.length === 1 && year.outings.length === 0 && year.year === 2025, year);
+  const byStranger = pub(D, 'brock');
+  check('a stranger sees outings shared with everyone, not trips shown to friends', byStranger.outings.length === 1 && byStranger.trips.length === 0, byStranger);
+  check('and the owner sees all of their own', pub(A, 'brock').outings.length === 2 && pub(A, 'brock').trips.length === 1);
+
+  check('A opens the page to the web', as(A, `update public.profiles set public_page = true where id = '${A}';`).ok);
+  const open = pub('anon', 'brock');
+  check('now a signed-out visitor sees what is shared with everyone', open.hidden === false && open.outings.length === 1 && open.outings[0].id === 'e1'
+    && open.trips.length === 0, open);
+  check('and the profile details set to everyone only', open.profile.username === 'brock' && !('birthday' in open.profile) && open.profile.relation === 'none', open.profile);
+  const anonCat2 = page('anon', chiefs.id);
+  check('and the outing on the catalog page, counted in the average', anonCat2.outings.length === 1 && anonCat2.ratings === 1 && anonCat2.outings[0].by.relation === 'none', anonCat2);
+  check('trips shown to everyone reach signed-out visitors too', as(A, `update public.profiles set visibility = visibility || '{"trips":"everyone"}'::jsonb where id = '${A}';`).ok
+    && pub('anon', 'brock').trips.length === 1);
+  check('A blocks D', call(A, `block_user('${D}')`).ok);
+  check('a block hides the page both ways', pub(D, 'brock') === null && pub(A, 'dora') === null);
+  check('A unblocks D', call(A, `unblock_user('${D}')`).ok);
+  check('A sets trips back to only me', as(A, `update public.profiles set visibility = visibility || '{"trips":"me"}'::jsonb where id = '${A}';`).ok);
+  check('then nobody else sees them, even before the next sync', pub(B, 'brock').trips.length === 0 && pub('anon', 'brock').trips.length === 0);
+  check('and the next sync clears them', syncTrips(A, tripItems).out.split('\n').pop() === '0' && psql(`select count(*) from public.shared_trips where user_id = '${A}'`).out === '0');
+  check('signed-out visitors cannot share trips', !as('anon', "select public.sync_trips('[]'::jsonb);").ok);
+  const readTrips = as(B, 'select * from public.shared_trips;');
+  check('shared trips cannot be read directly', !readTrips.ok && /permission denied/.test(readTrips.err), readTrips.err);
+  check('an unknown visibility setting is still dropped', as(A, `update public.profiles set visibility = visibility || '{"trips":"nope"}'::jsonb where id = '${A}';`).ok
+    && psql(`select visibility ? 'trips' from public.profiles where id = '${A}'`).out === 'f');
+  check('show trips to friends again, for deleting below', as(A, `update public.profiles set visibility = visibility || '{"trips":"friends"}'::jsonb where id = '${A}';`).ok
+    && syncTrips(A, tripItems).out.split('\n').pop() === '1');
+
   // ---- deleting an account ----
   const anonDel = as('anon', 'select public.delete_my_account();');
   check('a signed-out visitor cannot delete anything', !anonDel.ok, anonDel.err);
   check('a person can delete their own account', as(A, 'select public.delete_my_account();').ok);
   check('which removes their sign-in, profile and saved data', psql(`select (select count(*) from auth.users where id = '${A}') + (select count(*) from public.profiles where id = '${A}') + (select count(*) from public.orbit_data where user_id = '${A}')`).out === '0');
-  check('their shared outings go with it, and the entries they added stay, without their name', psql(`select (select count(*) from public.outings where user_id = '${A}') + (select count(*) from public.outing_links where user_id = '${A}')`).out === '0'
+  check('their shared outings go with it, and the entries they added stay, without their name', psql(`select (select count(*) from public.outings where user_id = '${A}') + (select count(*) from public.outing_links where user_id = '${A}') + (select count(*) from public.shared_trips where user_id = '${A}')`).out === '0'
     && psql(`select count(*) || '|' || count(created_by) from public.catalog where source_id = 'Q223455'`).out === '1|0');
   check('and nobody else\'s', psql(`select (select count(*) from public.profiles where id = '${B}') + (select count(*) from public.orbit_data where user_id = '${B}')`).out === '2');
 } finally {

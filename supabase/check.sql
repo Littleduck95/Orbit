@@ -43,6 +43,13 @@ from (values
   (21, 'Part 4: search, pages and sharing',    to_regprocedure('public.catalog_add(text, text, text, text, text)') is not null
                                                 and to_regprocedure('public.catalog_search(text, text)') is not null
                                                 and to_regprocedure('public.catalog_page(uuid)') is not null
-                                                and to_regprocedure('public.sync_outings(jsonb)') is not null)
+                                                and to_regprocedure('public.sync_outings(jsonb)') is not null),
+  (22, 'Part 5: public page setting',          exists (select 1 from information_schema.columns
+                                                  where table_schema = 'public' and table_name = 'profiles' and column_name = 'public_page')),
+  (23, 'Part 5: trips shown on pages',         to_regclass('public.shared_trips') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.shared_trips')), false)
+                                                and to_regprocedure('public.sync_trips(jsonb)') is not null),
+  (24, 'Part 5: public pages',                 case when to_regprocedure('public.public_profile(text, integer)') is null then false
+                                                else has_function_privilege('anon', to_regprocedure('public.public_profile(text, integer)')::oid, 'execute') end)
 ) as t(n, item, ok)
 order by n;

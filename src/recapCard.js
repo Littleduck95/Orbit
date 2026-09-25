@@ -248,7 +248,7 @@ export const drawRecapCard = (canvas, card, geo) => {
 
   ctx.font = `400 26px ${FONT}`;
   ctx.fillStyle = FAINT;
-  ctx.fillText(card.site ? `Made with Orbit · ${card.site}` : 'Made with Orbit', PAD, CARD_H - 64);
+  ctx.fillText(fit(ctx, card.site ? `Made with Orbit · ${card.site}` : 'Made with Orbit', CARD_W - PAD * 2), PAD, CARD_H - 64);
 };
 
 export const cardBlob = (canvas) => new Promise((resolve) => {

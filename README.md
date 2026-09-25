@@ -57,7 +57,8 @@ src/PersonalCRM.jsx   the app
 src/photoStore.js     trip photos in IndexedDB, and preparing uploads
 src/TripMap.jsx       the Leaflet maps, loaded only when a map is shown
 src/recapCard.js      draws Recap's share card on a canvas
-src/catalog.js        the shared catalog: Wikidata search, and what of an event is shared
+src/catalog.js        the shared catalog: Wikidata search, and what of an event or trip is shared
+src/route.js          the public addresses (/u/name, /u/name/year, /c/id) that skip sign-in
 src/mapConfig.js      map tiles and place search: one entry each
 src/geo.js            country and US state outlines: which one a stop is in, and shading
 tests/                characterization tests (logic, storage, account, browser)
@@ -446,6 +447,58 @@ deletes its outings; entries it added stay, without its name.
 adder's app sent (for Wikidata, what Wikidata said), and anyone signed in
 can add entries. There is no reporting or merging of duplicates yet.
 
+### Public pages
+
+Everyone with a username has a page at `<site>/u/<username>`, and one per
+year at `<site>/u/<username>/<year>`. It shows their name and whatever
+profile details this viewer may see, the numbers (trips, countries, US
+states, days away, and concerts, games, shows and festivals), a map of their
+trips, the trips with their dates, stars and highlights, and their concerts,
+games and shows with what they thought and links to the catalog. Year chips
+move between all time and each year with anything in it; *Copy link to this
+page* copies the address. Catalog entries have pages too, at
+`<site>/c/<id>`, and on them each name links to that person's page.
+
+These open **without signing in** (`src/main.jsx` sends those addresses to
+`PublicPage` rather than the sign-in screen), follow the device's light or
+dark setting, and invite a visitor to join. Moving between them stays on the
+page; *Open Orbit* or *Join Orbit* goes to the app.
+
+**Who sees what.** Signed-in people see a page by the owner's settings, as
+everywhere else: Everyone, Friends, or only the owner, and nothing across a
+block. Signed-out visitors, anyone on the web, see only what is set to
+Everyone, and only once its owner ticks **Anyone with the link can see it**
+(Settings → Profile → *Your page*; off to start with). Until then they see
+the name and username, and a way to log in. "Everyone" meant everyone in
+Orbit before pages existed, so nobody's details reach the open web without
+their saying so. The same rule covers catalog pages: a signed-out visitor
+only sees outings, and counts ratings, from people whose pages are open.
+
+**Trips on the page** are off until chosen: *Trips you have taken* in the
+same card, Everyone, Friends or Only me. Once shown, the app copies the
+trips taken (never ones planned or wished for, which would say when someone
+is away) with their title, dates, rating, highlight and each stop's name,
+country and US state, and its position rounded to about a kilometre. Never
+who went, notes, tags, photos or street addresses. Countries and states are
+worked out on the device from the outlines, which load only for this. The
+copy follows the trips the way shared outings follow events: the whole set
+when it changes, never before the trips have been read, and an empty set
+once when trips go back to Only me (the database also stops showing them at
+once).
+
+**Links to it.** The ⋮ menu has *Your page* under your username, Settings
+shows the address with *Copy link*, and the Recap share card names the
+year's page in its footer (the share sheet sends the address with the
+picture).
+
+**GitHub Pages** has no routes of its own, so the build writes the app a
+second time as `404.html`, which Pages serves for any address it does not
+have; the app then reads the address. It works for people, but the answer
+carries a 404 status, and link previews (iMessage, Slack) and search
+engines see the generic page rather than the person. Proper previews need a
+host with rewrites and a server-rendered page or an Open Graph image per
+address.
+
 ### Preferences and notifications
 
 **Settings → Preferences** holds the theme, which tab Orbit opens on, and
@@ -512,7 +565,8 @@ reads the same offline), `review` (the thoughts shared with the rating) and
 `visibility` (`everyone`, `friends` or `me`); events saved before these
 existed read as kept to yourself. A fingerprint of the last set of outings
 shared is kept per account under `orbit-outings-sent:<user id>` in
-`localStorage`, outside the account's own keys. Lists are called
+`localStorage`, outside the account's own keys, and one of the trips shown on
+your page under `orbit-trips-sent:<user id>`. Lists are called
 collections in the code, because "list" already means the people list there.
 The app reads and writes them through an async `window.storage` object.
 

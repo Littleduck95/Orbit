@@ -163,7 +163,7 @@ begin
     end if;
   end loop;
   for k, v in select * from jsonb_each(coalesce(new.visibility, '{}'::jsonb)) loop
-    if k in ('pronouns', 'bio', 'location', 'birthday', 'phone', 'contact_email', 'website', 'socials')
+    if k in ('pronouns', 'bio', 'location', 'birthday', 'phone', 'contact_email', 'website', 'socials', 'trips')
        and v #>> '{}' in ('everyone', 'friends', 'me') then
       vis := vis || jsonb_build_object(k, v #>> '{}');
     end if;
@@ -565,6 +565,15 @@ revoke all on public.catalog from anon, authenticated;
 revoke all on public.outings from anon, authenticated;
 revoke all on public.outing_links from anon, authenticated;
 
+-- Whether someone has opened their page to the whole web: off until they
+-- turn it on. Part 5 has the pages themselves.
+alter table public.profiles add column if not exists public_page boolean not null default false;
+create or replace function public.page_is_public(who uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select coalesce((select public_page from public.profiles where id = who), false);
+$$;
+revoke all on function public.page_is_public(uuid) from public, anon, authenticated;
+
 -- An entry as it is handed out: never who added it.
 create or replace function public.catalog_entry(c public.catalog) returns jsonb
 language sql stable security definer set search_path = '' as $$
@@ -572,12 +581,15 @@ language sql stable security definer set search_path = '' as $$
 $$;
 
 -- Whether this viewer may see an outing: their own always; otherwise one set
--- to Everyone, or to Friends when they are friends; never across a block.
+-- to Everyone, or to Friends when they are friends; never across a block. A
+-- signed-out viewer (null) sees one set to Everyone only when its owner has
+-- made their page public (see part 5).
 create or replace function public.can_see_outing(owner uuid, vis text, viewer uuid) returns boolean
 language sql stable security definer set search_path = '' as $$
-  select owner = viewer
+  select coalesce(owner = viewer, false)
     or (not public.is_blocked(owner, viewer)
-        and (vis = 'everyone' or (vis = 'friends' and viewer is not null and public.are_friends(owner, viewer))));
+        and ((vis = 'everyone' and (viewer is not null or public.page_is_public(owner)))
+             or (vis = 'friends' and viewer is not null and public.are_friends(owner, viewer))));
 $$;
 revoke all on function public.catalog_entry(public.catalog) from public, anon, authenticated;
 revoke all on function public.can_see_outing(uuid, text, uuid) from public, anon, authenticated;
@@ -629,7 +641,7 @@ begin
     from public.catalog c
     cross join lateral (
       select count(*) filter (where public.can_see_outing(o.user_id, o.visibility, me)) as n,
-             round(avg(o.rating) filter (where o.visibility = 'everyone' and not public.is_blocked(o.user_id, me)), 2) as avg
+             round(avg(o.rating) filter (where o.visibility = 'everyone' and public.can_see_outing(o.user_id, o.visibility, me)), 2) as avg
       from public.outing_links l join public.outings o on o.user_id = l.user_id and o.event_id = l.event_id
       where l.catalog_id = c.id
     ) s
@@ -638,7 +650,7 @@ begin
     limit 20;
 end $$;
 
--- One entry's page: the entry, its ratings shared with everyone (how many,
+-- One entry's page, for anyone, signed in or not: the entry, its ratings shared with everyone (how many,
 -- the average, and how many at each half star), and the outings this viewer
 -- may see, newest first, each with who logged it and what else it links to.
 create or replace function public.catalog_page(p_id uuid) returns jsonb
@@ -648,7 +660,8 @@ declare
   c public.catalog;
   out jsonb;
 begin
-  if me is null then raise exception 'Not signed in'; end if;
+  -- Signed-out visitors may look too (a public page links here), and see
+  -- only what is shared with everyone.
   select * into c from public.catalog where id = p_id;
   if c.id is null then return null; end if;
   with mine as (
@@ -658,7 +671,8 @@ begin
     join public.profiles p on p.id = o.user_id
     where l.catalog_id = c.id
   ), public_ratings as (
-    select rating from mine where visibility = 'everyone' and rating is not null and not public.is_blocked(user_id, me)
+    select rating from mine where visibility = 'everyone' and rating is not null
+      and public.can_see_outing(user_id, visibility, me)
   )
   select jsonb_build_object(
     'entry', public.catalog_entry(c),
@@ -730,12 +744,159 @@ end $$;
 
 revoke all on function public.catalog_add(text, text, text, text, text) from public, anon;
 revoke all on function public.catalog_search(text, text) from public, anon;
-revoke all on function public.catalog_page(uuid) from public, anon;
+revoke all on function public.catalog_page(uuid) from public;
 revoke all on function public.sync_outings(jsonb) from public, anon;
 grant execute on function public.catalog_add(text, text, text, text, text) to authenticated;
 grant execute on function public.catalog_search(text, text) to authenticated;
-grant execute on function public.catalog_page(uuid) to authenticated;
+grant execute on function public.catalog_page(uuid) to anon, authenticated;
 grant execute on function public.sync_outings(jsonb) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Part 5: public pages. Each person has a page (/u/username, and one per
+-- year) with what they have chosen to show: the profile details, outings and
+-- trips each set to Everyone or Friends. Signed-in people see it by those
+-- settings. Signed-out visitors, anyone on the web, see only what is set to
+-- Everyone, and only once its owner turns on public_page: "Everyone" meant
+-- everyone in Orbit before pages existed, so nobody is put on the open web
+-- without saying so.
+--
+-- Trips live in each person's own saved data. When they choose to show them
+-- (visibility.trips), the trips they have taken are copied here: title,
+-- dates, rating, highlight, and each stop's name, country, US state and a
+-- position rounded to about a kilometre. Never who went, never notes or
+-- photos, and never trips still to come, which would say when someone is
+-- away from home.
+
+-- public_page, whether signed-out visitors may see a page at all, is added
+-- in part 4 above, where outings first need it.
+
+create table if not exists public.shared_trips (
+  user_id    uuid         not null references auth.users (id) on delete cascade,
+  trip_id    text         not null check (char_length(trip_id) between 1 and 100),
+  title      text         not null check (char_length(title) between 1 and 200),
+  start_date date         not null,
+  end_date   date         check (end_date is null or end_date >= start_date),
+  rating     numeric(2,1) check (rating is null or (rating between 0.5 and 5 and rating * 2 = trunc(rating * 2))),
+  highlight  text         not null default '' check (char_length(highlight) <= 300),
+  stops      jsonb        not null default '[]'::jsonb check (jsonb_typeof(stops) = 'array' and jsonb_array_length(stops) <= 50),
+  updated_at timestamptz  not null default now(),
+  primary key (user_id, trip_id)
+);
+alter table public.shared_trips enable row level security;
+revoke all on public.shared_trips from anon, authenticated;
+
+-- Replaces the trips this person shows with the set given: an array of
+-- { trip_id, title, start, end, rating, highlight, stops: [{ name, lat, lng,
+-- country, state }] }. Nothing is kept while their trips are set to Only me.
+-- Anything malformed or still to come is left out. Answers with how many
+-- were kept.
+create or replace function public.sync_trips(items jsonb) returns integer
+language plpgsql security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  vis text;
+  it jsonb;
+  st jsonb;
+  stops jsonb;
+  kept integer;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  select coalesce(visibility ->> 'trips', 'me') into vis from public.profiles where id = me;
+  if vis is null then raise exception 'Choose a username first'; end if;
+  if jsonb_typeof(items) is distinct from 'array' then raise exception 'Expected a list'; end if;
+  if jsonb_array_length(items) > 1000 then raise exception 'Too many to share at once'; end if;
+  delete from public.shared_trips where user_id = me;
+  if vis = 'me' then return 0; end if;
+  for it in select value from jsonb_array_elements(items) loop
+    begin
+      if jsonb_typeof(it) <> 'object' or (it ->> 'start')::date > current_date + 1 then continue; end if;
+      stops := '[]'::jsonb;
+      for st in select value from jsonb_array_elements(case when jsonb_typeof(it -> 'stops') = 'array' then it -> 'stops' else '[]'::jsonb end) limit 50 loop
+        if jsonb_typeof(st) = 'object' and (st ->> 'lat')::float8 between -90 and 90 and (st ->> 'lng')::float8 between -180 and 180 then
+          stops := stops || jsonb_build_array(jsonb_build_object(
+            'name', left(coalesce(st ->> 'name', ''), 200),
+            'lat', round((st ->> 'lat')::numeric, 2), 'lng', round((st ->> 'lng')::numeric, 2),
+            'country', left(coalesce(st ->> 'country', ''), 100), 'state', left(coalesce(st ->> 'state', ''), 100)));
+        end if;
+      end loop;
+      insert into public.shared_trips (user_id, trip_id, title, start_date, end_date, rating, highlight, stops)
+        values (me, it ->> 'trip_id', btrim(it ->> 'title'), (it ->> 'start')::date, (it ->> 'end')::date,
+                (it ->> 'rating')::numeric, left(btrim(coalesce(it ->> 'highlight', '')), 300), stops)
+        on conflict do nothing;
+    exception when others then
+      null; -- this one is left out; the rest still go
+    end;
+  end loop;
+  select count(*) into kept from public.shared_trips where user_id = me;
+  return kept;
+end $$;
+
+-- One person's page, for anyone: their profile as this viewer may see it,
+-- the years with anything in them, and the trips and outings this viewer may
+-- see (all of them, or one year's). A signed-out visitor gets only the name
+-- and username, with hidden set, unless the page is public. Nothing across a
+-- block, and nothing for a username nobody has.
+create or replace function public.public_profile(uname text, p_year integer default null) returns jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  p public.profiles;
+  rel text;
+  tv text;
+  see_trips boolean;
+begin
+  select * into p from public.profiles where username = lower(ltrim(btrim(coalesce(uname, '')), '@'));
+  if p.id is null or public.is_blocked(p.id, me) then return null; end if;
+  if me is null and not p.public_page then
+    return jsonb_build_object('profile', jsonb_build_object('username', p.username, 'display_name', p.display_name), 'hidden', true);
+  end if;
+  rel := public.relation_to(p.id, me);
+  tv := coalesce(p.visibility ->> 'trips', 'me');
+  see_trips := rel = 'self' or tv = 'everyone' or (tv = 'friends' and rel = 'friends');
+  return jsonb_build_object(
+    'profile', public.profile_for(p, me),
+    'hidden', false,
+    'year', p_year,
+    'years', coalesce((
+      select jsonb_agg(y order by y desc) from (
+        select distinct extract(year from o.on_date)::integer as y from public.outings o
+          where o.user_id = p.id and public.can_see_outing(o.user_id, o.visibility, me)
+        union
+        select distinct extract(year from t.start_date)::integer from public.shared_trips t
+          where t.user_id = p.id and see_trips
+      ) ys
+    ), '[]'::jsonb),
+    'trips', case when not see_trips then '[]'::jsonb else coalesce((
+      select jsonb_agg(x.j order by x.start_date desc) from (
+        select t.start_date, jsonb_build_object('id', t.trip_id, 'title', t.title, 'start', t.start_date, 'end', t.end_date,
+          'rating', t.rating, 'highlight', t.highlight, 'stops', t.stops) as j
+        from public.shared_trips t
+        where t.user_id = p.id and (p_year is null
+          or p_year between extract(year from t.start_date) and extract(year from coalesce(t.end_date, t.start_date)))
+        order by t.start_date desc limit 500
+      ) x
+    ), '[]'::jsonb) end,
+    'outings', coalesce((
+      select jsonb_agg(x.j order by x.on_date desc) from (
+        select o.on_date, jsonb_build_object('id', o.event_id, 'kind', o.kind, 'title', o.title, 'date', o.on_date, 'rating', o.rating,
+          'review', o.review, 'links', coalesce((
+            select jsonb_agg(public.catalog_entry(c) order by c.kind, c.name)
+            from public.outing_links l join public.catalog c on c.id = l.catalog_id
+            where l.user_id = o.user_id and l.event_id = o.event_id
+          ), '[]'::jsonb)) as j
+        from public.outings o
+        where o.user_id = p.id and public.can_see_outing(o.user_id, o.visibility, me)
+          and (p_year is null or extract(year from o.on_date) = p_year)
+        order by o.on_date desc limit 200
+      ) x
+    ), '[]'::jsonb)
+  );
+end $$;
+
+revoke all on function public.sync_trips(jsonb) from public, anon;
+revoke all on function public.public_profile(text, integer) from public;
+grant execute on function public.sync_trips(jsonb) to authenticated;
+grant execute on function public.public_profile(text, integer) to anon, authenticated;
 
 -- Tell the API about the table now. Without this it can briefly answer
 -- "Could not find the table 'public.orbit_data' in the schema cache".
