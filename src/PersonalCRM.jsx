@@ -5283,9 +5283,8 @@ function CollectionForm({ initial, kind: startKind, mine, onSave, onCancel }) {
       {!initial && (
         <div className="crm-tpl-pick">
           <Field label="Start from a template">
-            {/* The shared input style's background would paint over the arrow. */}
-            <select className="crm-select" value={templateValue}
-              style={{ ...inputStyle, background: undefined, backgroundColor: C.surface, paddingRight: 32 }} onChange={(e) => pickByValue(e.target.value)}>
+            <select className="crm-select" style={inputStyle} value={templateValue}
+              onChange={(e) => pickByValue(e.target.value)}>
               <option value="">None, start blank</option>
               <optgroup label="Templates">
                 {LIST_TEMPLATES.map((t) => <option key={t.kind} value={`k:${t.kind}`}>{t.kind}</option>)}
@@ -10107,11 +10106,14 @@ export default function PersonalCRM({ account = null } = {}) {
            ring drawn outside a button that fills the row, so rings go inside. */
         .crm-entry .crm-btn:focus-visible, .crm-entry a:focus-visible,
         .crm-person .crm-btn:focus-visible { outline-offset: -3px; }
+        /* Important, because every select also takes the shared input style
+           inline, whose background and padding would otherwise paint over
+           the arrow and run the text underneath it. */
         .crm-select {
           appearance: none; -webkit-appearance: none;
-          background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.5 4.5 L6 8 L9.5 4.5' fill='none' stroke='${encodeURIComponent(C.muted)}' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
-          background-repeat: no-repeat; background-position: right 11px center; background-size: 12px;
-          padding-right: 32px;
+          background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.5 4.5 L6 8 L9.5 4.5' fill='none' stroke='${encodeURIComponent(C.muted)}' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>") !important;
+          background-repeat: no-repeat !important; background-position: right 11px center !important; background-size: 12px !important;
+          padding-right: 32px !important;
         }
         /* Hidden from sight, still there for keyboards and screen readers. */
         .crm-sr {
