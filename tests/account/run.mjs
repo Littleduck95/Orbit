@@ -67,7 +67,7 @@ const session = () => ({
  * already in use. Sign-ups, password logins, resets and profile changes are
  * all recorded on db for the checks to look at.
  */
-const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = signedIn ? PROFILE : null, taken = ['bea'], others = [], catalog = [], pages = {}, publicPages = {}, feed = [] } = {}) => {
+const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = signedIn ? PROFILE : null, taken = ['bea'], others = [], catalog = [], pages = {}, publicPages = {}, feed = [], threads = {}, usageAdmin = false, usageReport = null } = {}) => {
   const db = {
     rows: new Map(Object.entries(rows).map(([u, kv]) => [u, new Map(Object.entries(kv))])), down: false, calls: [], profile, taken: new Set(taken),
     // Other people, as the friends functions hand them out: each with how
@@ -80,6 +80,8 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
     publicPages: { ...publicPages }, tripsSynced: [], asked: [],
     // Friends' outings and trips as friend_feed hands them out, newest first.
     feed: feed.map((x) => ({ ...x })), feedAsked: [],
+    // Likes and comments by post ("owner:post:ref"), and every usage batch.
+    threads: JSON.parse(JSON.stringify(threads)), likes: [], comments: [], usage: [], usageAdmin, usageReport,
   };
   const mine = () => {
     if (!db.rows.has(USER.id)) db.rows.set(USER.id, new Map());
@@ -169,6 +171,42 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
       db.asked.push({ ...a, signedIn: Boolean(req.headers().authorization?.includes('test-access')) });
       const pg = db.publicPages[a.uname];
       return r.fulfill({ status: 200, headers, body: JSON.stringify(pg ? { ...pg, year: a.p_year } : null) });
+    }
+    if (u.pathname === '/rest/v1/rpc/track_usage') {
+      const a = JSON.parse(req.postData() || '{}');
+      db.usage.push(...(a.events || []).map((e) => ({ ...e, session: a.p_session, signedIn: Boolean(req.headers().authorization?.includes('test-access')) })));
+      return r.fulfill({ status: 200, headers, body: String((a.events || []).length) });
+    }
+    if (u.pathname === '/rest/v1/rpc/is_usage_admin') return r.fulfill({ status: 200, headers, body: JSON.stringify(db.usageAdmin) });
+    if (u.pathname === '/rest/v1/rpc/usage_report') {
+      db.reportDays = JSON.parse(req.postData() || '{}').p_days;
+      return db.usageAdmin ? r.fulfill({ status: 200, headers, body: JSON.stringify({ ...db.usageReport, days: db.reportDays }) })
+        : r.fulfill({ status: 400, headers, body: JSON.stringify({ message: 'Only for Orbit\'s team' }) });
+    }
+    if (['/rest/v1/rpc/like_post', '/rest/v1/rpc/comment_post', '/rest/v1/rpc/delete_comment', '/rest/v1/rpc/post_thread'].includes(u.pathname)) {
+      const a = JSON.parse(req.postData() || '{}');
+      const reply = (v) => r.fulfill({ status: 200, headers, body: JSON.stringify(v) });
+      const key = `${a.p_owner}:${a.p_kind}:${a.p_ref}`;
+      const t = db.threads[key] || (db.threads[key] = { likes: 0, liked: false, comments: 0, likers: [], thread: [] });
+      const counts = () => ({ owner: a.p_owner, post: a.p_kind, ref: a.p_ref, likes: t.likes, liked: t.liked, comments: t.thread.length });
+      if (u.pathname.endsWith('like_post')) {
+        db.likes.push(a);
+        if (a.p_on && !t.liked) { t.likes += 1; t.liked = true; }
+        if (!a.p_on && t.liked) { t.likes -= 1; t.liked = false; }
+        return reply(counts());
+      }
+      if (u.pathname.endsWith('comment_post')) {
+        db.comments.push(a);
+        const c = { id: `c${db.comments.length}`, body: a.p_body.trim(), at: new Date().toISOString(), by: { username: 'sam', display_name: 'Sam' }, mine: true, can_delete: true };
+        t.thread.push(c);
+        return reply(c);
+      }
+      if (u.pathname.endsWith('delete_comment')) {
+        for (const th of Object.values(db.threads)) th.thread = th.thread.filter((c) => c.id !== a.p_id);
+        db.deletedComment = a.p_id;
+        return r.fulfill({ status: 204, headers });
+      }
+      return reply({ ...counts(), likers: t.likers, thread: t.thread });
     }
     if (u.pathname === '/rest/v1/rpc/friend_feed') {
       const a = JSON.parse(req.postData() || '{}');
@@ -289,6 +327,126 @@ const localKeys = (page) => page.evaluate(() => Object.keys(localStorage).filter
 const shown = (loc) => loc.waitFor({ timeout: 8000 }).then(() => true, () => false);
 
 const scenarios = {
+  async 'likes and comments'() {
+    const bea = { username: 'bea', display_name: 'Bea Reads' };
+    const OWNER = '33333333-3333-4333-8333-333333333333';
+    const post = { id: 'x1', type: 'outing', at: new Date(Date.now() - 600000).toISOString(), by: bea, kind: 'Concert', title: 'Phoebe Bridgers',
+      date: '2026-06-20', rating: 5, review: 'Perfect night.', links: [], owner: OWNER, post: 'outing', ref: 'e1', likes: 2, liked: false, comments: 1 };
+    const { page, db, problems, close } = await newPage({
+      signedIn: true, profile: { ...PROFILE, visibility: {}, public_page: false, share_usage: true },
+      rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } }, feed: [post],
+      threads: { [`${OWNER}:outing:e1`]: { likes: 2, liked: false, likers: [bea, { username: 'dora', display_name: 'Dora' }],
+        thread: [{ id: 'c0', body: 'So jealous!', at: new Date(Date.now() - 300000).toISOString(), by: { username: 'dora', display_name: 'Dora' }, mine: false, can_delete: false }] } },
+    });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    await page.getByRole('button', { name: /^Feed/ }).first().click();
+    const like = page.getByRole('button', { name: 'Like, 2 likes' });
+    check('each post shows its likes and comments', await shown(like) && await page.getByRole('button', { name: '1 comment' }).isVisible());
+    await like.click();
+    check('liking shows at once and is saved', await shown(page.getByRole('button', { name: 'Unlike, 3 likes' }))
+      && db.likes[0]?.p_owner === OWNER && db.likes[0]?.p_kind === 'outing' && db.likes[0]?.p_ref === 'e1' && db.likes[0]?.p_on === true, db.likes);
+    await page.getByRole('button', { name: 'Unlike, 3 likes' }).click();
+    check('and can be taken back', await shown(page.getByRole('button', { name: 'Like, 2 likes' })) && db.likes[1]?.p_on === false);
+    await page.getByRole('button', { name: '1 comment' }).click();
+    check('comments open with who liked it', await shown(page.getByText('So jealous!')) && await page.getByText('Liked by Bea Reads, Dora').isVisible());
+    check('someone else\'s comment cannot be deleted here', !(await page.getByRole('button', { name: /Delete Dora/ }).isVisible()));
+    await page.getByLabel('Add a comment').fill('  See you at the next one  ');
+    await page.getByLabel('Add a comment').press('Enter');
+    check('a comment is posted with Enter', await shown(page.getByText('See you at the next one'))
+      && db.comments[0]?.p_body?.trim() === 'See you at the next one' && db.comments[0]?.p_ref === 'e1', db.comments);
+    check('and counted', await shown(page.getByRole('button', { name: '2 comments' })));
+    await page.getByRole('button', { name: 'Delete your comment' }).click();
+    check('your own can be deleted', await page.getByText('See you at the next one').waitFor({ state: 'detached', timeout: 5000 }).then(() => true, () => false)
+      && db.deletedComment === 'c1');
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
+  async 'usage counts'() {
+    const { page, db, problems, close } = await newPage({
+      signedIn: true, profile: { ...PROFILE, visibility: {}, public_page: false, share_usage: true },
+      rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } },
+    });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    await page.getByRole('button', { name: 'Events', exact: true }).first().click();
+    await page.getByRole('button', { name: 'Add an event' }).click();
+    await page.getByLabel('What happened').fill('Secret surprise party for Dana');
+    await page.getByLabel('Kind').selectOption('Celebration');
+    await page.getByRole('button', { name: 'Add to the timeline' }).click();
+    await page.waitForTimeout(5800);
+    const names = db.usage.map((e) => e.name);
+    check('opening Orbit is counted, with the device and how much is in it', db.usage.some((e) => e.name === 'app.open' && e.props.signed_in === true
+      && ['phone', 'computer'].includes(e.props.device) && e.props.events === 0), db.usage[0]);
+    check('each tab opened is counted', db.usage.some((e) => e.name === 'view.open' && e.props.view === 'events'), names);
+    check('adding an event is counted with its kind', db.usage.some((e) => e.name === 'event.add' && e.props.kind === 'Celebration' && e.props.rated === false), names);
+    check('counted as this person, in batches', db.usage.every((e) => e.signedIn && e.session?.length >= 8));
+    check('never what anyone wrote', !/Secret|surprise|Dana/.test(JSON.stringify(db.usage)), JSON.stringify(db.usage));
+
+    await page.getByRole('button', { name: /^More/ }).click();
+    await page.getByRole('button', { name: 'Settings' }).click();
+    await page.getByRole('button', { name: 'Preferences', exact: true }).click();
+    const box = page.getByRole('checkbox', { name: /Share which parts of Orbit I use/ });
+    check('Preferences says what is counted, and it starts on', await shown(box) && await box.isChecked());
+    const act = page.getByRole('checkbox', { name: /Friends’ activity/ });
+    const likes = page.getByRole('checkbox', { name: /Likes and comments/ });
+    check('friends\' activity, likes and comments are notifications, on to start with', await shown(act) && await act.isChecked() && await likes.isChecked());
+    await box.uncheck();
+    check('turning it off is saved to the profile', await shown(page.getByText('Nothing more is counted from you.')) && db.profile.share_usage === false, db.profile);
+    const before = db.usage.length;
+    await page.getByRole('button', { name: 'Recap', exact: true }).first().click();
+    await page.waitForTimeout(5800);
+    check('and then nothing more is sent', db.usage.length === before, db.usage.slice(before));
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
+  async 'the usage report'() {
+    const day = (i) => new Date(Date.now() - (6 - i) * 86400000).toISOString().slice(0, 10);
+    const REPORT = {
+      totals: { people: 120, joined: 14, active_today: 9, active_week: 31, active: 57, visits: 210 },
+      daily: Array.from({ length: 7 }, (_, i) => ({ day: day(i), active: [4, 6, 5, 9, 12, 7, 9][i], joined: i % 3, actions: 100 + i })),
+      areas: [{ area: 'feed', actions: 900, people: 40, share: 70 }, { area: 'person', actions: 700, people: 30, share: 53 }],
+      actions: Array.from({ length: 20 }, (_, i) => ({ name: `feed.a${i}`, count: 100 - i, people: 10 })),
+      views: [{ view: 'feed', count: 400, people: 40 }],
+      depth: { 1: 20, '2-3': 15, '4-7': 12, '8-14': 7, '15+': 3 },
+      heavy: { heavy_people: 10, light_people: 47, areas: [{ area: 'trip', heavy: 90, light: 20 }] },
+      cohorts: [{ week: day(0), joined: 14, week1: 8, week2: 5, week4: 2 }],
+      devices: [{ device: 'phone', installed: true, opens: 300 }],
+      public: { views: 500, visitors: 210, join_clicks: 25, joined: 14 },
+    };
+    const plain = await newPage({ signedIn: true, profile: { ...PROFILE, visibility: {}, share_usage: true }, rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } } });
+    await plain.page.goto(url);
+    await shown(plain.page.getByText("Sam's Orbit"));
+    await plain.page.getByRole('button', { name: /^More/ }).click();
+    check('only Orbit\'s team has Usage in the menu', !(await plain.page.getByRole('button', { name: 'Usage', exact: true }).isVisible()));
+    await plain.close();
+
+    const { page, db, problems, close } = await newPage({ signedIn: true, profile: { ...PROFILE, visibility: {}, share_usage: true },
+      rows: { [USER.id]: { 'crm-owner-v1': 'Sam' } }, usageAdmin: true, usageReport: REPORT });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    await page.getByRole('button', { name: /^More/ }).click();
+    await page.getByRole('button', { name: 'Usage', exact: true }).click();
+    check('the team sees the report', await shown(page.getByRole('heading', { name: 'Usage' })) && db.reportDays === 30);
+    const heads = (await page.getByRole('region', { name: 'Headline numbers' }).innerText()).replace(/\s+/g, ' ');
+    check('with the headline numbers', /9 active today/.test(heads) && /31 active in the last 7 days/.test(heads) && /120 people in all/.test(heads), heads);
+    check('each day as a column, with its numbers for anyone who cannot see the chart',
+      await page.getByRole('button', { name: /: 12 active, 1 new, 104 actions$/ }).isVisible());
+    await page.getByRole('button', { name: /: 12 active, 1 new, 104 actions$/ }).hover();
+    check('hovering a day shows it', /12 active on/.test(await page.locator('[aria-live="polite"]').first().innerText()));
+    await page.getByRole('button', { name: 'Show as table' }).click();
+    check('and the same as a table', await page.getByRole('cell', { name: '104' }).isVisible());
+    check('parts of the app in plain words, with their share', await page.getByRole('cell', { name: 'The feed' }).isVisible() && await page.getByRole('cell', { name: '70%' }).isVisible());
+    check('what engaged people rely on', await page.getByRole('cell', { name: 'Trips' }).isVisible() && await page.getByRole('cell', { name: '90%' }).isVisible());
+    check('every action, fifteen first', await page.getByRole('cell', { name: 'feed.a14' }).isVisible() && !(await page.getByRole('cell', { name: 'feed.a15' }).isVisible()));
+    await page.getByRole('button', { name: '90 days' }).click();
+    check('the window can change', await page.waitForFunction(() => true).then(() => true) && (await page.waitForTimeout(400), db.reportDays === 90));
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
+
   async 'the friends feed'() {
     const CHIEFS = { id: '00000000-0000-4000-8000-00000000c41f', kind: 'team', name: 'Kansas City Chiefs', about: 'NFL team', source: 'wikidata', source_id: 'Q223455' };
     const at = (min) => new Date(Date.now() - min * 60000).toISOString();
@@ -401,6 +559,9 @@ const scenarios = {
     await page.goto(`${url}u/shy`);
     check('a page not open to the web shows only the name, and a way in', await shown(page.getByText('Shy’s page is only for people signed in to Orbit.'))
       && await page.getByRole('link', { name: 'Log in or join Orbit' }).isVisible());
+    await page.waitForTimeout(5600);
+    check('a signed-out visitor\'s page view is counted, as a visit, with nobody attached', db.usage.some((e) => e.name === 'page.view' && e.props.kind === 'profile'
+      && e.props.signed_in === false && !e.signedIn && e.session?.length >= 8), db.usage);
     await page.goto(`${url}u/NO!`);
     check('an address that is not a page opens the app, behind sign-in', await shown(page.getByRole('heading', { name: 'Welcome back' })));
     check('no page errors', problems.length === 0, problems);

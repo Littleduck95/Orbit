@@ -9,6 +9,7 @@ import * as photoStore from './photoStore.js';
 import { GEOCODER } from './mapConfig.js';
 import { CARD_W, CARD_H, drawRecapCard, cardBlob, cardFontsReady } from './recapCard.js';
 import { BASE, catalogPath, pageUrl, profilePath, readRoute } from './route.js';
+import { deviceKind, flush as flushUsage, track, usageShare } from './usage.js';
 import { CATALOG_KINDS, LINKS_FOR, OUTING_VISIBILITY, WIKIDATA, cleanLinks, outingsToShare, searchWikidata, tripsToShare } from './catalog.js';
 
 /* ---------- palette ---------- */
@@ -1595,6 +1596,7 @@ function PersonShare({ p, owner, onClose }) {
   const going = ['Name', ...fields.filter((f) => picks[f.key]).map((f) => (f.labelFor ? f.labelFor(p) : f.label))];
 
   const copy = async () => {
+    track('share.person', { how: 'link', fields: going.length });
     try {
       await navigator.clipboard.writeText(link);
       setSaid('The link is copied. Send it however you like.');
@@ -1606,12 +1608,14 @@ function PersonShare({ p, owner, onClose }) {
   };
   const sheet = async () => {
     try {
+      track('share.person', { how: 'sheet', fields: going.length });
       await navigator.share({ title: p.name, text: `${by.trim() || 'Someone'} shared ${p.name}'s contact from Orbit.`, url: link });
     } catch (e) {
       if (e?.name !== 'AbortError') copy();
     }
   };
   const save = () => {
+    track('share.person', { how: 'file', fields: going.length });
     const ok = downloadCsv(`${fileSlug(p.name)}.orbit`, shareFileText(payload), 'application/json');
     setSaid(ok ? `Saved ${fileSlug(p.name)}.orbit. They open it from Import in their Orbit.` : 'This browser would not save the file.');
   };
@@ -3166,6 +3170,60 @@ const fromCsv = (cols, rows, make) => {
   return { out, skipped };
 };
 
+// What a save changed, as usage counts (see usage.js): how many were added,
+// removed or edited, and a few plain details of a single one, never what
+// anyone wrote. A pile at once (an import, a restore) is one count.
+const changeActions = (what, prev, next) => {
+  const out = [];
+  if (!Array.isArray(prev) || !Array.isArray(next)) return out;
+  const before = new Map(prev.map((x) => [x?.id, x]));
+  const after = new Map(next.map((x) => [x?.id, x]));
+  const added = next.filter((x) => !before.has(x?.id));
+  const removed = prev.filter((x) => !after.has(x?.id));
+  const edited = next.filter((x) => before.has(x?.id) && before.get(x.id) !== x);
+  const total = (xs, f) => xs.reduce((n, x) => n + (f(x) || 0), 0);
+  const grew = (f) => Math.max(0, total(next, f) - total(prev, f));
+  const one = (name, xs, detail) => {
+    if (!xs.length) return;
+    out.push([name, xs.length === 1 && detail ? detail(xs[0]) : { n: xs.length, ...(xs.length > 3 ? { bulk: true } : {}) }]);
+  };
+  const eventDetail = (e) => ({ kind: e.kind || 'Other', rated: Boolean(e.rating), linked: (e.links || []).length, shared: e.visibility || 'me', thoughts: Boolean(e.review) });
+  if (what === 'people') {
+    const logs = grew((p) => (p.log || []).length);
+    one('person.add', added, (p) => ({ circle: p.circle || 'friend', birthday: Boolean(p.birthday), cadence: p.cadence || 0 }));
+    one('person.remove', removed);
+    one('person.edit', edited.filter((p) => (p.log || []).length === (before.get(p.id).log || []).length));
+    if (logs) out.push(['catchup.log', { n: logs }]);
+  } else if (what === 'events') {
+    one('event.add', added, eventDetail);
+    one('event.remove', removed);
+    one('event.edit', edited, eventDetail);
+  } else if (what === 'reminders') {
+    const done = grew((r) => (r.history || []).length);
+    one('reminder.add', added, (r) => ({ kind: r.kind || 'Other', repeats: Boolean(r.every), anchor: r.anchor || 'date' }));
+    one('reminder.remove', removed);
+    one('reminder.edit', edited.filter((r) => (r.history || []).length === (before.get(r.id).history || []).length));
+    if (done) out.push(['reminder.done', { n: done }]);
+  } else if (what === 'lists') {
+    one('list.add', added, (c) => ({ kind: c.kind || 'Other', stages: Boolean(c.track) }));
+    one('list.remove', removed);
+    const items = grew((c) => (c.items || []).length);
+    const finished = grew((c) => (c.items || []).filter((it) => it.doneOn).length);
+    const rated = grew((c) => (c.items || []).filter((it) => it.rating).length);
+    if (items) out.push(['list.item_add', { n: items }]);
+    if (finished) out.push(['list.item_done', { n: finished }]);
+    if (rated) out.push(['list.item_rate', { n: rated }]);
+  } else if (what === 'trips') {
+    one('trip.add', added, (t) => ({ status: t.status || 'been', rated: Boolean(t.rating), stops: (t.stops || []).length, photos: (t.photoIds || []).length }));
+    one('trip.remove', removed);
+    one('trip.edit', edited, (t) => ({ status: t.status || 'been', rated: Boolean(t.rating) }));
+    const photos = grew((t) => (t.photoIds || []).length);
+    if (photos) out.push(['trip.photo_add', { n: photos }]);
+  }
+  return out;
+};
+const trackChanges = (what, prev, next) => changeActions(what, prev, next).forEach(([name, props]) => track(name, props));
+
 // A short fingerprint of some text (FNV-1a), to tell whether it changed
 // without keeping it.
 const fingerprint = (text) => {
@@ -3734,6 +3792,7 @@ function RecapShare({ people, events, trips, year, owner, page = '' }) {
     return blob;
   };
   const save = async () => {
+    track('recap.card_save', { trips: include.trips, events: include.events, catchups: include.people, named: Boolean(by.trim()) });
     try {
       const url = URL.createObjectURL(await picture());
       const a = document.createElement('a');
@@ -3750,6 +3809,7 @@ function RecapShare({ people, events, trips, year, owner, page = '' }) {
   };
   const canSheet = typeof navigator !== 'undefined' && typeof navigator.canShare === 'function' && typeof File === 'function';
   const sheet = async () => {
+    track('recap.card_share', { trips: include.trips, events: include.events, catchups: include.people, linked: Boolean(page) });
     try {
       const f = new File([await picture()], file, { type: 'image/png' });
       if (!navigator.canShare({ files: [f] })) { await save(); return; }
@@ -3807,7 +3867,7 @@ function Recap({ people, year, years, onYear, eventCount, reminderCount, listCou
         </h1>
         <YearPicker year={year} years={years} onYear={onYear} />
         {shareable && (
-          <Button onClick={() => setSharing(!sharing)} aria-expanded={sharing}
+          <Button onClick={() => { if (!sharing) track('recap.card_open', { year }); setSharing(!sharing); }} aria-expanded={sharing}
             style={{ marginLeft: 'auto', ...(sharing ? { borderColor: C.accent } : null) }}>Share your year</Button>
         )}
       </div>
@@ -5072,6 +5132,7 @@ function CatalogPicker({ api, kind, label, ph, many = false, value, onChange }) 
     try {
       const e = entry.id ? entry : await api.add({ ...entry, kind });
       if (!e?.id) throw new Error('That could not be added.');
+      track('catalog.link', { kind, source: entry.id ? 'orbit' : entry.source });
       const link = { id: e.id, kind: e.kind, name: e.name };
       if (!chosen.has(link.id)) onChange(many ? [...value, link] : [link]);
       setQ('');
@@ -5166,7 +5227,7 @@ function CatalogSearch({ api, onOpen }) {
     let live = true;
     const t = setTimeout(() => {
       api.search(term, kind || null).then(
-        (rows) => { if (live) setFound({ key, rows, problem: '' }); },
+        (rows) => { if (live) { setFound({ key, rows, problem: '' }); track('explore.search', { kind: kind || 'all', found: rows.length }); } },
         (e) => { if (live) setFound({ key, rows: [], problem: e.message || 'The search did not work.' }); },
       );
     }, 300);
@@ -5213,12 +5274,16 @@ function CatalogSearch({ api, onOpen }) {
   );
 }
 
-function CatalogPage({ api, id, onOpen, onPerson }) {
+function CatalogPage({ api, id, onOpen, onPerson, canAct = true }) {
   const [page, setPage] = useState({ state: 'loading' });
   useEffect(() => {
     let live = true;
     api.page(id).then(
-      (p) => { if (live) setPage(p ? { state: 'ok', ...p } : { state: 'gone' }); },
+      (p) => {
+        if (!live) return;
+        setPage(p ? { state: 'ok', ...p } : { state: 'gone' });
+        if (p) track('catalog.view', { kind: p.entry.kind, ratings: p.ratings, outings: p.outings.length });
+      },
       (e) => { if (live) setPage({ state: 'failed', problem: e.message }); },
     );
     return () => { live = false; };
@@ -5280,8 +5345,136 @@ function CatalogPage({ api, id, onOpen, onPerson }) {
               ))}
             </div>
           )}
+          <PostActions api={api} post={o} canAct={canAct} />
         </article>
       ))}
+    </div>
+  );
+}
+
+/* ---------- likes and comments ---------- */
+// The heart and the comments under a shared outing or trip. post: { owner,
+// post, ref, likes, liked, comments } as the server hands them out. canAct:
+// signed in; otherwise the counts show, with a way in.
+function PostActions({ api, post, canAct = true }) {
+  const [likes, setLikes] = useState({ n: post.likes || 0, mine: Boolean(post.liked) });
+  const [count, setCount] = useState(post.comments || 0);
+  const [open, setOpen] = useState(false);
+  const [thread, setThread] = useState(null);
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState('');
+  const name = useId();
+  if (!post.owner || !post.ref) return null;
+
+  const toggleLike = async () => {
+    const was = likes;
+    setLikes({ n: was.n + (was.mine ? -1 : 1), mine: !was.mine });
+    setProblem('');
+    try {
+      const r = await api.like(post, !was.mine);
+      setLikes({ n: r.likes, mine: r.liked });
+      track(was.mine ? 'post.unlike' : 'post.like', { post: post.post });
+    } catch (e) {
+      setLikes(was);
+      setProblem(e.message || 'That did not work.');
+    }
+  };
+  const load = async () => {
+    try {
+      const t = await api.thread(post);
+      if (!t) { setProblem('That is not there any more.'); return; }
+      setThread(t);
+      setCount(t.comments);
+      setLikes({ n: t.likes, mine: t.liked });
+    } catch (e) {
+      setProblem(e.message || 'The comments could not be loaded.');
+    }
+  };
+  const toggleOpen = () => {
+    if (!open && !thread) load();
+    setOpen(!open);
+    if (!open) track('post.open_comments', { post: post.post });
+  };
+  const send = async () => {
+    const body = draft.trim();
+    if (!body || busy) return;
+    setBusy(true);
+    setProblem('');
+    try {
+      const c = await api.comment(post, body);
+      setThread((t) => ({ ...(t || { thread: [], likers: [] }), thread: [...(t?.thread || []), c] }));
+      setCount((n) => n + 1);
+      setDraft('');
+      track('post.comment', { post: post.post, length: body.length });
+    } catch (e) {
+      setProblem(e.message || 'That comment did not post.');
+    }
+    setBusy(false);
+  };
+  const remove = async (id) => {
+    try {
+      await api.uncomment(id);
+      setThread((t) => ({ ...t, thread: t.thread.filter((c) => c.id !== id) }));
+      setCount((n) => Math.max(0, n - 1));
+    } catch (e) {
+      setProblem(e.message || 'That did not work.');
+    }
+  };
+  const small = { font: 'inherit', fontSize: 12.5, fontWeight: 600, background: 'transparent', border: 'none', padding: '4px 2px', color: C.muted };
+
+  return (
+    <div style={{ marginTop: 10, borderTop: `1px solid ${C.line}`, paddingTop: 6 }}>
+      <div style={{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
+        {canAct ? (
+          <button className="crm-btn" aria-pressed={likes.mine} onClick={toggleLike}
+            aria-label={likes.mine ? `Unlike, ${likes.n} ${likes.n === 1 ? 'like' : 'likes'}` : `Like, ${likes.n} ${likes.n === 1 ? 'like' : 'likes'}`}
+            style={{ ...small, cursor: 'pointer', color: likes.mine ? C.overdueBar : C.muted }}>
+            <span aria-hidden="true">{likes.mine ? '♥' : '♡'}</span> {likes.n || ''}
+          </button>
+        ) : (
+          <span style={small} aria-label={`${likes.n} ${likes.n === 1 ? 'like' : 'likes'}`}><span aria-hidden="true">♡</span> {likes.n || ''}</span>
+        )}
+        {canAct ? (
+          <button className="crm-btn" aria-expanded={open} onClick={toggleOpen} style={{ ...small, cursor: 'pointer' }}>
+            {count ? `${count} ${count === 1 ? 'comment' : 'comments'}` : 'Comment'}
+          </button>
+        ) : (
+          <span style={small}>{count ? `${count} ${count === 1 ? 'comment' : 'comments'}` : ''}</span>
+        )}
+        {!canAct && <a href={BASE} style={{ fontSize: 12, color: C.muted }}>Log in to like or comment</a>}
+      </div>
+      {problem && <p role="alert" style={{ margin: '4px 0 0', fontSize: 12.5, color: C.overdue }}>{problem}</p>}
+      {open && canAct && (
+        <div style={{ marginTop: 6 }}>
+          {thread === null && !problem && <p style={{ margin: 0, fontSize: 12.5, color: C.muted }}>Loading…</p>}
+          {thread?.likers?.length > 0 && (
+            <p style={{ margin: '0 0 8px', fontSize: 12.5, color: C.muted }}>
+              Liked by {thread.likers.slice(0, 3).map((l) => l.display_name).join(', ')}{thread.likers.length > 3 ? ` and ${thread.likers.length - 3} more` : ''}
+            </p>
+          )}
+          {thread?.thread.map((c) => (
+            <div key={c.id} style={{ padding: '6px 0', borderTop: `1px solid ${C.line}` }}>
+              <p style={{ margin: 0, fontSize: 12.5, color: C.muted, display: 'flex', gap: 6, alignItems: 'baseline' }}>
+                <a href={profilePath(c.by.username)} style={{ fontWeight: 600, color: C.ink, textDecoration: 'none' }}>{c.by.display_name}</a>
+                <span style={{ color: C.faint }}>{ago(c.at)}</span>
+                {c.can_delete && (
+                  <button className="crm-btn" onClick={() => remove(c.id)} aria-label={`Delete ${c.mine ? 'your' : `${c.by.display_name}’s`} comment`}
+                    style={{ ...textButton(), fontSize: 12, fontWeight: 500, marginLeft: 'auto', color: C.faint }}>Delete</button>
+                )}
+              </p>
+              <p style={{ margin: '2px 0 0', fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{c.body}</p>
+            </div>
+          ))}
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <label htmlFor={name} className="crm-sr">Add a comment</label>
+            <textarea id={name} rows={1} maxLength={1000} value={draft} onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => { if (isEnter(e) && !e.shiftKey) { e.preventDefault(); send(); } }}
+              placeholder="Add a comment" style={{ ...inputStyle, minHeight: 38, fontSize: 14, resize: 'vertical', flex: 1 }} />
+            <Button kind="solid" onClick={send} disabled={busy || !draft.trim()} style={{ fontSize: 13, padding: '7px 12px' }}>Post</Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -5321,7 +5514,7 @@ const groupFeed = (items) => {
 };
 const GROUP_SHOWN = 3;
 
-function FeedItem({ x, onCatalog }) {
+function FeedItem({ x, onCatalog, api }) {
   const trip = x.type === 'trip' ? pageTrip({ ...x, id: x.id }) : null;
   const verb = !trip && x.rating ? 'rated' : 'went to';
   return (
@@ -5351,6 +5544,7 @@ function FeedItem({ x, onCatalog }) {
           ))}
         </div>
       )}
+      <PostActions api={api} post={x} />
     </article>
   );
 }
@@ -5367,7 +5561,13 @@ function FeedView({ api, onCatalog, onSeen, onFriends }) {
   useEffect(() => {
     let live = true;
     api.feed(null, PAGE).then(
-      (rows) => { if (!live) return; setItems(rows); setMore(rows.length === PAGE); if (rows[0]) onSeen(rows[0].at); },
+      (rows) => {
+        if (!live) return;
+        setItems(rows);
+        setMore(rows.length === PAGE);
+        if (rows[0]) onSeen(rows[0].at);
+        track('feed.view', { items: rows.length });
+      },
       (e) => { if (live) { setItems([]); setProblem(e.message || 'The feed could not be loaded.'); } },
     );
     return () => { live = false; };
@@ -5376,6 +5576,7 @@ function FeedView({ api, onCatalog, onSeen, onFriends }) {
     setBusy(true);
     try {
       const rows = await api.feed(items[items.length - 1], PAGE);
+      track('feed.more', { shown: items.length });
       setItems([...items, ...rows]);
       setMore(rows.length === PAGE);
     } catch (e) {
@@ -5406,9 +5607,9 @@ function FeedView({ api, onCatalog, onSeen, onFriends }) {
         const rest = g.items.length - shown.length;
         return (
           <div key={g.key}>
-            {shown.map((x) => <FeedItem key={x.id} x={x} onCatalog={onCatalog} />)}
+            {shown.map((x) => <FeedItem key={x.id} x={x} onCatalog={onCatalog} api={api} />)}
             {rest > 0 && (
-              <button className="crm-btn" onClick={() => setOpen(new Set([...open, g.key]))}
+              <button className="crm-btn" onClick={() => { track('feed.expand', { n: rest }); setOpen(new Set([...open, g.key])); }}
                 style={{ ...textButton(), fontSize: 13, margin: '0 0 14px 4px' }}>
                 {`${rest} more from ${g.by.display_name.split(' ')[0]}`}
               </button>
@@ -5417,6 +5618,201 @@ function FeedView({ api, onCatalog, onSeen, onFriends }) {
         );
       })}
       {more && <Button onClick={busy ? undefined : loadMore}>{busy ? 'Loading…' : 'Load more'}</Button>}
+    </div>
+  );
+}
+
+/* ---------- usage report (Orbit's team only) ---------- */
+// The parts of the app, as the report names them (the part of each action's
+// name before the dot), in plain words.
+const USAGE_AREAS = {
+  app: 'Opening Orbit', view: 'Moving between tabs', person: 'People', catchup: 'Logging catch-ups', event: 'Events',
+  reminder: 'Reminders', list: 'Lists', trip: 'Trips', recap: 'Recap and its card', share: 'Sending copies',
+  catalog: 'The catalog', explore: 'Explore', feed: 'The feed', post: 'Likes and comments', friends: 'Friends',
+  notify: 'Notifications', settings: 'Settings', profile: 'Their profile and page', page: 'Public pages', data: 'Import, export, backup',
+};
+const areaName = (a) => USAGE_AREAS[a] || a;
+const shortDay = (d) => formatDay(parseDate(d), 'monthDay');
+
+// Active people by day: one column per day, one colour. Hovering or
+// focusing a day shows its numbers above; the table has them all.
+function DailyActive({ rows }) {
+  const [at, setAt] = useState(rows.length - 1);
+  const [asTable, setAsTable] = useState(false);
+  const most = Math.max(1, ...rows.map((r) => r.active));
+  const r = rows[Math.min(at, rows.length - 1)] || rows[rows.length - 1];
+  const H = 120;
+  if (!rows.length) return null;
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 15, marginBottom: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+        <p style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>Active people each day</p>
+        <button className="crm-btn" onClick={() => setAsTable(!asTable)} style={{ ...textButton(), fontSize: 12.5, marginLeft: 'auto' }}>
+          {asTable ? 'Show as chart' : 'Show as table'}
+        </button>
+      </div>
+      {asTable ? (
+        <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+          <UsageTable head={['Day', 'Active', 'New', 'Actions']} rows={[...rows].reverse().map((x) => [shortDay(x.day), x.active, x.joined, x.actions])} />
+        </div>
+      ) : (
+        <>
+          <p aria-live="polite" style={{ margin: '0 0 8px', fontSize: 13, color: C.muted }}>
+            <strong style={{ fontSize: 16, color: C.ink }}>{r.active}</strong> active on {shortDay(r.day)}
+            {` · ${r.joined} new · ${r.actions} actions`}
+          </p>
+          <div style={{ position: 'relative', height: H, display: 'flex', alignItems: 'flex-end', gap: 2, borderBottom: `1px solid ${C.line}` }}>
+            <span aria-hidden="true" style={{ position: 'absolute', top: -2, left: 0, fontSize: 11, color: C.faint, fontVariantNumeric: 'tabular-nums' }}>{most}</span>
+            {rows.map((x, i) => (
+              <button key={x.day} className="crm-btn" onMouseEnter={() => setAt(i)} onFocus={() => setAt(i)}
+                aria-label={`${shortDay(x.day)}: ${x.active} active, ${x.joined} new, ${x.actions} actions`}
+                style={{ flex: '1 1 0', height: '100%', display: 'flex', alignItems: 'flex-end', justifyContent: 'center', background: 'transparent', border: 'none', padding: 0, cursor: 'default', minWidth: 0 }}>
+                <span style={{
+                  display: 'block', width: '100%', maxWidth: 24, height: Math.max(x.active ? 3 : 1, (x.active / most) * (H - 14)),
+                  background: x.active ? C.accentDeep : C.line, borderRadius: '4px 4px 0 0', opacity: i === at ? 1 : 0.78,
+                }} />
+              </button>
+            ))}
+          </div>
+          <div aria-hidden="true" style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: C.faint, marginTop: 5 }}>
+            <span>{shortDay(rows[0].day)}</span><span>{shortDay(rows[rows.length - 1].day)}</span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function UsageTable({ head, rows, bar }) {
+  const cell = { padding: '7px 8px', borderBottom: `1px solid ${C.line}`, fontSize: 13, textAlign: 'right', fontVariantNumeric: 'tabular-nums' };
+  return (
+    <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+      <thead>
+        <tr>{head.map((h, i) => <th key={h} scope="col" style={{ ...cell, textAlign: i ? 'right' : 'left', color: C.muted, fontWeight: 600, fontSize: 12 }}>{h}</th>)}</tr>
+      </thead>
+      <tbody>
+        {rows.map((r, j) => (
+          <tr key={j}>
+            {r.map((v, i) => (
+              <td key={i} style={{ ...cell, textAlign: i ? 'right' : 'left', color: C.ink }}>
+                {i === 0 && bar ? (
+                  <span style={{ display: 'block' }}>
+                    {v}
+                    <span aria-hidden="true" style={{ display: 'block', height: 4, marginTop: 4, borderRadius: 2, background: C.line }}>
+                      <span style={{ display: 'block', height: 4, borderRadius: 2, width: `${Math.max(0, Math.min(100, bar(j)))}%`, background: C.accentDeep }} />
+                    </span>
+                  </span>
+                ) : v}
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function UsageView({ api }) {
+  const [days, setDays] = useState(30);
+  const [report, setReport] = useState(null);
+  const [problem, setProblem] = useState('');
+  const [allActions, setAllActions] = useState(false);
+  useEffect(() => {
+    let live = true;
+    api.report(days).then((r) => { if (live) { setReport(r); setProblem(''); } }, (e) => { if (live) setProblem(e.message || 'The report could not be loaded.'); });
+    return () => { live = false; };
+  }, [api, days]);
+  const card = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 15, marginBottom: 12 };
+  const head = (t, sub) => (
+    <>
+      <p style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>{t}</p>
+      {sub && <p style={{ margin: '3px 0 8px', fontSize: 12.5, color: C.muted, lineHeight: 1.45 }}>{sub}</p>}
+    </>
+  );
+  const pct = (n) => `${n}%`;
+  const t = report?.totals;
+  return (
+    <div style={{ opacity: report || problem ? 1 : 0.6 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
+        <h1 style={{ margin: 0, fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Usage</h1>
+        <div role="group" aria-label="Window" style={{ display: 'flex', gap: 6, marginLeft: 'auto' }}>
+          {[7, 30, 90].map((d) => (
+            <button key={d} className="crm-btn" aria-pressed={days === d} onClick={() => setDays(d)} style={filterChip(days === d)}>{d} days</button>
+          ))}
+        </div>
+      </div>
+      <p style={{ margin: '0 0 16px', fontSize: 13.5, color: C.muted, lineHeight: 1.5 }}>
+        What people do in Orbit, as counts: never what they wrote. People who turned usage counts off are not in it.
+      </p>
+      {problem && <p role="alert" style={{ fontSize: 13.5, color: C.overdue }}>{problem}</p>}
+      {!report && !problem && <p style={{ fontSize: 14, color: C.muted }}>Loading…</p>}
+      {report && (
+        <>
+          <div role="region" aria-label="Headline numbers" style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+            <Stat n={t.active_today} label="active today" tone={C.accentDeep} />
+            <Stat n={t.active_week} label="active in the last 7 days" />
+            <Stat n={t.active} label={`active in ${report.days} days`} />
+            <Stat n={t.people} label="people in all" />
+            <Stat n={t.joined} label={`joined in ${report.days} days`} />
+            <Stat n={t.visits} label="visits from people signed out" />
+          </div>
+
+          <DailyActive rows={report.daily} />
+
+          <div style={card}>
+            {head('Parts of the app', 'How many of the people active in this window used each part.')}
+            <UsageTable head={['Part', 'Of active people', 'People', 'Actions']} bar={(j) => report.areas[j].share}
+              rows={report.areas.map((a) => [areaName(a.area), pct(a.share), a.people, a.actions])} />
+          </div>
+
+          <div style={card}>
+            {head('What engaged people rely on', `Heavy: active on 8 or more days in this window (${report.heavy.heavy_people} people). Light: fewer (${report.heavy.light_people}). A part far more used by heavy people is a good candidate to build on, or to charge for.`)}
+            <UsageTable head={['Part', 'Heavy', 'Light']}
+              rows={report.heavy.areas.map((a) => [areaName(a.area), pct(a.heavy), pct(a.light)])} />
+          </div>
+
+          <div style={card}>
+            {head('How often people come back', 'People by the number of days they were active in this window.')}
+            <UsageTable head={['Days active', 'People']} rows={Object.entries(report.depth).map(([k, v]) => [k === '1' ? '1 day' : `${k} days`, v])} />
+          </div>
+
+          <div style={card}>
+            {head('Do new people stay?', 'People by the week they joined, and how many came back 1–7, 8–14 and 22–28 days later.')}
+            <UsageTable head={['Joined', 'People', 'Week 1', 'Week 2', 'Week 4']}
+              rows={report.cohorts.map((c) => [`Week of ${shortDay(c.week)}`, c.joined, c.week1, c.week2, c.week4])} />
+          </div>
+
+          <div style={card}>
+            {head('Tabs opened')}
+            <UsageTable head={['Tab', 'Opens', 'People']} rows={report.views.map((v) => [v.view || '?', v.count, v.people])} />
+          </div>
+
+          <div style={card}>
+            {head('Public pages', 'Views of people’s pages and catalog pages, and whether visitors go on to join.')}
+            <UsageTable head={['', 'Count']} rows={[
+              ['Page views', report.public.views], ['Visitors signed out', report.public.visitors],
+              ['“Join Orbit” clicks', report.public.join_clicks], ['New accounts in this window', report.public.joined],
+            ]} />
+          </div>
+
+          <div style={card}>
+            {head('Devices', 'Each time Orbit was opened.')}
+            <UsageTable head={['Device', 'From the Home Screen', 'Opens']}
+              rows={report.devices.map((d) => [d.device, d.installed ? 'Yes' : 'No', d.opens])} />
+          </div>
+
+          <div style={card}>
+            {head('Every action', 'Each thing counted, most frequent first.')}
+            <UsageTable head={['Action', 'Times', 'People']}
+              rows={(allActions ? report.actions : report.actions.slice(0, 15)).map((a) => [a.name, a.count, a.people])} />
+            {report.actions.length > 15 && (
+              <button className="crm-btn" onClick={() => setAllActions(!allActions)} style={{ ...textButton(), fontSize: 13, marginTop: 10 }}>
+                {allActions ? 'Show fewer' : `Show all ${report.actions.length}`}
+              </button>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -5482,6 +5878,7 @@ function ProfilePage({ api, username, year, go, signedIn }) {
 
   const link = pageUrl(profilePath(pr.username, year));
   const copy = async () => {
+    track('page.copy_link', { own: pr.relation === 'self' });
     try { await navigator.clipboard.writeText(link); setSaid('Link copied.'); } catch { setSaid(link); }
   };
   const box = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, marginBottom: 12 };
@@ -5512,7 +5909,7 @@ function ProfilePage({ api, username, year, go, signedIn }) {
           <p style={{ margin: '0 0 12px', fontSize: 14, lineHeight: 1.55 }}>
             {pr.display_name.split(' ')[0]}’s page is only for people signed in to Orbit.
           </p>
-          <a href={BASE} style={{ ...solidLink(), display: 'inline-block' }}>Log in or join Orbit</a>
+          <a href={BASE} onClick={() => { track('page.join', { where: 'hidden' }); flushUsage(); }} style={{ ...solidLink(), display: 'inline-block' }}>Log in or join Orbit</a>
         </div>
       </div>
     );
@@ -5570,6 +5967,7 @@ function ProfilePage({ api, username, year, go, signedIn }) {
                     {t.stops.length > 0 && ` · ${[...new Set(t.stops.map((st) => st.name).filter(Boolean))].join(' → ')}`}
                   </p>
                   {t.excerpt && <p className="crm-serif" style={{ margin: '7px 0 0', fontSize: 15, lineHeight: 1.55 }}>{t.excerpt}</p>}
+                  <PostActions api={api} post={page.trips.find((x) => x.id === t.id) || {}} canAct={signedIn} />
                 </article>
               ))}
             </section>
@@ -5595,6 +5993,7 @@ function ProfilePage({ api, username, year, go, signedIn }) {
                       ))}
                     </div>
                   )}
+                  <PostActions api={api} post={o} canAct={signedIn} />
                 </article>
               ))}
             </section>
@@ -5612,7 +6011,7 @@ function ProfilePage({ api, username, year, go, signedIn }) {
           <p style={{ margin: '0 0 12px', fontSize: 13.5, color: C.muted, lineHeight: 1.5 }}>
             Orbit keeps the people you care about, the places you have been, and the concerts, games and shows you went to, in one place.
           </p>
-          <a href={BASE} style={{ ...solidLink(), display: 'inline-block' }}>Join Orbit</a>
+          <a href={BASE} onClick={() => { track('page.join', { where: 'bottom' }); flushUsage(); }} style={{ ...solidLink(), display: 'inline-block' }}>Join Orbit</a>
         </div>
       )}
     </div>
@@ -5644,6 +6043,9 @@ export function PublicPage({ client, route: first }) {
     window.addEventListener('popstate', back);
     return () => { live = false; window.removeEventListener('popstate', back); };
   }, [client]);
+  useEffect(() => {
+    if (route) track('page.view', { kind: route.kind, year: Boolean(route.year), signed_in: signedIn });
+  }, [route, signedIn]);
   const go = useCallback((path) => {
     window.history.pushState(null, '', path);
     setRoute(readRoute(path));
@@ -5658,14 +6060,15 @@ export function PublicPage({ client, route: first }) {
           <a href={BASE} style={{ display: 'flex', alignItems: 'center', gap: 8, color: C.ink, textDecoration: 'none', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', fontSize: 13 }}>
             <OrbitMark /> Orbit
           </a>
-          <a href={BASE} style={{ ...solidLink(), marginLeft: 'auto', fontSize: 13, padding: '7px 12px' }}>{signedIn ? 'Open Orbit' : 'Join Orbit'}</a>
+          <a href={BASE} onClick={() => { track(signedIn ? 'page.open_app' : 'page.join', { where: 'top' }); flushUsage(); }}
+            style={{ ...solidLink(), marginLeft: 'auto', fontSize: 13, padding: '7px 12px' }}>{signedIn ? 'Open Orbit' : 'Join Orbit'}</a>
         </div>
         {!route ? (
           <p style={{ fontSize: 14, color: C.muted }}>That page does not exist.</p>
         ) : route.kind === 'profile' ? (
           <ProfilePage key={`${route.username}/${route.year}`} api={api} username={route.username} year={route.year} go={go} signedIn={signedIn} />
         ) : (
-          <CatalogPage key={route.id} api={api} id={route.id} onOpen={(id) => go(catalogPath(id))} onPerson={(u) => go(profilePath(u))} />
+          <CatalogPage key={route.id} api={api} id={route.id} canAct={signedIn} onOpen={(id) => go(catalogPath(id))} onPerson={(u) => go(profilePath(u))} />
         )}
       </div>
     </div>
@@ -6822,6 +7225,7 @@ const SharePanel = memo(function SharePanel({ c, people, owner }) {
   // The clipboard is refused outright on plain http and in some embeds, so
   // there is always a way to get at the text by hand.
   const copy = async (value, what) => {
+    track('share.list', { how: /link/i.test(what) ? 'link' : 'text' });
     try {
       await navigator.clipboard.writeText(value);
       setSaid(`${what} is copied. Paste it wherever you like.`);
@@ -6834,6 +7238,7 @@ const SharePanel = memo(function SharePanel({ c, people, owner }) {
 
   const sheet = async () => {
     try {
+      track('share.list', { how: 'sheet' });
       await navigator.share({ title: c.name, text });
     } catch (e) {
       if (e?.name !== 'AbortError') copy(text, 'The list');
@@ -8437,6 +8842,7 @@ const TripSharePanel = memo(function TripSharePanel({ trip, owner }) {
   }, [withPhotos, size, trip.photoIds]);
 
   const copy = async (value, what) => {
+    track('share.trip', { how: /link/i.test(what) ? 'link' : 'text' });
     try {
       await navigator.clipboard.writeText(value);
       setSaid(`${what} is copied. Send it however you like.`);
@@ -8448,6 +8854,7 @@ const TripSharePanel = memo(function TripSharePanel({ trip, owner }) {
   };
   const sheet = async () => {
     try {
+      track('share.trip', { how: 'sheet' });
       await navigator.share({ title: trip.title, text: `${opts.by || 'Someone'} shared a trip from Orbit: ${trip.title}.`, url: link });
     } catch (e) {
       if (e?.name !== 'AbortError') copy(link, 'The link');
@@ -8463,6 +8870,7 @@ const TripSharePanel = memo(function TripSharePanel({ trip, owner }) {
   };
 
   const saveFile = async (tryShare) => {
+    track('share.trip', { how: 'file', photos: withPhotos });
     setSaid('');
     setMaking(true);
     let file;
@@ -9528,6 +9936,7 @@ function ProfileSettings({ account }) {
         // Only once the server has pages (schema part 5).
         ...('public_page' in pr ? { publicPage: draft.publicPage } : {}),
       });
+      track('profile.save', { public_page: draft.publicPage, trips: draft.visibility.trips, searchable: draft.searchable });
       setDraft({ ...draft, website: site, socials });
       setSaid('Your profile is saved.');
     } catch (err) {
@@ -9882,6 +10291,34 @@ const PUSH_WHY = {
   denied: 'Notifications are blocked for Orbit in this browser. Allow them in the browser’s site settings, then come back.',
 };
 
+// Whether this person shares which parts of Orbit they use (usage.js). Only
+// with an account whose server counts usage (schema part 8).
+function UsageChoice({ account }) {
+  const pr = account?.profile;
+  const [on, setOn] = useState(pr?.share_usage !== false);
+  const [said, setSaid] = useState('');
+  if (!pr || !('share_usage' in pr)) return null;
+  const change = async (v) => {
+    setOn(v);
+    setSaid('');
+    try {
+      await account.updateProfile({ shareUsage: v });
+      setSaid(v ? 'Thanks. That helps decide what to build.' : 'Nothing more is counted from you.');
+    } catch (err) {
+      setOn(!v);
+      setSaid(err?.message || 'That did not save.');
+    }
+  };
+  return (
+    <div style={settingsCard()}>
+      <p style={settingsHead}>Usage counts</p>
+      <Check on={on} onChange={change} label="Share which parts of Orbit I use"
+        hint="Counts of what you do, like “added an event” or “opened the feed”, so what gets built next follows what people use. Never what you write: no names, titles, notes or places." />
+      {said && <p aria-live="polite" style={{ margin: 0, fontSize: 13, color: C.muted }}>{said}</p>}
+    </div>
+  );
+}
+
 function PreferencesSettings({ account, theme, onTheme, start, onStart }) {
   const api = account?.notifications;
   const [prefs, setPrefs] = useState(null);
@@ -10091,6 +10528,7 @@ function SettingsView({ account, theme, onTheme, start, onStart, onBackup, onClo
       {account && tab === 'account' && <AccountSettings account={account} />}
       {account && tab === 'profile' && <ProfileSettings account={account} />}
       {(!account || tab === 'prefs') && <PreferencesSettings account={account} theme={theme} onTheme={onTheme} start={start} onStart={onStart} />}
+      {account && tab === 'prefs' && <UsageChoice account={account} />}
       {(!account || tab === 'prefs') && <StorageSettings onBackup={onBackup} />}
     </div>
   );
@@ -10157,6 +10595,7 @@ function ExportView({ people, events, reminders, collections, onClose }) {
     const stamp = todayStr();
     let saved = 0;
     parts.forEach(([name, csv]) => { if (downloadCsv(`orbit-${name}-${stamp}.csv`, csv)) saved += 1; });
+    track('data.export', { files: parts.length });
     setPreview(parts.map(([name, csv]) => `### ${name}\n${csv}`).join('\n\n'));
     setNote(saved === parts.length
       ? `Downloaded ${saved} file${saved === 1 ? '' : 's'}. The text is below too, in case the download was blocked.`
@@ -10329,6 +10768,7 @@ function ImportView({ people, events, reminders, collections, onPeople, onEvents
 
   const commit = () => {
     if (!found) return;
+    track('data.import', { kind: found.kind, rows: found.rows.length, mode });
     if (found.kind === 'people') {
       onPeople(mode === 'replace' ? found.rows : [...people, ...found.rows]);
     } else if (found.kind === 'reminders') {
@@ -10658,6 +11098,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const persist = async (next) => {
+    trackChanges('people', people, next);
     setPeople(next);
     if (holdBack(STORE_KEY)) return false;
     try {
@@ -10785,6 +11226,32 @@ export default function PersonalCRM({ account = null } = {}) {
     if (!loading && view === 'feed' && !catalogOn) setView('list');
   }, [loading, view, catalogOn]);
 
+  // Usage: whether this person shares it, when Orbit opens (with how much is
+  // in it, as numbers), and each tab opened.
+  const shareUsage = account?.profile?.share_usage !== false;
+  useEffect(() => { usageShare(shareUsage); }, [shareUsage]);
+  const opened = useRef(false);
+  useEffect(() => {
+    if (loading || opened.current) return;
+    opened.current = true;
+    track('app.open', {
+      ...deviceKind(), signed_in: Boolean(account), view,
+      people: people.length, events: events.length, reminders: reminders.length, lists: collections.length, trips: trips.length,
+    });
+  }, [loading, account, view, people.length, events.length, reminders.length, collections.length, trips.length]);
+  useEffect(() => {
+    if (!loading) track('view.open', { view });
+  }, [loading, view]);
+
+  // Whether this person is on Orbit's team and may see the usage report.
+  const [usageAdmin, setUsageAdmin] = useState(false);
+  useEffect(() => {
+    if (!account?.usage || !account.profile) return undefined;
+    let live = true;
+    account.usage.isAdmin().then((yes) => { if (live) setUsageAdmin(yes); }, () => {});
+    return () => { live = false; };
+  }, [account]);
+
   // How many friend requests wait, read once when Orbit opens.
   useEffect(() => {
     if (!friendsOn) return undefined;
@@ -10840,6 +11307,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const persistEvents = async (next) => {
+    trackChanges('events', events, next);
     setEvents(next);
     if (holdBack(EVENTS_KEY)) return false;
     try {
@@ -10859,6 +11327,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const persistReminders = async (next) => {
+    trackChanges('reminders', reminders, next);
     setReminders(next);
     if (holdBack(REMINDERS_KEY)) return false;
     try {
@@ -10884,6 +11353,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const persistCollections = async (next) => {
+    trackChanges('lists', collections, next);
     setCollections(next);
     if (holdBack(COLLECTIONS_KEY)) return false;
     try {
@@ -10928,6 +11398,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const persistTrips = async (next) => {
+    trackChanges('trips', trips, next);
     setTrips(next);
     if (holdBack(TRIPS_KEY)) return false;
     try {
@@ -11015,6 +11486,7 @@ export default function PersonalCRM({ account = null } = {}) {
   };
 
   const backedUp = () => {
+    track('data.backup', {});
     const today = todayStr();
     setLastBackup(today);
     dismissTripNotice();
@@ -11025,6 +11497,7 @@ export default function PersonalCRM({ account = null } = {}) {
   // matched by id (see mergeById), and photos are added only when missing.
   // Photos go in before the trips that point at them.
   const restoreFile = async (file) => {
+    track('data.restore', {});
     const { parts, photos } = await readBackupFile(file);
     const P = mergeById(people, parts.people);
     const E = mergeById(events, parts.events);
@@ -11134,12 +11607,14 @@ export default function PersonalCRM({ account = null } = {}) {
   const totalCount = (circle) => ofCircle(circle).length;
 
   const pickTheme = async (name) => {
+    track('settings.theme', { theme: name });
     applyTheme(name);
     setTheme(name);
     try { await window.storage.set(THEME_KEY, name); } catch { /* not fatal */ }
   };
 
   const pickStart = async (v) => {
+    track('settings.start', { view: v });
     setStartView(v);
     try { await window.storage.set(START_KEY, v); } catch { /* not fatal */ }
   };
@@ -11378,7 +11853,7 @@ export default function PersonalCRM({ account = null } = {}) {
                       boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
                     }}
                   >
-                    {[...(friendsOn ? [['friends', friendCount ? `Friends (${friendCount})` : 'Friends']] : []), ['settings', 'Settings'], ['import', 'Import'], ['export', 'Export'], ['backup', 'Backup file']].map(([v, l], i) => (
+                    {[...(friendsOn ? [['friends', friendCount ? `Friends (${friendCount})` : 'Friends']] : []), ['settings', 'Settings'], ['import', 'Import'], ['export', 'Export'], ['backup', 'Backup file'], ...(usageAdmin ? [['usage', 'Usage']] : [])].map(([v, l], i) => (
                       <button
                         key={v}
                         className="crm-btn"
@@ -11533,6 +12008,12 @@ export default function PersonalCRM({ account = null } = {}) {
                 onExplore={catalogOn ? () => { setExplore([]); setView('explore'); } : null}
               />
             )}
+          </div>
+        )}
+
+        {view === 'usage' && usageAdmin && (
+          <div className="crm-full">
+            <UsageView api={account.usage} />
           </div>
         )}
 

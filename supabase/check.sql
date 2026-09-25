@@ -53,6 +53,13 @@ from (values
                                                 else has_function_privilege('anon', to_regprocedure('public.public_profile(text, integer)')::oid, 'execute') end),
   (25, 'Part 6: the friends feed',             to_regprocedure('public.friend_feed(timestamptz, text, integer)') is not null
                                                 and exists (select 1 from information_schema.columns
-                                                  where table_schema = 'public' and table_name = 'outings' and column_name = 'created_at'))
+                                                  where table_schema = 'public' and table_name = 'outings' and column_name = 'created_at')),
+  (26, 'Part 7: likes and comments',           to_regclass('public.post_likes') is not null and to_regclass('public.post_comments') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.post_comments')), false)
+                                                and to_regprocedure('public.post_thread(uuid, text, text)') is not null),
+  (27, 'Part 8: usage counts',                 to_regclass('public.usage_events') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.usage_events')), false)
+                                                and to_regprocedure('public.track_usage(jsonb, text)') is not null
+                                                and to_regprocedure('public.usage_report(integer)') is not null)
 ) as t(n, item, ok)
 order by n;

@@ -80,7 +80,7 @@ try {
   };
   const before = report();
   check('the setup check runs on an empty database and reports everything missing',
-    before.length === 25 && before.every(([, st]) => st.startsWith('MISSING')), before);
+    before.length === 27 && before.every(([, st]) => st.startsWith('MISSING')), before);
   // Part 1 alone, as it was merged, before friends existed.
   const partOne = schema.slice(0, schema.indexOf('-- Profiles as others see them.'));
   if (partOne.length < schema.length) {
@@ -94,7 +94,7 @@ try {
   const again = psql(schema);
   check('and runs again without harm, as its header promises', again.ok, again.err);
   const after = report();
-  check('after the whole schema, the setup check says OK to everything', after.length === 25 && after.every(([, st]) => st === 'OK'), after);
+  check('after the whole schema, the setup check says OK to everything', after.length === 27 && after.every(([, st]) => st === 'OK'), after);
 
   // ---- signing up ----
   check('a password sign-up makes the profile in the same step',
@@ -224,7 +224,10 @@ try {
   check('a person saves their notification settings', as(B, `insert into public.notification_prefs (user_id, push, send_hour, time_zone, kinds)
     values ('${B}', true, 8, 'America/Chicago', '{"birthdays": false, "junk": true, "events": "yes"}'::jsonb);`).ok);
   check('only the known kinds are kept, each on or off', psql(`select kinds::text from public.notification_prefs where user_id = '${B}'`).out
-    === '{"events": true, "checkins": true, "birthdays": false, "reminders": true, "friend_requests": true}');
+    === '{"events": true, "checkins": true, "birthdays": false, "reminders": true, "likes_comments": true, "friend_activity": true, "friend_requests": true}',
+    psql(`select kinds::text from public.notification_prefs where user_id = '${B}'`).out);
+  check('friends\' activity, likes and comments start on', psql("select column_default from information_schema.columns where table_name = 'notification_prefs' and column_name = 'kinds'").out.includes('"friend_activity": true')
+    && psql("select column_default from information_schema.columns where table_name = 'notification_prefs' and column_name = 'kinds'").out.includes('"likes_comments": true'));
   const hour = as(B, `update public.notification_prefs set send_hour = 25 where user_id = '${B}';`);
   check('a send hour must be a real hour', !hour.ok);
   check('nobody reads someone else\'s settings', as(D, 'select count(*) from public.notification_prefs;').out.split('\n').pop() === '0');
@@ -411,12 +414,97 @@ try {
   check('a block ends the friendship, and with it the feed', call(B, `block_user('${A}')`).ok && feed(B).length === 0);
   check('B unblocks A', call(B, `unblock_user('${A}')`).ok);
 
+  // ---- likes and comments ----
+  const like = (who, owner, kind, ref, on = true) => one(who, `select public.like_post('${owner}', '${kind}', '${ref}', ${on});`);
+  const comment = (who, owner, kind, ref, body) => one(who, `select public.comment_post('${owner}', '${kind}', '${ref}', '${body.replace(/'/g, "''")}');`);
+  const thread = (who, owner, kind, ref) => one(who, `select public.post_thread('${owner}', '${kind}', '${ref}');`);
+  check('A and B are friends again (the block above ended it)', call(A, `send_friend_request('${B}')`).ok
+    && call(B, `respond_friend_request('${A}', true)`).out.endsWith('friends'));
+  check('A shares again: e1 with everyone, e2 with friends, and a trip with friends', sync(A, items).ok && syncTrips(A, tripItems).ok);
+  const dl = like(D, A, 'outing', 'e1');
+  check('a stranger can like what is shared with everyone', dl.likes === 1 && dl.liked === true, dl);
+  check('but not what is shared with friends', /not there/.test(like(D, A, 'outing', 'e2').error || '') && /not there/.test(like(D, A, 'trip', 't1').error || ''));
+  check('a friend can like both', like(B, A, 'outing', 'e2').likes === 1 && like(B, A, 'trip', 't1').likes === 1);
+  check('liking twice is still one like', like(D, A, 'outing', 'e1').likes === 1);
+  check('and a like can be taken back', like(D, A, 'outing', 'e1', false).likes === 0 && like(D, A, 'outing', 'e1').likes === 1);
+  check('signed-out visitors cannot like or comment', !as('anon', `select public.like_post('${A}', 'outing', 'e1', true);`).ok
+    && !as('anon', `select public.comment_post('${A}', 'outing', 'e1', 'hi');`).ok);
+  const c1 = comment(B, A, 'outing', 'e1', 'Great game!');
+  check('a comment says who wrote it', c1.body === 'Great game!' && c1.by.username === 'bea' && c1.mine === true, c1);
+  check('an empty or overlong comment is refused', /1 to 1000/.test(comment(B, A, 'outing', 'e1', '   ').error || '')
+    && /1 to 1000/.test(comment(B, A, 'outing', 'e1', 'x'.repeat(1001)).error || ''));
+  check('nobody comments on what they cannot see', /not there/.test(comment(D, A, 'outing', 'e2', 'hm').error || ''));
+  const byOwner = thread(A, A, 'outing', 'e1');
+  check('the owner sees the thread, and may take any comment down', byOwner.thread.length === 1 && byOwner.thread[0].can_delete === true
+    && byOwner.thread[0].mine === false && byOwner.likers.map((l) => l.username).join() === 'dora', byOwner);
+  const threadD = thread(D, A, 'outing', 'e1');
+  check('others see it, but may only take down their own', threadD.thread[0].can_delete === false && threadD.liked === true);
+  check('nobody gets the thread of what they cannot see', thread(D, A, 'outing', 'e2') === null);
+  check('signed-out visitors get no thread', !as('anon', `select public.post_thread('${A}', 'outing', 'e1');`).ok);
+  const inFeed = feed(B).find((x) => x.ref === 'e1');
+  check('the feed carries whose post it is, and its likes and comments', inFeed?.owner === A && inFeed.post === 'outing' && inFeed.likes === 1
+    && inFeed.comments === 1 && inFeed.liked === false, inFeed);
+  check('as does a page', pub(B, 'brock').trips[0]?.likes === 1 && pub(B, 'brock').trips[0]?.liked === true);
+  check('and a catalog page', page(D, chiefs.id).outings[0]?.comments === 1 && page(D, chiefs.id).outings[0]?.liked === true);
+  check('signed-out visitors see the counts', pub('anon', 'brock').outings.find((o) => o.ref === 'e1')?.likes === 1);
+  check('D blocks B', call(D, `block_user('${B}')`).ok);
+  const blockedThread = thread(D, A, 'outing', 'e1');
+  check('a block hides their comments and likes, both ways', blockedThread.thread.length === 0 && blockedThread.comments === 0, blockedThread);
+  check('D unblocks B', call(D, `unblock_user('${B}')`).ok);
+  as(D, `select public.delete_comment('${c1.id}');`);
+  check('someone else\'s comment cannot be taken down by a third person', thread(A, A, 'outing', 'e1').thread.length === 1);
+  check('the owner can', as(A, `select public.delete_comment('${c1.id}');`).ok && thread(A, A, 'outing', 'e1').thread.length === 0);
+  comment(B, A, 'outing', 'e1', 'Again!');
+  check('a post taken down takes its likes and comments with it', sync(A, items.filter((x) => x.event_id !== 'e1')).ok
+    && psql(`select (select count(*) from public.post_likes where ref = 'e1') + (select count(*) from public.post_comments where ref = 'e1')`).out === '0');
+  const readLikes = as(B, 'select * from public.post_comments;');
+  check('likes and comments cannot be read directly', !readLikes.ok && /permission denied/.test(readLikes.err), readLikes.err);
+  check('A shares e1 again, and B likes and comments for the deletion checks', sync(A, items).ok && like(B, A, 'outing', 'e1').likes === 1
+    && comment(B, A, 'outing', 'e1', 'Still great').id);
+
+  // ---- usage counts ----
+  const track = (who, events, session = 'visit-abcdef12') => {
+    const r = as(who, `select public.track_usage('${JSON.stringify(events).replace(/'/g, "''")}'::jsonb, '${session}');`);
+    return r.ok ? Number(r.out.split('\n').pop()) : r.err;
+  };
+  check('a signed-out visitor\'s page view is counted, and malformed ones are not', track('anon', [
+    { name: 'page.view', props: { kind: 'profile', long: 'x'.repeat(200), nested: { a: 1 }, 'Bad Key': 1, n: 3, yes: true } },
+    { name: 'Bad Name' }, { name: 'nodot' }, 'not an object',
+  ]) === 1);
+  const row = JSON.parse(psql("select row_to_json(u) from public.usage_events u where name = 'page.view' order by id desc limit 1").out);
+  check('with no one attached, and only short plain details kept', row.user_id === null && row.props.long.length === 100 && !('nested' in row.props)
+    && !('Bad Key' in row.props) && row.props.n === 3 && row.props.yes === true && row.props.kind === 'profile', row);
+  check('a visit needs an id', track('anon', [{ name: 'page.view' }], 'short') === 0);
+  check('a signed-in action is counted against them', track(A, [{ name: 'event.add', props: { kind: 'Concert', rated: true } }, { name: 'view.open', props: { view: 'feed' } }]) === 2
+    && psql(`select count(*) from public.usage_events where user_id = '${A}'`).out === '2');
+  check('at most 50 at once', track(A, Array.from({ length: 60 }, () => ({ name: 'feed.scroll' }))) === 50);
+  check('and nothing claims to be from more than an hour ago, or the future',
+    track(A, [{ name: 'app.old', ago_ms: 7200000 }, { name: 'app.future', ago_ms: -50000 }]) === 2
+    && psql("select (select at > now() - interval '61 minutes' from public.usage_events where name = 'app.old') and (select at <= now() from public.usage_events where name = 'app.future')").out === 't');
+  check('someone who turned it off is not counted, whatever their app sends', as(B, `update public.profiles set share_usage = false where id = '${B}';`).ok
+    && track(B, [{ name: 'event.add' }]) === 0 && psql(`select count(*) from public.usage_events where user_id = '${B}'`).out === '0');
+  const readUsage = as(A, 'select * from public.usage_events;');
+  check('nobody reads the rows directly', !readUsage.ok && /permission denied/.test(readUsage.err), readUsage.err);
+  const notAdmin = as(A, 'select public.usage_report(30);');
+  check('the usage is only for the team', !notAdmin.ok && /team/.test(notAdmin.err) && as(A, 'select public.is_usage_admin();').out.endsWith('f'), notAdmin.err);
+  check('and never for signed-out visitors', !as('anon', 'select public.usage_report(30);').ok && !as('anon', 'select public.is_usage_admin();').ok);
+  check('A is added to the team by hand', psql(`insert into public.usage_admins select id from public.profiles where username = 'brock';`).ok
+    && as(A, 'select public.is_usage_admin();').out.endsWith('t'));
+  const usage = one(A, 'select public.usage_report(30);');
+  check('the report counts who is active, and each part of the app', usage.totals.active >= 1 && usage.totals.visits >= 1
+    && usage.areas.some((x) => x.area === 'event' && x.people === 1 && x.share === 100) && usage.actions.some((x) => x.name === 'event.add' && x.count === 1), usage.totals);
+  check('by day, by tab, by depth, heavy against light, by week joined, and the public page funnel', usage.daily.length === 30
+    && usage.views.some((x) => x.view === 'feed') && usage.depth['1'] >= 1 && Array.isArray(usage.heavy.areas)
+    && usage.cohorts.length >= 1 && usage.public.visitors === 1 && usage.public.views === 1, usage);
+  check('a window can be chosen, within reason', one(A, 'select public.usage_report(7);').daily.length === 7 && one(A, 'select public.usage_report(9999);').days === 365);
+  check('nothing anyone wrote is in it', !JSON.stringify(usage).includes('xxxxx'));
+
   // ---- deleting an account ----
   const anonDel = as('anon', 'select public.delete_my_account();');
   check('a signed-out visitor cannot delete anything', !anonDel.ok, anonDel.err);
   check('a person can delete their own account', as(A, 'select public.delete_my_account();').ok);
   check('which removes their sign-in, profile and saved data', psql(`select (select count(*) from auth.users where id = '${A}') + (select count(*) from public.profiles where id = '${A}') + (select count(*) from public.orbit_data where user_id = '${A}')`).out === '0');
-  check('their shared outings go with it, and the entries they added stay, without their name', psql(`select (select count(*) from public.outings where user_id = '${A}') + (select count(*) from public.outing_links where user_id = '${A}') + (select count(*) from public.shared_trips where user_id = '${A}')`).out === '0'
+  check('their shared outings go with it, and the entries they added stay, without their name', psql(`select (select count(*) from public.outings where user_id = '${A}') + (select count(*) from public.outing_links where user_id = '${A}') + (select count(*) from public.shared_trips where user_id = '${A}') + (select count(*) from public.post_likes where owner = '${A}') + (select count(*) from public.post_comments where owner = '${A}') + (select count(*) from public.usage_events where user_id = '${A}') + (select count(*) from public.usage_admins where user_id = '${A}')`).out === '0'
     && psql(`select count(*) || '|' || count(created_by) from public.catalog where source_id = 'Q223455'`).out === '1|0');
   check('and nobody else\'s', psql(`select (select count(*) from public.profiles where id = '${B}') + (select count(*) from public.orbit_data where user_id = '${B}')`).out === '2');
 } finally {

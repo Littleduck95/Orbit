@@ -59,6 +59,7 @@ src/TripMap.jsx       the Leaflet maps, loaded only when a map is shown
 src/recapCard.js      draws Recap's share card on a canvas
 src/catalog.js        the shared catalog: Wikidata search, and what of an event or trip is shared
 src/route.js          the public addresses (/u/name, /u/name/year, /c/id) that skip sign-in
+src/usage.js          usage counts: what people do (never what they write), in batches
 src/mapConfig.js      map tiles and place search: one entry each
 src/geo.js            country and US state outlines: which one a stop is in, and shading
 tests/                characterization tests (logic, storage, account, browser)
@@ -531,6 +532,76 @@ your own. A block ends the friendship and with it the feed; trips set back
 to Only me leave it at once. All of this is `friend_feed` in part 6 of
 `supabase/schema.sql`.
 
+### Likes and comments
+
+Every shared outing and trip, in the feed, on people's pages and on catalog
+pages, has a heart and comments underneath. Anyone signed in who may see a
+post can like it and comment on it (up to 1000 characters; Enter posts,
+Shift+Enter starts a new line). Comments open with who liked it. A comment
+can be deleted by whoever wrote it and by the post's owner. Signed-out
+visitors to an open page see the counts and *Log in to like or comment*,
+never the comments themselves, since those were written for people in
+Orbit.
+
+They belong to the post: when it is taken down (set to Only me, removed,
+or trips hidden) its likes and comments go with it. Someone blocked,
+either way, is not counted and their comments are not shown. More than 60
+comments in an hour from one person are refused. All of this is part 7 of
+`supabase/schema.sql` (`like_post`, `comment_post`, `delete_comment`,
+`post_thread`), and every post the feed, pages and catalog hand out carries
+its `owner`, `post`, `ref`, `likes`, `liked` and `comments`.
+
+### Usage counts
+
+Orbit counts what people do, so what gets built next, and what could be
+worth paying for, follows what people use. `track('event.add', { kind:
+'Concert', rated: true })` notes one action ([`src/usage.js`](src/usage.js)).
+Names are `area.action`; details are a few short words, numbers or
+true/false. **Never anything anyone wrote**: no names, titles, notes,
+places or comments. Actions wait on the device and go in batches every few
+seconds, and when the page is hidden or closed.
+
+What is counted:
+
+| Area | Actions |
+| --- | --- |
+| `app`, `view` | opening Orbit (phone or computer, from the Home Screen or not, signed in, and how many people, events, reminders, lists and trips are in it), each tab opened |
+| `person`, `catchup`, `event`, `reminder`, `list`, `trip` | added, edited, removed, catch-ups logged, reminders done, list entries added, finished and rated, trip photos added, with a few details of a single one (an event's kind, whether rated, linked or shared). Counted where the app saves, so nothing is missed; a pile at once (an import) is one count |
+| `share`, `recap`, `data` | sending a copy of a person, list or trip (how), the Recap card opened, saved or shared, import, export, backup, restore |
+| `catalog`, `explore`, `feed`, `post` | linking an entry (from Orbit or Wikidata), searching, opening a page, the feed viewed, more loaded, piles opened, likes and comments |
+| `friends`, `notify`, `settings`, `profile` | requests, accepts, blocks, push on or off, which notification kinds are turned off, theme, start tab, page settings |
+| `page` | public page views (signed in or not), *Join Orbit* clicks, links copied |
+
+**Turning it off.** Settings → Preferences → *Share which parts of Orbit I
+use*, on to start with. Off, the app stops sending, and the server keeps
+nothing from that person whatever arrives (`profiles.share_usage`).
+Signed-out visitors to public pages are counted by a random id for that
+visit only, and not at all when their browser asks not to be tracked (Do
+Not Track or Global Privacy Control). Without an account server nothing is
+counted. Deleting an account deletes its counts.
+
+**The report.** Nobody reads the rows directly. People added to
+`usage_admins` get *Usage* in the ⋮ menu: the last 7, 30 or 90 days as
+headline numbers, active people by day (a chart, or a table), each part of
+the app with the share of active people using it, **what engaged people
+rely on** (each part's use among people active 8 or more days against the
+rest: the best guide to what to build on, or charge for), how many days
+people come back, whether each week's new people stay (weeks 1, 2 and 4),
+tabs opened, the public page funnel (views, visitors, *Join Orbit* clicks,
+new accounts), devices, and every action. Add yourself once in the SQL
+Editor:
+
+```sql
+insert into public.usage_admins select id from public.profiles where username = 'yourname';
+```
+
+It is `track_usage`, `is_usage_admin` and `usage_report` in part 8 of
+`supabase/schema.sql`. `track_usage` takes at most 50 actions a call, keeps
+only well-formed names and plain details, and uses the server's clock.
+Anyone can call it (signed-out visitors are counted), so a determined
+person could add noise; if that happens, rate limiting belongs in front of
+it.
+
 ### Preferences and notifications
 
 **Settings → Preferences** holds the theme, which tab Orbit opens on, and
@@ -546,7 +617,13 @@ notifications:
   is something in it.
 - **What**: birthdays (on the day, or up to two weeks before), reminders (when
   they come into view and when due), check-ins falling overdue, events (the
-  day before and the day of), and friend requests.
+  day before and the day of), friend requests, **friends' activity** (a friend
+  rated a concert or a game, or showed a trip) and **likes and comments** on
+  what you shared. The last two are on to start with, including for settings
+  saved before they existed, and each can be turned off here. Like friend
+  requests, they go on any hourly run outside quiet hours, by push only;
+  more than two from one friend at once become one line ("Dora shared 5 new
+  things").
 - **When**: an hour of the day in the person's own time zone, and quiet hours
   that hold friend request pushes until they end.
 

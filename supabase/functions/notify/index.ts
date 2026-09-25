@@ -5,8 +5,9 @@
 // supabase/notifications-cron.sql) calls it, and for each person whose
 // chosen hour it now is, in their own time zone, it works out what is due
 // from their saved Orbit and sends it. Friend requests go out on any run,
-// outside quiet hours. A log of what went out keeps anything being sent
-// twice. Signed-in people can also ask it for a test push to their own
+// outside quiet hours, as do friends' activity (what they rated, where they
+// went) and likes and comments on what you shared. A log of what went out
+// keeps anything being sent twice. Signed-in people can also ask it for a test push to their own
 // devices.
 //
 // Secrets it needs (Edge Functions → Secrets in the dashboard):
@@ -58,8 +59,16 @@ export function nextBirthday(birthday: string, today: string): string {
 
 /* ---------- what is due ---------- */
 
-export type Kinds = { birthdays: boolean; reminders: boolean; checkins: boolean; events: boolean; friend_requests: boolean };
-export type Item = { kind: keyof Kinds; ref: string; text: string; day: string };
+// friend_activity and likes_comments came later: a setting saved before them
+// does not name them, and they count as on.
+export type Kinds = {
+  birthdays: boolean; reminders: boolean; checkins: boolean; events: boolean; friend_requests: boolean;
+  friend_activity?: boolean; likes_comments?: boolean;
+};
+// also: more refs a gathered item stands for, each logged as sent with it.
+export type Item = { kind: keyof Kinds; ref: string; text: string; day: string; also?: string[] };
+// Something a friend did: who, so a pile from one friend can be gathered.
+export type Social = { ref: string; who: string; text: string };
 type Rec = Record<string, unknown>;
 
 const when = (d: number) => (d === 0 ? 'today' : d === 1 ? 'tomorrow' : `in ${d} days`);
@@ -124,12 +133,47 @@ export function dueItems(
   return out.sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
 }
 
+const SOCIAL = new Set<keyof Kinds>(['friend_activity', 'likes_comments', 'friend_requests']);
+
+// Friends' activity and reactions as push items, only what has not been sent,
+// with more than two from one friend gathered into one line.
+export function socialItems(list: (Social & { kind: 'friend_activity' | 'likes_comments' })[], done: Set<string>, day: string): Item[] {
+  const fresh = list.filter((s) => !done.has(s.ref));
+  const out: Item[] = [];
+  const seen = new Set<string>();
+  for (const s of fresh) {
+    const key = `${s.kind}:${s.who}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const same = fresh.filter((x) => x.kind === s.kind && x.who === s.who);
+    if (same.length > 2) {
+      out.push({
+        kind: s.kind, ref: same[0].ref, also: same.slice(1).map((x) => x.ref), day,
+        text: s.kind === 'friend_activity' ? `${s.who} shared ${same.length} new things` : `${s.who} liked or commented on ${same.length} of your posts`,
+      });
+    } else {
+      out.push(...same.map((x) => ({ kind: x.kind, ref: x.ref, text: x.text, day })));
+    }
+  }
+  return out;
+}
+
+const refsOf = (i: Item) => [i.ref, ...(i.also ?? [])];
+
+// Stars in text, halves and all: 4.5 is ★★★★½.
+export const starText = (n: unknown) => {
+  const r = Number(n);
+  if (!(r > 0)) return '';
+  return '★'.repeat(Math.floor(r)) + (r % 1 ? '½' : '');
+};
+
 // One push for everything new at once, rather than a stream of them.
 export function pushFor(items: Item[]): { title: string; body: string; tag: string } {
   if (items.length === 1) return { title: 'Orbit', body: items[0].text, tag: 'orbit-digest' };
   const more = items.length - 3;
+  const social = items.every((i) => SOCIAL.has(i.kind));
   return {
-    title: `Orbit: ${items.length} things coming up`,
+    title: social ? `Orbit: ${items.length} new from friends` : `Orbit: ${items.length} things coming up`,
     body: items.slice(0, 3).map((i) => i.text).join('\n') + (more > 0 ? `\nand ${more} more` : ''),
     tag: 'orbit-digest',
   };
@@ -171,6 +215,10 @@ export type Db = {
   subs(userId: string): Promise<Sub[]>;
   dropSub(endpoint: string): Promise<void>;
   requests(userId: string): Promise<{ id: string; name: string }[]>;
+  // Friends' outings and trips first shared since then, and likes and
+  // comments on this person's posts since then.
+  activity(userId: string, since: string): Promise<Social[]>;
+  reactions(userId: string, since: string): Promise<Social[]>;
   sent(userId: string, channel: 'push' | 'email', refs: string[]): Promise<Set<string>>;
   log(rows: { user_id: string; channel: 'push' | 'email'; ref: string }[]): Promise<void>;
   emailOf(userId: string): Promise<string | null>;
@@ -205,16 +253,24 @@ export async function run(db: Db, send: Senders, now: Date, appUrl: string) {
 
       if (p.push) {
         const items = onTime ? dueItems(data, here.date, { kinds: p.kinds, birthdayDays: p.birthday_days }) : [];
-        if (p.kinds.friend_requests && !quiet) {
-          for (const r of await db.requests(p.user_id)) {
-            items.push({ kind: 'friend_requests', ref: `req:${r.id}`, day: here.date, text: `${r.name} wants to be friends` });
+        const social: (Social & { kind: 'friend_activity' | 'likes_comments' })[] = [];
+        if (!quiet) {
+          if (p.kinds.friend_requests) {
+            for (const r of await db.requests(p.user_id)) {
+              items.push({ kind: 'friend_requests', ref: `req:${r.id}`, day: here.date, text: `${r.name} wants to be friends` });
+            }
           }
+          // A day and an hour back, so nothing falls between two runs.
+          const since = new Date(now.getTime() - 25 * 3600000).toISOString();
+          if (p.kinds.friend_activity !== false) social.push(...(await db.activity(p.user_id, since)).map((s) => ({ ...s, kind: 'friend_activity' as const })));
+          if (p.kinds.likes_comments !== false) social.push(...(await db.reactions(p.user_id, since)).map((s) => ({ ...s, kind: 'likes_comments' as const })));
         }
-        const done = items.length ? await db.sent(p.user_id, 'push', items.map((i) => i.ref)) : new Set<string>();
-        const fresh = items.filter((i) => !done.has(i.ref));
+        const refs = [...items.map((i) => i.ref), ...social.map((s) => s.ref)];
+        const done = refs.length ? await db.sent(p.user_id, 'push', refs) : new Set<string>();
+        const fresh = [...items.filter((i) => !done.has(i.ref)), ...socialItems(social, done, here.date)];
         if (fresh.length && (await pushAll(db, send, p.user_id, { ...pushFor(fresh), url: appUrl })) > 0) {
           summary.pushes += 1;
-          await db.log(fresh.map((i) => ({ user_id: p.user_id, channel: 'push', ref: i.ref })));
+          await db.log(fresh.flatMap(refsOf).map((ref) => ({ user_id: p.user_id, channel: 'push' as const, ref })));
         }
       }
 
@@ -269,6 +325,55 @@ export function supabaseDb(client: any): Db {
       const names: { id: string; display_name: string }[] = must(await client.from('profiles').select('id, display_name')
         .in('id', rows.map((r) => r.requester))) ?? [];
       return names.map((n) => ({ id: n.id, name: n.display_name }));
+    },
+    activity: async (userId, since) => {
+      const pairs: { requester: string; addressee: string }[] = must(await client.from('friendships').select('requester, addressee')
+        .eq('status', 'accepted').or(`requester.eq.${userId},addressee.eq.${userId}`)) ?? [];
+      const ids = pairs.map((f) => (f.requester === userId ? f.addressee : f.requester));
+      if (!ids.length) return [];
+      const people: { id: string; display_name: string; visibility: Rec }[] = must(await client.from('profiles')
+        .select('id, display_name, visibility').in('id', ids)) ?? [];
+      const who = new Map(people.map((x) => [x.id, x]));
+      const outs: { user_id: string; event_id: string; title: string; rating: number | null }[] = must(await client.from('outings')
+        .select('user_id, event_id, title, rating').in('user_id', ids).gte('created_at', since).order('created_at')) ?? [];
+      const trips: { user_id: string; trip_id: string; title: string }[] = must(await client.from('shared_trips')
+        .select('user_id, trip_id, title').in('user_id', ids).gte('created_at', since).order('created_at')) ?? [];
+      const nameOf = (id: string) => who.get(id)?.display_name || 'A friend';
+      return [
+        ...outs.map((o) => ({
+          ref: `act:${o.user_id}:o:${o.event_id}`, who: nameOf(o.user_id),
+          text: o.rating ? `${nameOf(o.user_id)} rated ${o.title} ${starText(o.rating)}` : `${nameOf(o.user_id)} went to ${o.title}`,
+        })),
+        // Only trips they show to friends or everyone.
+        ...trips.filter((t) => ['friends', 'everyone'].includes(String(who.get(t.user_id)?.visibility?.trips || 'me'))).map((t) => ({
+          ref: `act:${t.user_id}:t:${t.trip_id}`, who: nameOf(t.user_id), text: `${nameOf(t.user_id)} went to ${t.title}`,
+        })),
+      ];
+    },
+    reactions: async (userId, since) => {
+      const likes: { liker: string; kind: string; ref: string }[] = must(await client.from('post_likes').select('liker, kind, ref')
+        .eq('owner', userId).neq('liker', userId).gte('created_at', since).order('created_at')) ?? [];
+      const notes: { id: string; author: string; kind: string; ref: string; body: string }[] = must(await client.from('post_comments')
+        .select('id, author, kind, ref, body').eq('owner', userId).neq('author', userId).gte('created_at', since).order('created_at')) ?? [];
+      if (!likes.length && !notes.length) return [];
+      const blocks: { blocker: string; blocked: string }[] = must(await client.from('blocks').select('blocker, blocked')
+        .or(`blocker.eq.${userId},blocked.eq.${userId}`)) ?? [];
+      const blocked = new Set(blocks.map((b) => (b.blocker === userId ? b.blocked : b.blocker)));
+      const ids = [...new Set([...likes.map((l) => l.liker), ...notes.map((c) => c.author)])];
+      const people: { id: string; display_name: string }[] = must(await client.from('profiles').select('id, display_name').in('id', ids)) ?? [];
+      const nameOf = (id: string) => people.find((x) => x.id === id)?.display_name || 'Someone';
+      const outs: { event_id: string; title: string }[] = must(await client.from('outings').select('event_id, title').eq('user_id', userId)) ?? [];
+      const trips: { trip_id: string; title: string }[] = must(await client.from('shared_trips').select('trip_id, title').eq('user_id', userId)) ?? [];
+      const title = (kind: string, ref: string) => (kind === 'outing' ? outs.find((o) => o.event_id === ref)?.title : trips.find((t) => t.trip_id === ref)?.title) || 'your post';
+      const clip = (t: string) => (t.length > 80 ? `${t.slice(0, 79)}…` : t);
+      return [
+        ...likes.filter((l) => !blocked.has(l.liker)).map((l) => ({
+          ref: `like:${l.liker}:${l.kind}:${l.ref}`, who: nameOf(l.liker), text: `${nameOf(l.liker)} liked ${title(l.kind, l.ref)}`,
+        })),
+        ...notes.filter((c) => !blocked.has(c.author)).map((c) => ({
+          ref: `cmt:${c.id}`, who: nameOf(c.author), text: `${nameOf(c.author)} commented on ${title(c.kind, c.ref)}: “${clip(c.body)}”`,
+        })),
+      ];
     },
     sent: async (userId, channel, refs) => {
       const rows: { ref: string }[] = must(await client.from('notification_log').select('ref')
