@@ -8,7 +8,7 @@ import { Buffer } from 'node:buffer';
 import {
   type Db, type Kinds, type Prefs, type Senders, type Sub,
   type Social,
-  daysBetween, dueItems, emailFor, handle, inQuiet, localNow, nextBirthday, pushFor, realSenders, run, socialItems, starText,
+  IN_CHUNK, daysBetween, dueItems, emailFor, handle, inQuiet, localNow, nextBirthday, pushFor, realSenders, run, socialItems, starText, supabaseDb,
 } from '../../supabase/functions/notify/index.ts';
 
 const ALL: Kinds = { birthdays: true, reminders: true, checkins: true, events: true, friend_requests: true };
@@ -342,4 +342,32 @@ Deno.test('things coming up still say so, even beside friends\' news', () => {
     { kind: 'events', ref: 'a', day: 'd', text: 'Tomorrow: Wedding' },
     { kind: 'friend_activity', ref: 'b', day: 'd', text: 'Bea went to Lisbon' },
   ]).title, 'Orbit: 2 things coming up');
+});
+
+// A stand-in for the Supabase client: each query records its .in() list and
+// answers with the rows whose value is in it.
+function fakeClient(rows: Record<string, Record<string, unknown>[]>) {
+  const lists: number[] = [];
+  const client = {
+    from(table: string) {
+      let col = '';
+      let list: unknown[] = [];
+      const q = {
+        select: () => q, eq: () => q, gte: () => q, order: () => q, or: () => q,
+        in: (c: string, l: unknown[]) => { col = c; list = l; lists.push(l.length); return q; },
+        then: (ok: (v: unknown) => void) => ok({ data: (rows[table] ?? []).filter((r) => !col || list.includes(r[col])), error: null }),
+      };
+      return q;
+    },
+  };
+  return { client, lists };
+}
+
+Deno.test('a long list is asked for in pieces, so the request stays short, and nothing is lost', async () => {
+  const refs = Array.from({ length: 173 }, (_, i) => `act:friend:o:${i}`);
+  const { client, lists } = fakeClient({ notification_log: refs.filter((_, i) => i % 2).map((ref) => ({ ref })) });
+  const done = await supabaseDb(client).sent('u', 'push', refs);
+  assertEquals(done.size, 86);
+  assert(lists.every((n) => n <= IN_CHUNK), `pieces of at most ${IN_CHUNK}: ${lists}`);
+  assertEquals(lists.reduce((a, b) => a + b, 0), 173);
 });

@@ -785,8 +785,8 @@ grant execute on function public.sync_outings(jsonb) to authenticated;
 -- (visibility.trips), the trips they have taken are copied here: title,
 -- dates, rating, highlight, and each stop's name, country, US state and a
 -- position rounded to about a kilometre. Never who went, never notes or
--- photos, and never trips still to come, which would say when someone is
--- away from home.
+-- photos, and never trips still to come or still going, which would say
+-- when someone is away from home.
 
 -- public_page, whether signed-out visitors may see a page at all, is added
 -- in part 4 above, where outings first need it.
@@ -836,7 +836,8 @@ begin
   -- Updated where they are, as outings are, so each keeps when it was first shown.
   for it in select value from jsonb_array_elements(items) loop
     begin
-      if jsonb_typeof(it) <> 'object' or (it ->> 'start')::date > current_date + 1 then continue; end if;
+      -- Only trips that are over: one still going says its owner is away now.
+      if jsonb_typeof(it) <> 'object' or coalesce((it ->> 'end')::date, (it ->> 'start')::date) >= current_date then continue; end if;
       tid := it ->> 'trip_id';
       if tid is null or tid = any(keep) then continue; end if;
       stops := '[]'::jsonb;

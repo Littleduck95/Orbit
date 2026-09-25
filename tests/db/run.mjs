@@ -329,13 +329,14 @@ try {
     { trip_id: 't1', title: 'Lisbon', start: '2025-05-10', end: '2025-05-17', rating: 4.5, highlight: 'Tram 28',
       stops: [{ name: 'Lisbon', lat: 38.72231, lng: -9.13934, country: 'Portugal', state: '' }, { name: 'Bad', lat: 999, lng: 0 }] },
     { trip_id: 't2', title: 'Later', start: '2099-01-01', stops: [] },
+    { trip_id: 't4', title: 'Still away', start: '2020-01-01', end: '2099-01-01', stops: [] },
     { trip_id: 't3', title: 'Bad dates', start: '2025-05-10', end: '2025-05-01', stops: [] },
   ];
   const syncTrips = (who, list) => as(who, `select public.sync_trips('${JSON.stringify(list).replace(/'/g, "''")}'::jsonb);`);
   check('trips set to only me are never kept', syncTrips(A, tripItems).out.split('\n').pop() === '0'
     && psql(`select count(*) from public.shared_trips where user_id = '${A}'`).out === '0');
   check('A shows trips to friends', as(A, `update public.profiles set visibility = visibility || '{"trips":"friends"}'::jsonb where id = '${A}';`).ok);
-  check('then trips that have happened are kept, and malformed ones are not', syncTrips(A, tripItems).out.split('\n').pop() === '1');
+  check('then trips that are over are kept; ones still going, to come, or malformed are not', syncTrips(A, tripItems).out.split('\n').pop() === '1');
   check('each stop keeps a position rounded to about a kilometre, and bad stops are dropped',
     psql(`select stops::text from public.shared_trips where user_id = '${A}'`).out === '[{"lat": 38.72, "lng": -9.14, "name": "Lisbon", "state": "", "country": "Portugal"}]',
     psql(`select stops::text from public.shared_trips where user_id = '${A}'`).out);

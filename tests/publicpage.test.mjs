@@ -57,9 +57,15 @@ describe('trips on a page', () => {
     assert.doesNotMatch(JSON.stringify(tripsToShare([trip('a')], where, '2026-09-22')), /p1|private|ph1|food|Rua/);
   });
 
+  it('not a trip still going: that would say someone is away now', () => {
+    const out = tripsToShare([trip('away', { startDate: '2026-09-20', endDate: '2026-09-25' }), trip('today', { startDate: '2026-09-22', endDate: null }),
+      trip('home', { startDate: '2026-09-15', endDate: '2026-09-21' })], where, '2026-09-22');
+    assert.deepEqual(out.map((t) => t.trip_id), ['home']);
+  });
+
   it('only trips taken: nothing planned, wished for, or yet to start', () => {
     const out = tripsToShare([trip('a'), trip('b', { status: 'planned' }), trip('c', { status: 'someday', startDate: null }),
-      trip('d', { startDate: '2026-09-23' }), trip('e', { startDate: '2026-09-22' })], where, '2026-09-22');
+      trip('d', { startDate: '2026-09-23', endDate: null }), trip('e', { startDate: '2026-09-21', endDate: null })], where, '2026-09-22');
     assert.deepEqual(out.map((t) => t.trip_id), ['a', 'e']);
   });
 

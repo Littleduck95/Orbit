@@ -299,11 +299,28 @@ export async function run(db: Db, send: Senders, now: Date, appUrl: string) {
 
 const ORBIT_KEYS = { 'crm-people-v1': 'people', 'crm-reminders-v1': 'reminders', 'crm-events-v1': 'events' } as const;
 
+// A list filter (.in) travels in the request's address, which has a length
+// limit. A friend who shares a pile at once can mean hundreds of refs, so
+// long lists are asked for in pieces.
+export const IN_CHUNK = 50;
+export const inPieces = <T>(xs: T[]): T[][] => {
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i += IN_CHUNK) out.push(xs.slice(i, i + IN_CHUNK));
+  return out;
+};
+
 // deno-lint-ignore no-explicit-any
 export function supabaseDb(client: any): Db {
   const must = <T>({ data, error }: { data: T; error: { message: string } | null }) => {
     if (error) throw new Error(error.message);
     return data;
+  };
+  // Every row where column is in the list, a piece at a time. q starts each query.
+  // deno-lint-ignore no-explicit-any
+  const inAll = async <T>(list: string[], column: string, q: () => any): Promise<T[]> => {
+    const rows: T[] = [];
+    for (const piece of inPieces(list)) rows.push(...((must(await q().in(column, piece)) as T[] | null) ?? []));
+    return rows;
   };
   return {
     prefs: async () => must(await client.from('notification_prefs').select('*').or('push.eq.true,email.eq.true')) ?? [],
@@ -331,13 +348,13 @@ export function supabaseDb(client: any): Db {
         .eq('status', 'accepted').or(`requester.eq.${userId},addressee.eq.${userId}`)) ?? [];
       const ids = pairs.map((f) => (f.requester === userId ? f.addressee : f.requester));
       if (!ids.length) return [];
-      const people: { id: string; display_name: string; visibility: Rec }[] = must(await client.from('profiles')
-        .select('id, display_name, visibility').in('id', ids)) ?? [];
+      const people = await inAll<{ id: string; display_name: string; visibility: Rec }>(ids, 'id',
+        () => client.from('profiles').select('id, display_name, visibility'));
       const who = new Map(people.map((x) => [x.id, x]));
-      const outs: { user_id: string; event_id: string; title: string; rating: number | null }[] = must(await client.from('outings')
-        .select('user_id, event_id, title, rating').in('user_id', ids).gte('created_at', since).order('created_at')) ?? [];
-      const trips: { user_id: string; trip_id: string; title: string }[] = must(await client.from('shared_trips')
-        .select('user_id, trip_id, title').in('user_id', ids).gte('created_at', since).order('created_at')) ?? [];
+      const outs = await inAll<{ user_id: string; event_id: string; title: string; rating: number | null }>(ids, 'user_id',
+        () => client.from('outings').select('user_id, event_id, title, rating').gte('created_at', since).order('created_at'));
+      const trips = await inAll<{ user_id: string; trip_id: string; title: string }>(ids, 'user_id',
+        () => client.from('shared_trips').select('user_id, trip_id, title').gte('created_at', since).order('created_at'));
       const nameOf = (id: string) => who.get(id)?.display_name || 'A friend';
       return [
         ...outs.map((o) => ({
@@ -360,7 +377,7 @@ export function supabaseDb(client: any): Db {
         .or(`blocker.eq.${userId},blocked.eq.${userId}`)) ?? [];
       const blocked = new Set(blocks.map((b) => (b.blocker === userId ? b.blocked : b.blocker)));
       const ids = [...new Set([...likes.map((l) => l.liker), ...notes.map((c) => c.author)])];
-      const people: { id: string; display_name: string }[] = must(await client.from('profiles').select('id, display_name').in('id', ids)) ?? [];
+      const people = await inAll<{ id: string; display_name: string }>(ids, 'id', () => client.from('profiles').select('id, display_name'));
       const nameOf = (id: string) => people.find((x) => x.id === id)?.display_name || 'Someone';
       const outs: { event_id: string; title: string }[] = must(await client.from('outings').select('event_id, title').eq('user_id', userId)) ?? [];
       const trips: { trip_id: string; title: string }[] = must(await client.from('shared_trips').select('trip_id, title').eq('user_id', userId)) ?? [];
@@ -376,8 +393,8 @@ export function supabaseDb(client: any): Db {
       ];
     },
     sent: async (userId, channel, refs) => {
-      const rows: { ref: string }[] = must(await client.from('notification_log').select('ref')
-        .eq('user_id', userId).eq('channel', channel).in('ref', refs)) ?? [];
+      const rows = await inAll<{ ref: string }>(refs, 'ref',
+        () => client.from('notification_log').select('ref').eq('user_id', userId).eq('channel', channel));
       return new Set(rows.map((r) => r.ref));
     },
     log: async (rows) => { must(await client.from('notification_log').upsert(rows, { onConflict: 'user_id,channel,ref', ignoreDuplicates: true })); },

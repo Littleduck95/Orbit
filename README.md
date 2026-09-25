@@ -477,8 +477,8 @@ only sees outings, and counts ratings, from people whose pages are open.
 
 **Trips on the page** are off until chosen: *Trips you have taken* in the
 same card, Everyone, Friends or Only me. Once shown, the app copies the
-trips taken (never ones planned or wished for, which would say when someone
-is away) with their title, dates, rating, highlight and each stop's name,
+trips that are over (never ones planned, wished for or still going, which
+would say when someone is away) with their title, dates, rating, highlight and each stop's name,
 country and US state, and its position rounded to about a kilometre. Never
 who went, notes, tags, photos or street addresses. Countries and states are
 worked out on the device from the outlines, which load only for this. The
