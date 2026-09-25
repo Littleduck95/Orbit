@@ -34,17 +34,26 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
   // ---- create a Books list from the quick start, then switch templates ----
   await page.getByRole('button', { name: 'Books', exact: true }).click();
   const nameBox = page.getByLabel('Name', { exact: true });
-  const template = (kind) => page.getByRole('button', { name: new RegExp(`^${kind} `) });
+  const templates = page.getByRole('group', { name: 'Templates' });
+  const template = (kind) => templates.getByRole('button', { name: new RegExp(`^${kind} `) });
+  const change = () => page.getByRole('button', { name: 'Change', exact: true }).click();
   check('quick start prefills the name', (await nameBox.inputValue()) === 'Books to read');
   check('quick start prefills stage words', (await page.getByLabel('Name for the under way stage').inputValue()) === 'Reading');
-  check('quick start marks its template', (await template('Books').getAttribute('aria-pressed')) === 'true');
+  check('quick start folds the templates to a line', (await templates.count()) === 0
+    && await page.getByText('Template: Books').isVisible());
+  await change();
+  check('Change opens the templates', await templates.isVisible());
+  check('the chosen template is marked', (await template('Books').getAttribute('aria-pressed')) === 'true');
   check('the form has no Other template', (await template('Other').count()) === 0);
   await template('Shows').click();
+  check('picking a template folds them away', (await templates.count()) === 0
+    && await page.getByText('Template: Shows').isVisible());
   check('switching template swaps the name', (await nameBox.inputValue()) === 'Shows to watch');
   check('switching template swaps the stage words', (await page.getByLabel('Name for the finished stage').inputValue()) === 'Watched');
   await page.getByLabel('Name for the finished stage').fill('Seen it');
   await nameBox.fill('Shows to watchs');
   await page.getByLabel('What it is for').fill('Kept as typed');
+  await change();
   await template('Books').click();
   check('switching template replaces an edited name', (await nameBox.inputValue()) === 'Books to read');
   check('switching template replaces edited stage words', (await page.getByLabel('Name for the finished stage').inputValue()) === 'Read');
@@ -54,7 +63,10 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
   check('Start blank empties the name', (await nameBox.inputValue()) === '');
   check('Start blank empties the stage words', (await page.getByLabel('Name for the not started stage').inputValue()) === '');
   check('Start blank empties the line under each title', (await page.getByLabel('The line under each title').inputValue()) === '');
+  check('Start blank says there is no template', await page.getByText('No template').isVisible());
+  await page.getByRole('button', { name: 'Use one', exact: true }).click();
   check('Start blank unmarks the template', (await template('Books').getAttribute('aria-pressed')) === 'false');
+  check('with no lists yet there is nothing of yours to copy', (await page.getByRole('group', { name: 'Your lists' }).count()) === 0);
   await template('Shows').click();
   await page.getByLabel('What it is for').fill('Everything people keep telling me to watch.');
   // Empty-name guard
@@ -240,8 +252,13 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
     && (await page.getByLabel('The line under each title').inputValue()) === ''
     && (await page.getByLabel('Name for the finished stage').inputValue()) === '');
   check('a new list starts with no template chosen', (await template('Shows').getAttribute('aria-pressed')) === 'false');
+  check('a new list offers your own lists as templates', await page.getByRole('group', { name: 'Your lists' })
+    .getByRole('button', { name: /^Shows to watch Want to watch · Watching · Watched/ }).isVisible());
   await page.getByLabel('Name', { exact: true }).fill('Gift ideas for Mom');
+  check('typing a name leaves the templates open', await templates.isVisible());
   await page.getByRole('button', { name: 'No, just a list' }).click();
+  check('moving on from the name folds them away', (await templates.count()) === 0
+    && await page.getByText('No template').isVisible());
   await page.getByLabel('The line under each title').fill('');
   await page.getByRole('button', { name: 'Make this list' }).click();
   const add2 = page.getByLabel('Add something');
@@ -249,6 +266,25 @@ export default async function lists({ newPage: harnessPage, check, url, shots })
   check('a plain list has no stage buttons', (await page.getByRole('button', { name: /Mark as/ }).count()) === 0);
   check('a plain list numbers its rows', (await page.$$eval('.crm-entry > span[aria-hidden]', (els) => els.map((e) => e.textContent))).join(',') === '1,2');
   check('a plain list offers no By progress order', (await page.getByLabel('Order').locator('option').allTextContents()).indexOf('By progress') === -1);
+
+  // ---- one of your own lists as the template for the next ----
+  await page.getByRole('button', { name: '← All lists' }).click();
+  await page.getByRole('button', { name: 'New list' }).click();
+  await page.getByLabel('Name', { exact: true }).fill('Tabbed past');
+  await page.getByLabel('Name', { exact: true }).press('Tab');
+  check('tabbing on from the name folds the templates', (await templates.count()) === 0);
+  await page.getByRole('button', { name: 'Use one', exact: true }).click();
+  await page.getByRole('group', { name: 'Your lists' }).getByRole('button', { name: /^Gift ideas for Mom Just a list/ }).click();
+  check('your own list folds to a line naming it', await page.getByText('Template: like Gift ideas for Mom').isVisible());
+  check('your own list leaves the name for you', (await page.getByLabel('Name', { exact: true }).inputValue()) === '');
+  check('your own list brings its no-stages setup', (await page.getByRole('button', { name: 'No, just a list' }).getAttribute('aria-pressed')) === 'true');
+  await page.getByRole('button', { name: 'Change', exact: true }).click();
+  await page.getByRole('group', { name: 'Your lists' }).getByRole('button', { name: /^Shows to watch / }).click();
+  check('your own list brings its stage words', (await page.getByLabel('Name for the finished stage').inputValue()) === 'Watched'
+    && (await page.getByRole('button', { name: 'Yes, in stages' }).getAttribute('aria-pressed')) === 'true');
+  await page.screenshot({ path: `${OUT}/02b-form-yours.png`, fullPage: true });
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await page.getByRole('button', { name: /^Gift ideas for Mom/ }).click();
 
   // ---- overview: search, kinds, cards ----
   await page.getByRole('button', { name: '← All lists' }).click();

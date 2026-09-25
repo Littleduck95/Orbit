@@ -5123,8 +5123,55 @@ function Progress({ c, n, thin }) {
 // a blank form is already that.
 const LIST_TEMPLATES = COLLECTION_KINDS.filter((x) => x.kind !== 'Other');
 const BLANK_LABELS = Object.freeze({ want: '', doing: '', done: '' });
+const OWN_TEMPLATE_CAP = 8;
 
-function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
+// A list's own words for each stage, as the form holds them.
+const labelsOf = (c) => ({ want: stageLabel(c, 'want'), doing: c.labels?.doing || '', done: stageLabel(c, 'done') });
+
+// The lists someone already has, offered as templates for the next one. Two
+// lists set up the same way are one template, and only the first few count.
+const ownTemplates = (lists) => {
+  const seen = new Set();
+  const out = [];
+  for (const c of lists || []) {
+    const l = labelsOf(c);
+    const key = JSON.stringify([c.kind, c.track, c.track ? [l.want, l.doing, l.done] : [], c.detail || '']);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(c);
+    if (out.length === OWN_TEMPLATE_CAP) break;
+  }
+  return out;
+};
+
+// What a template card says under its name: the stages it moves through.
+const stagesPreview = (labels, track = true) =>
+  (track ? STAGES.map((st) => labels[st]).filter(Boolean).join(' · ') : 'Just a list');
+
+function TemplateCard({ title, preview, on, onPick }) {
+  return (
+    <button className="crm-btn" onClick={onPick} aria-pressed={on} title={title} style={{
+      font: 'inherit', textAlign: 'left', cursor: 'pointer', padding: '8px 11px', borderRadius: 9, minWidth: 0,
+      display: 'flex', flexDirection: 'column', justifyContent: 'flex-start',
+      background: on ? C.accentSoft : 'transparent',
+      border: `1px solid ${on ? C.accent : C.line}`, color: C.ink,
+    }}>
+      <span style={{
+        display: 'block', maxWidth: '100%', fontSize: 13.5, fontWeight: 600,
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      }}>{title}</span>
+      <span style={{ display: 'block', fontSize: 11.5, color: C.faint, marginTop: 2, lineHeight: 1.4 }}>{preview}</span>
+    </button>
+  );
+}
+
+const templateGrid = { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(128px, 1fr))', gap: 7 };
+const linkButton = () => ({
+  font: 'inherit', fontSize: 'inherit', padding: 0, border: 0, background: 'none',
+  color: C.accentDeep, textDecoration: 'underline', cursor: 'pointer',
+});
+
+function CollectionForm({ initial, kind: startKind, mine, onSave, onCancel }) {
   // A new list starts blank unless it was opened from one of the templates.
   const first = kindOf(initial?.kind || startKind || 'Other');
   const blank = !initial && first.kind === 'Other';
@@ -5134,27 +5181,68 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
   const [track, setTrack] = useState(initial ? initial.track : true);
   // The middle stage is the only one that may be blank, meaning "skip it".
   const [labels, setLabels] = useState(initial
-    ? { want: stageLabel(initial, 'want'), doing: initial.labels?.doing || '', done: stageLabel(initial, 'done') }
+    ? labelsOf(initial)
     : blank ? { ...BLANK_LABELS } : { ...first.labels });
   const [detail, setDetail] = useState(initial ? initial.detail : blank ? '' : first.detail);
   const [missing, setMissing] = useState(false);
+  // Which template the words came from: a built-in one by its kind, or one of
+  // the owner's lists by its id. Null is a blank start.
+  const [from, setFrom] = useState(blank || initial ? null : { kind: first.kind });
+  // The templates take a lot of room, so once they have done their job they
+  // fold down to a line. They start open, unless one was already chosen.
+  const [open, setOpen] = useState(blank);
+  const yours = useMemo(() => (initial ? [] : ownTemplates(mine)), [initial, mine]);
 
   // A template fills in every word it has, whatever was there before, so
   // switching from one to another never leaves the last one's words behind.
   // What the list is for is the owner's own, and no template touches it.
   const pickTemplate = (t) => {
+    setFrom({ kind: t.kind });
     setKind(t.kind);
     setName(t.name);
     setLabels({ ...t.labels });
     setDetail(t.detail);
     setMissing(false);
+    setOpen(false);
+  };
+  // One of the owner's own lists brings its whole setup, stages or none, but
+  // not its name: the new list is a different one.
+  const pickOwn = (c) => {
+    setFrom({ id: c.id });
+    setKind(c.kind);
+    setName('');
+    setTrack(c.track);
+    setLabels(labelsOf(c));
+    setDetail(c.detail || '');
+    setOpen(false);
   };
   const startBlank = () => {
+    setFrom(null);
     setKind('Other');
     setName('');
     setLabels({ ...BLANK_LABELS });
     setDetail('');
   };
+
+  // Naming a list and moving on without picking a template means none is
+  // wanted, so the templates fold away then. Not while the name is typed, which
+  // would pull the box up mid-word, and not while a click is still under way:
+  // the fold moves everything up, and the button being pressed would slide out
+  // from under the pointer before the click lands. So a click folds once it is
+  // done, and only focus that arrives from the keyboard folds straight away.
+  const nameRef = useRef(null);
+  const templatesRef = useRef(null);
+  const pressing = useRef(false);
+  const foldOnMoveOn = (e) => {
+    if (initial || from || !open || !name.trim()) return;
+    if (e.target === nameRef.current || templatesRef.current?.contains(e.target)) return;
+    setOpen(false);
+  };
+  const foldOnFocus = (e) => { if (!pressing.current) foldOnMoveOn(e); };
+  const foldOnClick = (e) => { pressing.current = false; foldOnMoveOn(e); };
+
+  const fromOwn = from?.id ? yours.find((c) => c.id === from.id) : null;
+  const fromName = from?.kind ? from.kind : fromOwn ? `like ${fromOwn.name}` : '';
 
   const k = kindOf(kind);
 
@@ -5180,48 +5268,57 @@ function CollectionForm({ initial, kind: startKind, onSave, onCancel }) {
   };
 
   return (
-    <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
-      {!initial && (
-        <Group label="Start from a template">
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(128px, 1fr))', gap: 7 }}>
-            {LIST_TEMPLATES.map((t) => {
-              const on = kind === t.kind;
-              return (
-                <button key={t.kind} className="crm-btn" onClick={() => pickTemplate(t)} aria-pressed={on} style={{
-                  font: 'inherit', textAlign: 'left', cursor: 'pointer', padding: '8px 11px', borderRadius: 9,
-                  display: 'flex', flexDirection: 'column', justifyContent: 'flex-start',
-                  background: on ? C.accentSoft : 'transparent',
-                  border: `1px solid ${on ? C.accent : C.line}`, color: C.ink,
-                }}>
-                  <span style={{ display: 'block', fontSize: 13.5, fontWeight: 600 }}>{t.kind}</span>
-                  <span style={{ display: 'block', fontSize: 11.5, color: C.faint, marginTop: 2, lineHeight: 1.4 }}>
-                    {STAGES.map((st) => t.labels[st]).filter(Boolean).join(' · ')}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-          <span style={hintStyle()}>
-            Optional. A template fills in the words below, and every one of them can be changed.
-            {kind !== 'Other' && (
+    <div onPointerDown={() => { pressing.current = true; }} onFocus={foldOnFocus} onClick={foldOnClick}
+      style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: 16 }}>
+      {!initial && (open ? (
+        <div ref={templatesRef}>
+          <Group label="Start from a template">
+            <div role="group" aria-label="Templates" style={templateGrid}>
+              {LIST_TEMPLATES.map((t) => (
+                <TemplateCard key={t.kind} title={t.kind} preview={stagesPreview(t.labels)}
+                  on={from?.kind === t.kind} onPick={() => pickTemplate(t)} />
+              ))}
+            </div>
+            {yours.length > 0 && (
               <>
-                {' '}
-                <button className="crm-btn" onClick={startBlank} style={{
-                  font: 'inherit', fontSize: 'inherit', padding: 0, border: 0, background: 'none',
-                  color: C.accentDeep, textDecoration: 'underline', cursor: 'pointer',
-                }}>Start blank</button>
+                <span style={{ display: 'block', fontSize: 12, color: C.faint, margin: '12px 0 5px' }}>Like one of yours</span>
+                <div role="group" aria-label="Your lists" style={templateGrid}>
+                  {yours.map((c) => (
+                    <TemplateCard key={c.id} title={c.name} preview={stagesPreview(labelsOf(c), c.track)}
+                      on={from?.id === c.id} onPick={() => pickOwn(c)} />
+                  ))}
+                </div>
               </>
             )}
+            <span style={hintStyle()}>
+              Optional. A template fills in the words below, and every one of them can be changed.
+              {from && (
+                <>
+                  {' '}
+                  <button className="crm-btn" onClick={startBlank} style={linkButton()}>Start blank</button>
+                </>
+              )}
+            </span>
+          </Group>
+        </div>
+      ) : (
+        <p style={{ margin: '0 0 14px', fontSize: 13, color: C.muted, display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'baseline' }}>
+          <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {from ? <>Template: <strong style={{ color: C.ink, fontWeight: 600 }}>{fromName}</strong></> : 'No template'}
           </span>
-        </Group>
-      )}
+          <button className="crm-btn" onClick={() => setOpen(true)} style={linkButton()}>
+            {from ? 'Change' : 'Use one'}
+          </button>
+          {from && <button className="crm-btn" onClick={startBlank} style={linkButton()}>Start blank</button>}
+        </p>
+      ))}
 
       <Field label="Name">
-        <input style={inputStyle} value={name} maxLength={LIST_NAME_CAP}
+        <input ref={nameRef} style={inputStyle} value={name} maxLength={LIST_NAME_CAP}
           aria-invalid={missing || undefined}
           aria-describedby={missing ? 'crm-list-name-missing' : undefined}
           onChange={(e) => { setName(e.target.value); setMissing(false); }}
-          placeholder={k.name || 'Gift ideas, trails to hike, records to find…'} />
+          placeholder={(from?.kind && k.name) || 'Gift ideas, trails to hike, records to find…'} />
       </Field>
       {/* Outside the label, or it would become part of the field's name. */}
       {missing && (
@@ -10319,6 +10416,7 @@ export default function PersonalCRM({ account = null } = {}) {
               <CollectionForm
                 initial={collectionDraft.c}
                 kind={collectionDraft.kind}
+                mine={collections}
                 onSave={saveCollection}
                 onCancel={() => setCollectionDraft(null)}
               />
