@@ -80,7 +80,7 @@ try {
   };
   const before = report();
   check('the setup check runs on an empty database and reports everything missing',
-    before.length === 18 && before.every(([, st]) => st.startsWith('MISSING')), before);
+    before.length === 21 && before.every(([, st]) => st.startsWith('MISSING')), before);
   // Part 1 alone, as it was merged, before friends existed.
   const partOne = schema.slice(0, schema.indexOf('-- Profiles as others see them.'));
   if (partOne.length < schema.length) {
@@ -94,7 +94,7 @@ try {
   const again = psql(schema);
   check('and runs again without harm, as its header promises', again.ok, again.err);
   const after = report();
-  check('after the whole schema, the setup check says OK to everything', after.length === 18 && after.every(([, st]) => st === 'OK'), after);
+  check('after the whole schema, the setup check says OK to everything', after.length === 21 && after.every(([, st]) => st === 'OK'), after);
 
   // ---- signing up ----
   check('a password sign-up makes the profile in the same step',
@@ -242,11 +242,84 @@ try {
   check('turning push off removes the device', as(B, "delete from public.push_subscriptions where endpoint = 'https://push.example/abc';").ok
     && psql('select count(*) from public.push_subscriptions').out === '0');
 
+  // ---- the shared catalog ----
+  const one = (who, sql) => { const r = as(who, sql); return r.ok ? JSON.parse(r.out.split('\n').pop() || 'null') : { error: r.err }; };
+  const add = (who, kind, name, source, sid, about = '') => one(who, `select public.catalog_add('${kind}', '${name}', '${about}', '${source}', ${sid === null ? 'null' : `'${sid}'`});`);
+  const anonAdd = as('anon', "select public.catalog_add('team', 'X', '', 'orbit', null);");
+  check('signed-out visitors cannot add to the catalog', !anonAdd.ok, anonAdd.err);
+  for (const fn of ["catalog_search('ch')", `catalog_page('${A}')`, "sync_outings('[]'::jsonb)"]) {
+    check(`nor call ${fn.split('(')[0]}`, !as('anon', `select public.${fn};`).ok);
+  }
+  const chiefs = add(A, 'team', 'Kansas City Chiefs', 'wikidata', 'Q223455', 'NFL team in Kansas City');
+  const arrowhead = add(A, 'venue', 'Arrowhead Stadium', 'wikidata', 'Q1128848');
+  check('an entry from Wikidata is added', chiefs.id && chiefs.name === 'Kansas City Chiefs' && chiefs.about === 'NFL team in Kansas City', chiefs);
+  check('and never says who added it', !JSON.stringify(chiefs).includes(A) && !('created_by' in chiefs));
+  const again2 = add(B, 'team', 'Renamed Chiefs', 'wikidata', 'Q223455');
+  check('the same Wikidata item is the same entry for everyone, and keeps its name', again2.id === chiefs.id && again2.name === 'Kansas City Chiefs', again2);
+  check('a made-up Wikidata id is refused', /not a Wikidata item/.test(add(A, 'team', 'X', 'wikidata', 'Q0; drop').error || ''));
+  check('as is an unknown kind', /Unknown kind/.test(add(A, 'car', 'X', 'orbit', null).error || ''));
+  check('and a blank name', /needs a name/.test(add(A, 'team', '   ', 'orbit', null).error || ''));
+  const rackets = add(A, 'performer', 'The Rackets', 'orbit', 'ignored');
+  const rackets2 = add(B, 'performer', '  the   RACKETS ', 'orbit', null);
+  check('an entry made in Orbit is matched by kind and name, whatever the case or spacing', rackets.id && rackets2.id === rackets.id && rackets.source_id === 'performer:the rackets', [rackets, rackets2]);
+  check('but the same name as another kind is another entry', add(A, 'venue', 'The Rackets', 'orbit', null).id !== rackets.id);
+
+  const readCat = as(D, 'select * from public.catalog;');
+  check('the catalog cannot be read directly', !readCat.ok && /permission denied/.test(readCat.err), readCat.err);
+  const plantOuting = as(D, `insert into public.outings (user_id, event_id, kind, title, on_date, visibility) values ('${A}', 'x', 'Sports', 'x', '2026-01-01', 'everyone');`);
+  check('nor can outings be written directly', !plantOuting.ok && /permission denied/.test(plantOuting.err), plantOuting.err);
+
+  // A and B are friends; D is a stranger to A.
+  check('A and B become friends', call(A, `send_friend_request('${B}')`).ok && call(B, `respond_friend_request('${A}', true)`).out.endsWith('friends'));
+  const items = [
+    { event_id: 'e1', kind: 'Sports', title: 'Chiefs vs Broncos', date: '2026-01-05', rating: 4.5, review: 'Loud', visibility: 'everyone', links: [chiefs.id, arrowhead.id] },
+    { event_id: 'e2', kind: 'Concert', title: 'Rackets at the Record Bar', date: '2026-02-01', rating: 3, review: 'Tight set', visibility: 'friends', links: [rackets.id] },
+    { event_id: 'e3', kind: 'Sports', title: 'Next season', date: '2099-09-01', visibility: 'everyone', links: [chiefs.id] },
+    { event_id: 'e4', kind: 'Sports', title: 'No links', date: '2026-01-01', visibility: 'everyone', links: [] },
+    { event_id: 'e5', kind: 'Sports', title: 'Odd rating', date: '2026-01-01', rating: 3.3, visibility: 'everyone', links: [chiefs.id] },
+    { event_id: 'e6', kind: 'Sports', title: 'Bad link', date: '2026-01-01', visibility: 'everyone', links: ['not-a-uuid', D] },
+    { event_id: 'e7', kind: 'Sports', title: 'Private', date: '2026-01-01', visibility: 'me', links: [chiefs.id] },
+    { event_id: 'e8', kind: 'Birthday', title: 'Not an outing', date: '2026-01-01', visibility: 'everyone', links: [chiefs.id] },
+  ];
+  const sync = (who, list) => as(who, `select public.sync_outings('${JSON.stringify(list).replace(/'/g, "''")}'::jsonb);`);
+  const synced = sync(A, items);
+  check('sharing keeps only well-formed outings that have happened and link to something known', synced.ok && synced.out.split('\n').pop() === '2', synced.out || synced.err);
+  const page = (who, id) => one(who, `select public.catalog_page('${id}');`);
+  const seenD = page(D, chiefs.id);
+  check('a stranger sees an outing shared with everyone, and who logged it', seenD.outings.length === 1
+    && seenD.outings[0].by.username === 'brock' && seenD.outings[0].review === 'Loud' && seenD.outings[0].rating === 4.5, seenD);
+  check('with what else it links to, but not the page itself', seenD.outings[0].links.map((l) => l.name).join() === 'Arrowhead Stadium');
+  check('and the rating counts towards the average and the spread', seenD.ratings === 1 && seenD.average === 4.5 && seenD.spread[8] === 1 && seenD.spread.length === 10, seenD);
+  const racketsD = page(D, rackets.id);
+  check('a stranger sees nothing shared with friends only', racketsD.outings.length === 0 && racketsD.ratings === 0 && racketsD.average === null, racketsD);
+  const racketsB = page(B, rackets.id);
+  check('a friend does', racketsB.outings.length === 1 && racketsB.outings[0].by.relation === 'friends', racketsB);
+  check('but a friends-only rating never counts towards the public average', racketsB.ratings === 0 && racketsB.average === null);
+  check('the owner sees their own as "self"', page(A, rackets.id).outings[0]?.by.relation === 'self');
+  const findCat = (who, q, kind = null) => as(who, `select public.catalog_search('${q}', ${kind ? `'${kind}'` : 'null'});`).out.split('\n').filter((l) => l.startsWith('{')).map(JSON.parse);
+  const found = findCat(D, 'chie');
+  check('search finds entries by any part of the name, with how many outings and the average', found.length === 1 && found[0].outings === 1 && found[0].average === 4.5, found);
+  check('search counts only the outings this viewer may see', findCat(D, 'rack', 'performer')[0]?.outings === 0 && findCat(B, 'rack', 'performer')[0]?.outings === 1);
+  check('search can be narrowed to one kind', findCat(D, 'rack', 'venue').every((e) => e.kind === 'venue') && findCat(D, 'rack', 'venue').length === 1);
+  check('a % in a catalog search is taken literally', findCat(D, '%%').length === 0);
+  check('A blocks D', call(D, `block_user('${A}')`).ok);
+  const blockedPage = page(D, chiefs.id);
+  check('a block hides outings and their ratings, both ways', blockedPage.outings.length === 0 && blockedPage.ratings === 0, blockedPage);
+  check('D unblocks', call(D, `unblock_user('${A}')`).ok);
+  check('sharing again replaces what was there', sync(A, [items[1]]).out.split('\n').pop() === '1' && page(D, chiefs.id).outings.length === 0);
+  const noProfile = '88888888-8888-4888-8888-888888888888';
+  signUp(noProfile, { full_name: 'No Name' });
+  const early = sync(noProfile, [items[0]]);
+  check('sharing needs a username first', !early.ok && /username/.test(early.err), early.err);
+  check('share one with everyone again', sync(A, items).ok);
+
   // ---- deleting an account ----
   const anonDel = as('anon', 'select public.delete_my_account();');
   check('a signed-out visitor cannot delete anything', !anonDel.ok, anonDel.err);
   check('a person can delete their own account', as(A, 'select public.delete_my_account();').ok);
   check('which removes their sign-in, profile and saved data', psql(`select (select count(*) from auth.users where id = '${A}') + (select count(*) from public.profiles where id = '${A}') + (select count(*) from public.orbit_data where user_id = '${A}')`).out === '0');
+  check('their shared outings go with it, and the entries they added stay, without their name', psql(`select (select count(*) from public.outings where user_id = '${A}') + (select count(*) from public.outing_links where user_id = '${A}')`).out === '0'
+    && psql(`select count(*) || '|' || count(created_by) from public.catalog where source_id = 'Q223455'`).out === '1|0');
   check('and nobody else\'s', psql(`select (select count(*) from public.profiles where id = '${B}') + (select count(*) from public.orbit_data where user_id = '${B}')`).out === '2');
 } finally {
   run(path.join(BIN, 'pg_ctl'), ['-D', data, '-m', 'immediate', 'stop']);

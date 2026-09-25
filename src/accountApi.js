@@ -243,3 +243,22 @@ export const friendsApi = (client) => ({
   unblock: (id) => rpc(client, 'unblock_user', { other: id }),
   blocks: async () => (await rpc(client, 'my_blocks')) || [],
 });
+
+/* ---------- the shared catalog ---------- */
+
+const catalogRpc = async (client, fn, args) => {
+  const { data, error } = await client.rpc(fn, args);
+  if (error) throw new Error(/could not find the function|PGRST202/i.test(error.message || '') ? 'The catalog is not set up on the server yet.' : authMessage(error));
+  return data;
+};
+
+// See supabase/schema.sql, part 4. entry: { kind, name, about, source,
+// source_id } as Wikidata or the form gives it.
+export const catalogApi = (client) => ({
+  search: async (q, kind = null) => (await catalogRpc(client, 'catalog_search', { q, p_kind: kind })) || [],
+  add: (entry) => catalogRpc(client, 'catalog_add', {
+    p_kind: entry.kind, p_name: entry.name, p_about: entry.about || '', p_source: entry.source, p_source_id: entry.source_id || null,
+  }),
+  page: (id) => catalogRpc(client, 'catalog_page', { p_id: id }),
+  sync: (items) => catalogRpc(client, 'sync_outings', { items }),
+});

@@ -508,6 +508,235 @@ drop trigger if exists notification_prefs_clean on public.notification_prefs;
 create trigger notification_prefs_clean before insert or update on public.notification_prefs
   for each row execute function public.clean_notification_prefs();
 
+-- ---------------------------------------------------------------------------
+-- Part 4: the shared catalog. Performers, teams, shows, festivals and venues
+-- that everyone's events can point at, so everyone's "Kansas City Chiefs" is
+-- the same one and ratings can be added up. An entry comes from Wikidata (its
+-- item id, Q and digits, is what makes it the same for everyone) or, for the
+-- local band or the high school game Wikidata has never heard of, is made in
+-- Orbit, where the same kind and name makes the same entry.
+--
+-- Events stay in each person's own saved data. What they choose to share
+-- (Everyone or Friends) is copied here as an outing: the kind, title, date,
+-- rating, their thoughts, and what it links to. Never who they went with,
+-- never their private notes. The app sends the whole set each time it
+-- changes (sync_outings), so this copy can never drift from the events.
+
+create table if not exists public.catalog (
+  id         uuid        primary key default gen_random_uuid(),
+  kind       text        not null check (kind in ('performer', 'team', 'show', 'festival', 'venue')),
+  name       text        not null check (char_length(name) between 1 and 200),
+  about      text        not null default '' check (char_length(about) <= 300),
+  source     text        not null check (source in ('wikidata', 'orbit')),
+  source_id  text        not null check (char_length(source_id) between 1 and 300),
+  created_by uuid        references auth.users (id) on delete set null,
+  created_at timestamptz not null default now(),
+  unique (source, source_id)
+);
+create index if not exists catalog_name on public.catalog (lower(name) text_pattern_ops);
+
+create table if not exists public.outings (
+  user_id    uuid         not null references auth.users (id) on delete cascade,
+  event_id   text         not null check (char_length(event_id) between 1 and 100),
+  kind       text         not null check (kind in ('Concert', 'Sports', 'Theater', 'Festival')),
+  title      text         not null check (char_length(title) between 1 and 200),
+  on_date    date         not null,
+  rating     numeric(2,1) check (rating is null or (rating between 0.5 and 5 and rating * 2 = trunc(rating * 2))),
+  review     text         not null default '' check (char_length(review) <= 2000),
+  visibility text         not null check (visibility in ('everyone', 'friends')),
+  updated_at timestamptz  not null default now(),
+  primary key (user_id, event_id)
+);
+
+create table if not exists public.outing_links (
+  user_id    uuid not null,
+  event_id   text not null,
+  catalog_id uuid not null references public.catalog (id) on delete cascade,
+  primary key (user_id, event_id, catalog_id),
+  foreign key (user_id, event_id) references public.outings (user_id, event_id) on delete cascade
+);
+create index if not exists outing_links_catalog on public.outing_links (catalog_id);
+
+-- None of the three is read or written directly.
+alter table public.catalog enable row level security;
+alter table public.outings enable row level security;
+alter table public.outing_links enable row level security;
+revoke all on public.catalog from anon, authenticated;
+revoke all on public.outings from anon, authenticated;
+revoke all on public.outing_links from anon, authenticated;
+
+-- An entry as it is handed out: never who added it.
+create or replace function public.catalog_entry(c public.catalog) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select jsonb_build_object('id', c.id, 'kind', c.kind, 'name', c.name, 'about', c.about, 'source', c.source, 'source_id', c.source_id);
+$$;
+
+-- Whether this viewer may see an outing: their own always; otherwise one set
+-- to Everyone, or to Friends when they are friends; never across a block.
+create or replace function public.can_see_outing(owner uuid, vis text, viewer uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select owner = viewer
+    or (not public.is_blocked(owner, viewer)
+        and (vis = 'everyone' or (vis = 'friends' and viewer is not null and public.are_friends(owner, viewer))));
+$$;
+revoke all on function public.catalog_entry(public.catalog) from public, anon, authenticated;
+revoke all on function public.can_see_outing(uuid, text, uuid) from public, anon, authenticated;
+
+-- Adds an entry, or hands back the one already there. For Wikidata the item
+-- id decides; for one made in Orbit, the kind and the name, whatever its case
+-- or spacing.
+create or replace function public.catalog_add(p_kind text, p_name text, p_about text, p_source text, p_source_id text) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  nm text := btrim(regexp_replace(coalesce(p_name, ''), '\s+', ' ', 'g'));
+  sid text;
+  c public.catalog;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if p_kind is null or p_kind not in ('performer', 'team', 'show', 'festival', 'venue') then raise exception 'Unknown kind of entry'; end if;
+  if char_length(nm) not between 1 and 200 then raise exception 'An entry needs a name'; end if;
+  if p_source = 'wikidata' then
+    if coalesce(p_source_id, '') !~ '^Q[1-9][0-9]{0,11}$' then raise exception 'That is not a Wikidata item'; end if;
+    sid := p_source_id;
+  elsif p_source = 'orbit' then
+    sid := p_kind || ':' || lower(nm);
+  else
+    raise exception 'Unknown source';
+  end if;
+  insert into public.catalog (kind, name, about, source, source_id, created_by)
+    values (p_kind, nm, left(btrim(regexp_replace(coalesce(p_about, ''), '\s+', ' ', 'g')), 300), p_source, sid, me)
+    on conflict (source, source_id) do nothing;
+  select * into c from public.catalog where source = p_source and source_id = sid;
+  return public.catalog_entry(c);
+end $$;
+
+-- Finding entries by any part of the name, the closest first, then the most
+-- logged. outings counts only what this viewer may see; average is of ratings
+-- shared with everyone.
+create or replace function public.catalog_search(q text, p_kind text default null) returns setof jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  term text := lower(btrim(regexp_replace(coalesce(q, ''), '\s+', ' ', 'g')));
+  pat text;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if char_length(term) < 2 then return; end if;
+  pat := replace(replace(replace(term, '\', '\\'), '%', '\%'), '_', '\_');
+  return query
+    select public.catalog_entry(c) || jsonb_build_object('outings', s.n, 'average', s.avg)
+    from public.catalog c
+    cross join lateral (
+      select count(*) filter (where public.can_see_outing(o.user_id, o.visibility, me)) as n,
+             round(avg(o.rating) filter (where o.visibility = 'everyone' and not public.is_blocked(o.user_id, me)), 2) as avg
+      from public.outing_links l join public.outings o on o.user_id = l.user_id and o.event_id = l.event_id
+      where l.catalog_id = c.id
+    ) s
+    where lower(c.name) like '%' || pat || '%' and (p_kind is null or c.kind = p_kind)
+    order by (lower(c.name) = term) desc, (lower(c.name) like pat || '%') desc, s.n desc, c.name
+    limit 20;
+end $$;
+
+-- One entry's page: the entry, its ratings shared with everyone (how many,
+-- the average, and how many at each half star), and the outings this viewer
+-- may see, newest first, each with who logged it and what else it links to.
+create or replace function public.catalog_page(p_id uuid) returns jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  c public.catalog;
+  out jsonb;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  select * into c from public.catalog where id = p_id;
+  if c.id is null then return null; end if;
+  with mine as (
+    select o.*, p.username, p.display_name
+    from public.outing_links l
+    join public.outings o on o.user_id = l.user_id and o.event_id = l.event_id
+    join public.profiles p on p.id = o.user_id
+    where l.catalog_id = c.id
+  ), public_ratings as (
+    select rating from mine where visibility = 'everyone' and rating is not null and not public.is_blocked(user_id, me)
+  )
+  select jsonb_build_object(
+    'entry', public.catalog_entry(c),
+    'ratings', (select count(*) from public_ratings),
+    'average', (select round(avg(rating), 2) from public_ratings),
+    'spread', (select jsonb_agg((select count(*) from public_ratings r where r.rating = g / 2.0) order by g) from generate_series(1, 10) g),
+    'outings', coalesce((
+      select jsonb_agg(x.j order by x.on_date desc, x.updated_at desc)
+      from (
+        select m.on_date, m.updated_at, jsonb_build_object(
+          'by', jsonb_build_object('username', m.username, 'display_name', m.display_name, 'relation', public.relation_to(m.user_id, me)),
+          'kind', m.kind, 'title', m.title, 'date', m.on_date, 'rating', m.rating, 'review', m.review,
+          'links', coalesce((
+            select jsonb_agg(public.catalog_entry(oc) order by oc.kind, oc.name)
+            from public.outing_links ol join public.catalog oc on oc.id = ol.catalog_id
+            where ol.user_id = m.user_id and ol.event_id = m.event_id and oc.id <> c.id
+          ), '[]'::jsonb)
+        ) as j
+        from mine m
+        where public.can_see_outing(m.user_id, m.visibility, me)
+        order by m.on_date desc, m.updated_at desc
+        limit 100
+      ) x
+    ), '[]'::jsonb)
+  ) into out;
+  return out;
+end $$;
+
+-- Replaces everything this person shares with the set given: an array of
+-- { event_id, kind, title, date, rating, review, visibility, links: [catalog
+-- ids] }. Anything malformed, still to come, or linking to nothing known is
+-- left out. Answers with how many were kept.
+create or replace function public.sync_outings(items jsonb) returns integer
+language plpgsql security definer set search_path = '' as $$
+declare
+  me uuid := auth.uid();
+  it jsonb;
+  kept integer;
+begin
+  if me is null then raise exception 'Not signed in'; end if;
+  if not exists (select 1 from public.profiles where id = me) then raise exception 'Choose a username first'; end if;
+  if jsonb_typeof(items) is distinct from 'array' then raise exception 'Expected a list'; end if;
+  if jsonb_array_length(items) > 2000 then raise exception 'Too many to share at once'; end if;
+  delete from public.outings where user_id = me;
+  for it in select value from jsonb_array_elements(items) loop
+    begin
+      if jsonb_typeof(it) <> 'object' or (it ->> 'date')::date > current_date + 1 then continue; end if;
+      insert into public.outings (user_id, event_id, kind, title, on_date, rating, review, visibility)
+        values (me, it ->> 'event_id', it ->> 'kind', btrim(it ->> 'title'), (it ->> 'date')::date,
+                (it ->> 'rating')::numeric, btrim(coalesce(it ->> 'review', '')), it ->> 'visibility')
+        on conflict do nothing;
+      if not found then continue; end if;
+      insert into public.outing_links (user_id, event_id, catalog_id)
+        select me, it ->> 'event_id', c.id from public.catalog c
+        where c.id::text in (
+          select jsonb_array_elements_text(case when jsonb_typeof(it -> 'links') = 'array' then it -> 'links' else '[]'::jsonb end) limit 10
+        )
+        on conflict do nothing;
+    exception when others then
+      null; -- this one is left out; the rest still go
+    end;
+  end loop;
+  -- An outing linking to nothing says nothing about the catalog.
+  delete from public.outings o where o.user_id = me
+    and not exists (select 1 from public.outing_links l where l.user_id = me and l.event_id = o.event_id);
+  select count(*) into kept from public.outings where user_id = me;
+  return kept;
+end $$;
+
+revoke all on function public.catalog_add(text, text, text, text, text) from public, anon;
+revoke all on function public.catalog_search(text, text) from public, anon;
+revoke all on function public.catalog_page(uuid) from public, anon;
+revoke all on function public.sync_outings(jsonb) from public, anon;
+grant execute on function public.catalog_add(text, text, text, text, text) to authenticated;
+grant execute on function public.catalog_search(text, text) to authenticated;
+grant execute on function public.catalog_page(uuid) to authenticated;
+grant execute on function public.sync_outings(jsonb) to authenticated;
+
 -- Tell the API about the table now. Without this it can briefly answer
 -- "Could not find the table 'public.orbit_data' in the schema cache".
 notify pgrst, 'reload schema';

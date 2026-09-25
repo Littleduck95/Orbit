@@ -8,6 +8,7 @@ import {
 import * as photoStore from './photoStore.js';
 import { GEOCODER } from './mapConfig.js';
 import { CARD_W, CARD_H, drawRecapCard, cardBlob, cardFontsReady } from './recapCard.js';
+import { CATALOG_KINDS, LINKS_FOR, OUTING_VISIBILITY, WIKIDATA, cleanLinks, outingsToShare, searchWikidata } from './catalog.js';
 
 /* ---------- palette ---------- */
 const THEMES = {
@@ -2714,6 +2715,10 @@ const EVENT_FIXES = [
   ['people', fixTextList],
   ['lat', fixNumber], ['lon', fixNumber],
   ['rating', fixRating],
+  // Links to the shared catalog, what you thought (shared), and who sees it.
+  ['links', fixEntries([['id', fixText], ['kind', fixText], ['name', fixText]])],
+  ['review', fixText],
+  ['visibility', fixText],
 ];
 
 const REMINDER_FIXES = [
@@ -3009,6 +3014,17 @@ const fromCsv = (cols, rows, make) => {
     if (touched) out.push(obj); else skipped += 1;
   });
   return { out, skipped };
+};
+
+// A short fingerprint of some text (FNV-1a), to tell whether it changed
+// without keeping it.
+const fingerprint = (text) => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `${text.length}:${h.toString(36)}`;
 };
 
 const downloadCsv = (name, text, type = 'text/csv;charset=utf-8;') => {
@@ -4364,7 +4380,7 @@ const eventWhen = (e) => {
   return { text, days };
 };
 
-function EventForm({ initial, people, onSave, onCancel }) {
+function EventForm({ initial, people, onSave, onCancel, catalog = null }) {
   const [date, setDate] = useState(initial?.date || todayStr());
   const [endDate, setEndDate] = useState(initial?.endDate || '');
   const [spans, setSpans] = useState(Boolean(initial?.endDate && initial.endDate !== initial.date));
@@ -4372,6 +4388,9 @@ function EventForm({ initial, people, onSave, onCancel }) {
   const [kind, setKind] = useState(initial?.kind || 'Milestone');
   const [note, setNote] = useState(initial?.note || '');
   const [rating, setRating] = useState(initial?.rating || null);
+  const [links, setLinks] = useState(() => cleanLinks(initial?.links));
+  const [review, setReview] = useState(initial?.review || '');
+  const [visibility, setVisibility] = useState(initial?.visibility || 'friends');
   const [who, setWho] = useState(initial?.people || []);
   const [place, setPlace] = useState(initial?.place || '');
   const [coords, setCoords] = useState(
@@ -4419,6 +4438,11 @@ function EventForm({ initial, people, onSave, onCancel }) {
       addedOn: initial?.addedOn || todayStr(),
       date: start, endDate: finish, title: t, kind, note: note.trim(), people: who,
       rating: canRateEvent(kind, start) ? rating : null,
+      // Only an outing links to the catalog, and only one that has happened
+      // has thoughts to share.
+      links: LINKS_FOR[kind] ? cleanLinks(links) : [],
+      review: LINKS_FOR[kind] && start <= todayStr() ? review.trim().slice(0, 2000) : '',
+      visibility: LINKS_FOR[kind] ? visibility : 'me',
       place: place.trim(),
       lat: coords ? coords.lat : null,
       lon: coords ? coords.lon : null,
@@ -4464,7 +4488,44 @@ function EventForm({ initial, people, onSave, onCancel }) {
         </select>
       </Field>
 
+      {catalog && LINKS_FOR[kind] && (
+        <>
+          <CatalogPicker api={catalog} kind={LINKS_FOR[kind].kind} label={LINKS_FOR[kind].label} ph={LINKS_FOR[kind].ph}
+            many={LINKS_FOR[kind].many} value={links.filter((l) => l.kind !== 'venue')}
+            onChange={(ls) => setLinks([...ls, ...links.filter((l) => l.kind === 'venue')])} />
+          <CatalogPicker api={catalog} kind="venue" label="Venue" ph="Search for a stadium, arena, theatre or club"
+            value={links.filter((l) => l.kind === 'venue')}
+            onChange={(ls) => {
+              setLinks([...links.filter((l) => l.kind !== 'venue'), ...ls]);
+              if (ls[0] && !place.trim()) setPlace(ls[0].name);
+            }} />
+        </>
+      )}
+
       {canRateEvent(kind, date) && <StarInput label="How was it?" value={rating} onChange={setRating} />}
+
+      {catalog && LINKS_FOR[kind] && date && date <= todayStr() && (
+        <>
+          <Field label="Your thoughts">
+            <textarea className="crm-serif" maxLength={2000} value={review} onChange={(e) => setReview(e.target.value)}
+              style={{ ...inputStyle, minHeight: 80, resize: 'vertical', lineHeight: 1.55 }}
+              placeholder="What was it like? This goes with your rating." />
+          </Field>
+          <Group label="Who sees your rating and thoughts">
+            <div style={{ display: 'flex', gap: 8 }}>
+              {OUTING_VISIBILITY.map(([v, l]) => (
+                <button key={v} type="button" className="crm-btn" aria-pressed={visibility === v} onClick={() => setVisibility(v)} style={segment(visibility === v)}>{l}</button>
+              ))}
+            </div>
+            <span style={hintStyle()}>
+              {visibility === 'me' ? 'Kept to yourself.'
+                : !links.length ? `Link ${LINKS_FOR[kind].kind === 'team' ? 'a team' : `a ${LINKS_FOR[kind].kind}`} or a venue above to share it on ${visibility === 'everyone' ? 'their pages' : 'their pages, for friends'}.`
+                : `Shows on the pages of what it links to, for ${visibility === 'everyone' ? 'everyone in Orbit' : 'your friends'}, with your username.`}
+              {' '}Who you went with and the details below are never shared.
+            </span>
+          </Group>
+        </>
+      )}
 
       <Field label="Where">
         <div style={{ display: 'flex', gap: 8 }}>
@@ -4599,7 +4660,7 @@ function EventForm({ initial, people, onSave, onCancel }) {
   );
 }
 
-function EventCard({ e, people, onPerson, onEdit, onRemove }) {
+function EventCard({ e, people, onPerson, onEdit, onRemove, onCatalog }) {
   const [confirm, setConfirm] = useState(false);
   const attended = (e.people || []).map((id) => people.find((x) => x.id === id)).filter(Boolean);
   const when = eventWhen(e);
@@ -4629,6 +4690,26 @@ function EventCard({ e, people, onPerson, onEdit, onRemove }) {
         <p style={{ margin: '5px 0 0', fontSize: 17, fontWeight: 600, letterSpacing: '-0.02em', color: C.ink }}>
           {e.title}
         </p>
+
+        {e.links?.length > 0 && (
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 7 }}>
+            {e.links.map((l) => (onCatalog ? (
+              <button key={l.id} className="crm-btn" onClick={() => onCatalog(l.id)} aria-label={`Open ${l.name}`}
+                style={{ ...filterChip(false), padding: '3px 10px', fontSize: 12 }}>{l.name}</button>
+            ) : (
+              <span key={l.id} style={{ ...kindChip(), fontSize: 12 }}>{l.name}</span>
+            )))}
+          </div>
+        )}
+
+        {e.review && (
+          <p className="crm-serif" style={{ margin: '7px 0 0', fontSize: 15, lineHeight: 1.6, color: C.ink }}>
+            <span style={{ fontFamily: 'inherit', fontSize: 11, fontWeight: 600, color: C.faint, textTransform: 'uppercase', letterSpacing: '0.06em', marginRight: 6 }}>
+              {e.visibility === 'everyone' ? 'Shared with everyone' : e.visibility === 'friends' ? 'Shared with friends' : 'Your thoughts'}
+            </span>
+            {e.review}
+          </p>
+        )}
 
         {e.note && (
           <p className="crm-serif" style={{ margin: '7px 0 0', fontSize: 15, lineHeight: 1.6, color: C.ink }}>
@@ -4677,7 +4758,7 @@ function EventCard({ e, people, onPerson, onEdit, onRemove }) {
   );
 }
 
-function EventsView({ events, people, onAdd, onEdit, onRemove }) {
+function EventsView({ events, people, onAdd, onEdit, onRemove, onCatalog, onExplore }) {
   const [q, setQ] = useState('');
   const [kind, setKind] = useState('All');
   const [sort, setSort] = useState('newest');
@@ -4717,7 +4798,10 @@ function EventsView({ events, people, onAdd, onEdit, onRemove }) {
             ? `${countThings(sorted.length, 'event', 'events')} ${sorted.length === 1 ? 'matches' : 'match'}`
             : `${countThings(events.length, 'event', 'events')} worth keeping`}
         </h1>
-        <Button kind="solid" onClick={onAdd} style={{ marginLeft: 'auto' }}>Add an event</Button>
+        <div style={{ display: 'flex', gap: 8, marginLeft: 'auto' }}>
+          {onExplore && <Button onClick={onExplore}>Explore</Button>}
+          <Button kind="solid" onClick={onAdd}>Add an event</Button>
+        </div>
       </div>
 
       {events.length === 0 && <EmptySky />}
@@ -4780,7 +4864,7 @@ function EventsView({ events, people, onAdd, onEdit, onRemove }) {
 
       {byAdded
         ? sorted.map((e) => (
-            <EventCard key={e.id} e={e} people={people} onPerson={(n) => setQ(n)}
+            <EventCard key={e.id} e={e} people={people} onPerson={(n) => setQ(n)} onCatalog={onCatalog}
               onEdit={() => onEdit(e)} onRemove={() => onRemove(e.id)} />
           ))
         : years.map((y) => (
@@ -4790,11 +4874,259 @@ function EventsView({ events, people, onAdd, onEdit, onRemove }) {
                 textTransform: 'uppercase', color: C.faint,
               }}>{y}</p>
               {sorted.filter((e) => eventYear(e) === y).map((e) => (
-                <EventCard key={e.id} e={e} people={people} onPerson={(n) => setQ(n)}
+                <EventCard key={e.id} e={e} people={people} onPerson={(n) => setQ(n)} onCatalog={onCatalog}
                   onEdit={() => onEdit(e)} onRemove={() => onRemove(e.id)} />
               ))}
             </div>
           ))}
+    </div>
+  );
+}
+
+/* ---------- the shared catalog ---------- */
+const catalogKindWord = (k) => CATALOG_KINDS[k]?.one || k;
+const ratingLine = (n, avg) => [n ? `${n} logged` : '', avg ? `★ ${Number(avg).toFixed(1)}` : ''].filter(Boolean).join(' · ');
+
+// Finds entries of one kind in the shared catalog and on Wikidata; picking
+// one links it, and anything neither has can be made in Orbit. value: the
+// links of this kind already chosen.
+function CatalogPicker({ api, kind, label, ph, many = false, value, onChange }) {
+  const [q, setQ] = useState('');
+  const [found, setFound] = useState({ q: '', orbit: [], wiki: [] });
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState('');
+  const listId = useId();
+  const term = q.trim().replace(/\s+/g, ' ');
+  useEffect(() => {
+    if (term.length < 2) return undefined;
+    let live = true;
+    // A pause in typing before asking, as place search does.
+    const t = setTimeout(async () => {
+      const [orbit, wiki] = await Promise.all([api.search(term, kind).catch(() => []), searchWikidata(term)]);
+      if (live) setFound({ q: term, orbit, wiki });
+    }, 350);
+    return () => { live = false; clearTimeout(t); };
+  }, [term, api, kind]);
+
+  const showing = term.length >= 2 && found.q === term;
+  const inOrbit = new Set(found.orbit.map((e) => `${e.source}:${e.source_id}`));
+  const wiki = found.wiki.filter((e) => !inOrbit.has(`wikidata:${e.source_id}`));
+  const exact = found.orbit.some((e) => e.name.toLowerCase() === term.toLowerCase());
+  const chosen = new Set(value.map((l) => l.id));
+
+  const pick = async (entry) => {
+    setBusy(true);
+    setProblem('');
+    try {
+      const e = entry.id ? entry : await api.add({ ...entry, kind });
+      if (!e?.id) throw new Error('That could not be added.');
+      const link = { id: e.id, kind: e.kind, name: e.name };
+      if (!chosen.has(link.id)) onChange(many ? [...value, link] : [link]);
+      setQ('');
+    } catch (err) {
+      setProblem(err?.message || 'That could not be added.');
+    }
+    setBusy(false);
+  };
+
+  const row = (key, onClick, name, about, extra) => (
+    <button key={key} type="button" className="crm-btn" onClick={onClick} disabled={busy} style={{
+      display: 'flex', gap: 10, alignItems: 'baseline', width: '100%', textAlign: 'left', font: 'inherit', color: C.ink,
+      padding: '9px 12px', background: C.surface, border: 'none', borderTop: `1px solid ${C.line}`, cursor: 'pointer',
+    }}>
+      <span style={{ flex: 1, minWidth: 0 }}>
+        <span style={{ display: 'block', fontSize: 14, fontWeight: 600 }}>{name}</span>
+        {about && <span style={{ display: 'block', fontSize: 12, color: C.muted, marginTop: 1 }}>{about}</span>}
+      </span>
+      {extra && <span style={{ fontSize: 11.5, color: C.faint, flexShrink: 0 }}>{extra}</span>}
+    </button>
+  );
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <span style={labelText()}>{label}</span>
+      {value.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 7 }}>
+          {value.map((l) => (
+            <span key={l.id} style={{ ...filterChip(true), display: 'inline-flex', gap: 6, alignItems: 'center', cursor: 'default' }}>
+              {l.name}
+              <button type="button" className="crm-btn" aria-label={`Remove ${l.name}`} onClick={() => onChange(value.filter((x) => x.id !== l.id))}
+                style={{ font: 'inherit', fontSize: 14, lineHeight: 1, padding: 0, border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer' }}>×</button>
+            </span>
+          ))}
+        </div>
+      )}
+      {(many || !value.length) && (
+        <input style={inputStyle} value={q} onChange={(e) => setQ(e.target.value)} aria-label={label} aria-controls={listId}
+          placeholder={ph} autoComplete="off" />
+      )}
+      {showing && (
+        <div id={listId} role="group" aria-label={`Matches for ${term}`} style={{ marginTop: 6, border: `1px solid ${C.line}`, borderRadius: 8, overflow: 'hidden', marginBottom: 0 }}>
+          <div style={{ marginTop: -1 }}>
+            {found.orbit.filter((e) => !chosen.has(e.id)).map((e) => row(e.id, () => pick(e), e.name, e.about, ratingLine(e.outings, e.average) || 'In Orbit'))}
+            {wiki.map((e) => row(e.source_id, () => pick(e), e.name, e.about, 'Wikidata'))}
+            {!exact && row('new', () => pick({ source: 'orbit', name: term, about: '' }), `Add “${term}”`, `As a new ${catalogKindWord(kind)}, for anything the lists above do not have`)}
+          </div>
+        </div>
+      )}
+      {term.length >= 2 && !showing && <span style={hintStyle()}>Looking…</span>}
+      {problem && <span role="alert" style={{ ...hintStyle(), color: C.overdue }}>{problem}</span>}
+    </div>
+  );
+}
+
+// Half-star bars, 0.5 to 5.
+function RatingSpread({ spread }) {
+  const most = Math.max(1, ...spread);
+  return (
+    <div aria-hidden="true" style={{ display: 'flex', alignItems: 'flex-end', gap: 3, height: 44 }}>
+      {spread.map((n, i) => (
+        <div key={i} title={`${(i + 1) / 2} stars: ${n}`} style={{
+          flex: 1, height: Math.max(3, (n / most) * 44), borderRadius: 2, background: C.soonBar, opacity: n ? 1 : 0.25,
+        }} />
+      ))}
+    </div>
+  );
+}
+
+// Explore: search the shared catalog, and each entry's page. trail is the
+// entries opened in order; with none, it is the search.
+function ExploreView({ api, trail, onOpen, onBack }) {
+  const id = trail[trail.length - 1] || null;
+  return (
+    <div>
+      <button className="crm-btn" onClick={onBack} style={{ ...textButton(), fontSize: 13.5, marginBottom: 14 }}>
+        {id ? '← Back' : '← Events'}
+      </button>
+      {id ? <CatalogPage key={id} api={api} id={id} onOpen={onOpen} /> : <CatalogSearch api={api} onOpen={onOpen} />}
+    </div>
+  );
+}
+
+function CatalogSearch({ api, onOpen }) {
+  const [q, setQ] = useState('');
+  const [kind, setKind] = useState('');
+  const [found, setFound] = useState({ key: '', rows: [], problem: '' });
+  const term = q.trim().replace(/\s+/g, ' ');
+  const key = `${kind}:${term}`;
+  useEffect(() => {
+    if (term.length < 2) return undefined;
+    let live = true;
+    const t = setTimeout(() => {
+      api.search(term, kind || null).then(
+        (rows) => { if (live) setFound({ key, rows, problem: '' }); },
+        (e) => { if (live) setFound({ key, rows: [], problem: e.message || 'The search did not work.' }); },
+      );
+    }, 300);
+    return () => { live = false; clearTimeout(t); };
+  }, [term, kind, key, api]);
+  const ready = term.length >= 2 && found.key === key;
+  return (
+    <div>
+      <h1 style={{ margin: '0 0 6px', fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>Explore</h1>
+      <p style={{ margin: '0 0 14px', fontSize: 14, color: C.muted, lineHeight: 1.5 }}>
+        Teams, artists, shows, festivals and venues people in Orbit have been to, with their ratings and what they thought.
+      </p>
+      <input style={{ ...inputStyle, marginBottom: 10 }} value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search the catalog"
+        placeholder="Search for a team, artist, show or venue" />
+      <div role="group" aria-label="Kind" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 16 }}>
+        {[['', 'All'], ...Object.entries(CATALOG_KINDS).map(([k, w]) => [k, w.many[0].toUpperCase() + w.many.slice(1)])].map(([k, l]) => (
+          <button key={k || 'all'} className="crm-btn" aria-pressed={kind === k} onClick={() => setKind(k)} style={filterChip(kind === k)}>{l}</button>
+        ))}
+      </div>
+      {found.problem && ready && <p role="alert" style={{ fontSize: 13.5, color: C.overdue }}>{found.problem}</p>}
+      {ready && !found.problem && !found.rows.length && (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.55 }}>
+          Nothing in Orbit by that name yet. Anything you link from an event (a team, an artist, a venue) shows up here.
+        </p>
+      )}
+      {ready && found.rows.length > 0 && (
+        <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, padding: '4px 15px' }}>
+          {found.rows.map((e) => (
+            <button key={e.id} className="crm-btn" onClick={() => onOpen(e.id)} style={{
+              display: 'flex', gap: 10, alignItems: 'baseline', width: '100%', textAlign: 'left', font: 'inherit', color: C.ink,
+              padding: '11px 0', background: 'transparent', border: 'none', borderBottom: `1px solid ${C.line}`, cursor: 'pointer',
+            }}>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: 'block', fontSize: 14.5, fontWeight: 600 }}>{e.name}</span>
+                {e.about && <span style={{ display: 'block', fontSize: 12.5, color: C.muted, marginTop: 1 }}>{e.about}</span>}
+              </span>
+              <span style={{ fontSize: 12, color: C.muted, flexShrink: 0 }}>{ratingLine(e.outings, e.average)}</span>
+              <span style={kindChip()}>{catalogKindWord(e.kind)}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CatalogPage({ api, id, onOpen }) {
+  const [page, setPage] = useState({ state: 'loading' });
+  useEffect(() => {
+    let live = true;
+    api.page(id).then(
+      (p) => { if (live) setPage(p ? { state: 'ok', ...p } : { state: 'gone' }); },
+      (e) => { if (live) setPage({ state: 'failed', problem: e.message }); },
+    );
+    return () => { live = false; };
+  }, [api, id]);
+  if (page.state === 'loading') return <p style={{ fontSize: 14, color: C.muted }}>Loading…</p>;
+  if (page.state !== 'ok') {
+    return <p role="alert" style={{ fontSize: 14, color: C.muted }}>{page.state === 'gone' ? 'That is not in the catalog.' : page.problem || 'That page could not be loaded.'}</p>;
+  }
+  const { entry, ratings, average, spread, outings } = page;
+  const box = { background: C.surface, border: `1px solid ${C.line}`, borderRadius: 12, marginBottom: 12 };
+  return (
+    <div>
+      <span style={kindChip()}>{catalogKindWord(entry.kind)}</span>
+      <h1 style={{ margin: '8px 0 4px', fontSize: 27, fontWeight: 600, letterSpacing: '-0.035em' }}>{entry.name}</h1>
+      {entry.about && <p style={{ margin: '0 0 6px', fontSize: 14, color: C.muted }}>{entry.about}</p>}
+      {entry.source === 'wikidata' && (
+        <a href={WIKIDATA.page(entry.source_id)} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12.5, color: C.muted }}>On Wikidata</a>
+      )}
+
+      <div style={{ ...box, padding: 15, marginTop: 16, display: 'flex', gap: 18, alignItems: 'center', flexWrap: 'wrap' }}>
+        {ratings ? (
+          <>
+            <div>
+              <div style={{ fontSize: 34, fontWeight: 600, letterSpacing: '-0.04em', lineHeight: 1 }}>{Number(average).toFixed(1)}</div>
+              <div style={{ marginTop: 6 }}><Stars n={halfStep(average)} size={14} /></div>
+              <div style={{ fontSize: 12.5, color: C.muted, marginTop: 6 }}>{countThings(ratings, 'rating', 'ratings')} shared with everyone</div>
+            </div>
+            <div style={{ flex: '1 1 180px' }}><RatingSpread spread={spread} /></div>
+          </>
+        ) : (
+          <p style={{ margin: 0, fontSize: 13.5, color: C.muted }}>No ratings shared with everyone yet.</p>
+        )}
+      </div>
+
+      <h2 style={{ margin: '22px 0 10px', fontSize: 20, fontWeight: 600, letterSpacing: '-0.03em' }}>What people thought</h2>
+      {!outings.length ? (
+        <p style={{ fontSize: 14, color: C.muted, lineHeight: 1.55 }}>
+          Nobody you can see has logged this yet. Add an event and link it here to be the first.
+        </p>
+      ) : outings.map((o, i) => (
+        <article key={`${o.by.username}-${o.date}-${i}`} style={{ ...box, padding: '13px 15px' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 14, fontWeight: 600 }}>{o.by.display_name}</span>
+            <span style={{ fontSize: 12.5, color: C.faint }}>@{o.by.username}</span>
+            {o.by.relation === 'self' && <span style={kindChip()}>You</span>}
+            {o.by.relation === 'friends' && <span style={kindChip()}>Friend</span>}
+            <span style={{ marginLeft: 'auto' }}><Stars n={o.rating} size={12.5} /></span>
+          </div>
+          <p style={{ margin: '4px 0 0', fontSize: 12.5, color: C.muted }}>{o.title} · {prettyDate(o.date)}</p>
+          {o.review && <p className="crm-serif" style={{ margin: '8px 0 0', fontSize: 15, lineHeight: 1.6 }}>{o.review}</p>}
+          {o.links.length > 0 && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 9 }}>
+              {o.links.map((l) => (
+                <button key={l.id} className="crm-btn" onClick={() => onOpen(l.id)} aria-label={`Open ${l.name}`}
+                  style={{ ...filterChip(false), padding: '3px 10px', fontSize: 12 }}>{l.name}</button>
+              ))}
+            </div>
+          )}
+        </article>
+      ))}
     </div>
   );
 }
@@ -9531,6 +9863,11 @@ export default function PersonalCRM({ account = null } = {}) {
   // Where Orbit opens, as chosen in Settings.
   const [startView, setStartView] = useState('list');
   const [events, setEvents] = useState([]);
+  // Whether the saved events were read. Until they are, nothing is shared
+  // from them: an events list that failed to load is not an empty one.
+  const eventsRead = useRef(false);
+  // Explore: the catalog entries opened, in order, so Back goes to the last.
+  const [explore, setExplore] = useState([]);
   const [eventDraft, setEventDraft] = useState(null);
   const [reminders, setReminders] = useState([]);
   const [reminderDraft, setReminderDraft] = useState(null);
@@ -9600,6 +9937,7 @@ export default function PersonalCRM({ account = null } = {}) {
       const load = async (key, cleanList, byIdentity, apply) => {
         try {
           const r = await window.storage.get(key);
+          if (key === EVENTS_KEY) eventsRead.current = true;
           if (!r?.value) return;
           const { list, damaged } = readSaved(r.value, cleanList, byIdentity);
           if (damaged) {
@@ -9784,6 +10122,27 @@ export default function PersonalCRM({ account = null } = {}) {
       return rest;
     }));
   };
+
+  // Outings shared to the catalog follow the events. The whole set goes each
+  // time it changes (the server replaces what it had), and a fingerprint of
+  // the last set sent is kept on this device so an unchanged set is not sent
+  // again. A failure is quiet: the next change, or the next visit, tries again.
+  const catalogOn = Boolean(account?.catalog && account.profile);
+  const sharedOutings = useMemo(() => JSON.stringify(outingsToShare(events, OUTING_KINDS, todayStr())), [events]);
+  useEffect(() => {
+    if (!catalogOn || loading || !eventsRead.current) return undefined;
+    const key = `orbit-outings-sent:${account.profile.id}`;
+    const print = fingerprint(sharedOutings);
+    let last = null;
+    try { last = localStorage.getItem(key); } catch { /* sent again, harmlessly */ }
+    if (last === print) return undefined;
+    const t = setTimeout(() => {
+      account.catalog.sync(JSON.parse(sharedOutings)).then(() => {
+        try { localStorage.setItem(key, print); } catch { /* sent again next time */ }
+      }, () => {});
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [catalogOn, loading, sharedOutings, account]);
 
   // How many friend requests wait, read once when Orbit opens.
   useEffect(() => {
@@ -10641,6 +11000,7 @@ export default function PersonalCRM({ account = null } = {}) {
               <EventForm
                 initial={eventDraft.id ? eventDraft : null}
                 people={people}
+                catalog={catalogOn ? account.catalog : null}
                 onSave={saveEvent}
                 onCancel={() => setEventDraft(null)}
               />
@@ -10651,8 +11011,18 @@ export default function PersonalCRM({ account = null } = {}) {
                 onAdd={() => setEventDraft({})}
                 onEdit={(e) => setEventDraft(e)}
                 onRemove={(id) => persistEvents(events.filter((x) => x.id !== id))}
+                onCatalog={catalogOn ? (id) => { setExplore([id]); setView('explore'); } : null}
+                onExplore={catalogOn ? () => { setExplore([]); setView('explore'); } : null}
               />
             )}
+          </div>
+        )}
+
+        {view === 'explore' && catalogOn && (
+          <div className="crm-full">
+            <ExploreView api={account.catalog} trail={explore}
+              onOpen={(id) => setExplore([...explore, id])}
+              onBack={() => (explore.length ? setExplore(explore.slice(0, -1)) : setView('events'))} />
           </div>
         )}
 

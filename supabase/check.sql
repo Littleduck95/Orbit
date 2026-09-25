@@ -34,6 +34,15 @@ from (values
   (17, 'Part 3: devices with push on',         to_regclass('public.push_subscriptions') is not null
                                                 and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.push_subscriptions')), false)),
   (18, 'Part 3: what has been sent',           to_regclass('public.notification_log') is not null
-                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.notification_log')), false))
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.notification_log')), false)),
+  (19, 'Part 4: the shared catalog',           to_regclass('public.catalog') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.catalog')), false)),
+  (20, 'Part 4: shared ratings and thoughts',  to_regclass('public.outings') is not null and to_regclass('public.outing_links') is not null
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.outings')), false)
+                                                and coalesce((select relrowsecurity from pg_class where oid = to_regclass('public.outing_links')), false)),
+  (21, 'Part 4: search, pages and sharing',    to_regprocedure('public.catalog_add(text, text, text, text, text)') is not null
+                                                and to_regprocedure('public.catalog_search(text, text)') is not null
+                                                and to_regprocedure('public.catalog_page(uuid)') is not null
+                                                and to_regprocedure('public.sync_outings(jsonb)') is not null)
 ) as t(n, item, ok)
 order by n;

@@ -57,6 +57,7 @@ src/PersonalCRM.jsx   the app
 src/photoStore.js     trip photos in IndexedDB, and preparing uploads
 src/TripMap.jsx       the Leaflet maps, loaded only when a map is shown
 src/recapCard.js      draws Recap's share card on a canvas
+src/catalog.js        the shared catalog: Wikidata search, and what of an event is shared
 src/mapConfig.js      map tiles and place search: one entry each
 src/geo.js            country and US state outlines: which one a stop is in, and shading
 tests/                characterization tests (logic, storage, account, browser)
@@ -392,6 +393,59 @@ The database decides what each viewer receives: profiles are only read
 through functions that apply those settings, and friendships and blocks are
 only changed through functions that check who is asking.
 
+### The shared catalog and Explore
+
+Concerts, games, shows and festivals can be linked to a **shared catalog** of
+performers, teams, shows, festivals and venues, so everyone's *Kansas City
+Chiefs* is the same entry and what people thought of it can be gathered in
+one place. It needs an account with a username.
+
+**Linking.** In the event form, a concert asks *Who played* (artists, any
+number), a game asks *Who played* (teams), a show asks *Which show* and a
+festival *Which festival*, and each can have a *Venue*. Typing searches the
+catalog first, showing how many have logged each entry and its average,
+then [Wikidata](https://www.wikidata.org) for anything the catalog does not
+have yet (disambiguation pages left out), and last offers *Add "…"* for the
+local band or the high school game Wikidata has never heard of. Picking a
+Wikidata match adds it to the catalog; its item id (Q and digits) keeps it
+the same entry for everyone. One made in Orbit is matched by its kind and
+name. Picking a venue fills in *Where* if that was empty.
+
+**Sharing.** Once an outing has happened, the form has *Your thoughts* beside
+the rating, and *Who sees your rating and thoughts*: **Everyone**,
+**Friends** (the default) or **Only me**. The card on the timeline shows the
+thoughts and who they are shared with. An outing set to Everyone or Friends,
+that has happened and links to something, is copied to the account's
+database as an **outing**: its kind, title, date, rating, thoughts and links.
+Who went with you and the event's details are never copied. The app sends
+the whole set whenever it changes (the server replaces what it had), keeps a
+short fingerprint of the last set sent so an unchanged one is not sent
+again, and never sends anything before the events have been read, so an
+events list that failed to load can never empty what is shared.
+
+**Explore** (beside *Add an event*, or any link on an event card) searches
+the catalog, narrowed by kind if wanted. An entry's page has its average
+from the ratings shared with everyone, how many there are and how they
+spread across the half stars, a link to Wikidata, and **What people
+thought**: every outing the viewer may see, newest first, with who logged it
+(and *Friend* or *You*), their stars, title, date and thoughts, and what else
+it links to (tap to go there; *Back* retraces the way).
+
+**Who sees what** is decided by the database: an outing set to Everyone is
+seen by anyone signed in, one set to Friends only by friends, your own
+always, and nobody's across a block, either way. Only ratings shared with
+everyone count towards an average, so a friends-only rating is never
+revealed by a number. Searches count only the outings the viewer may see.
+
+The catalog, outings and their links are part 4 of `supabase/schema.sql`,
+reached only through `catalog_add`, `catalog_search`, `catalog_page` and
+`sync_outings`, each of which checks who is asking. Deleting an account
+deletes its outings; entries it added stay, without its name.
+
+*Known limits.* An entry's name and description are whatever its first
+adder's app sent (for Wikidata, what Wikidata said), and anyone signed in
+can add entries. There is no reporting or merging of duplicates yet.
+
 ### Preferences and notifications
 
 **Settings → Preferences** holds the theme, which tab Orbit opens on, and
@@ -452,7 +506,13 @@ under seven keys (`crm-people-v1`, `crm-events-v1`, `crm-reminders-v1`,
 more remember small things: that the Trips notice was read
 (`crm-trips-notice-v1`), that the pinned-events offer was answered
 (`crm-trips-events-offer-v1`), and when the last backup file was made
-(`crm-backup-file-v1`). Lists are called
+(`crm-backup-file-v1`). With the shared catalog, an event can also carry
+`links` (`{ id, kind, name }` for each catalog entry, the name kept so it
+reads the same offline), `review` (the thoughts shared with the rating) and
+`visibility` (`everyone`, `friends` or `me`); events saved before these
+existed read as kept to yourself. A fingerprint of the last set of outings
+shared is kept per account under `orbit-outings-sent:<user id>` in
+`localStorage`, outside the account's own keys. Lists are called
 collections in the code, because "list" already means the people list there.
 The app reads and writes them through an async `window.storage` object.
 

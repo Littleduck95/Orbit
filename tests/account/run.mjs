@@ -67,12 +67,15 @@ const session = () => ({
  * already in use. Sign-ups, password logins, resets and profile changes are
  * all recorded on db for the checks to look at.
  */
-const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = signedIn ? PROFILE : null, taken = ['bea'], others = [] } = {}) => {
+const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = signedIn ? PROFILE : null, taken = ['bea'], others = [], catalog = [], pages = {} } = {}) => {
   const db = {
     rows: new Map(Object.entries(rows).map(([u, kv]) => [u, new Map(Object.entries(kv))])), down: false, calls: [], profile, taken: new Set(taken),
     // Other people, as the friends functions hand them out: each with how
     // this user stands with them.
     others: others.map((o) => ({ ...o })), blocked: [],
+    // The shared catalog: its entries, the pages it hands out by id, and
+    // every set of outings the app has shared.
+    catalog: catalog.map((e) => ({ ...e })), pages: { ...pages }, synced: [], wikidata: [],
   };
   const mine = () => {
     if (!db.rows.has(USER.id)) db.rows.set(USER.id, new Map());
@@ -84,6 +87,14 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
   page.on('pageerror', (e) => problems.push(e.message));
   await page.route('https://fonts.googleapis.com/**', (r) => r.abort());
   await page.route('https://api.anthropic.com/**', (r) => r.abort());
+  // Wikidata's search, answering from WIKIDATA below.
+  await page.route('https://www.wikidata.org/**', (r) => {
+    const q = new URL(r.request().url()).searchParams;
+    db.wikidata.push(Object.fromEntries(q));
+    const term = (q.get('search') || '').toLowerCase();
+    const search = WIKIDATA.filter((w) => w.label.toLowerCase().includes(term));
+    return r.fulfill({ status: 200, headers: { 'access-control-allow-origin': '*', 'content-type': 'application/json' }, body: JSON.stringify({ search, success: 1 }) });
+  });
   await page.route(`${SB}/**`, async (r) => {
     const req = r.request();
     const u = new URL(req.url());
@@ -148,6 +159,34 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
       }
       if (fn === 'unblock_user') { db.blocked = db.blocked.filter((x) => x.id !== a.other); return reply(null); }
       if (fn === 'my_blocks') return reply(db.blocked.map(({ id, username, display_name }) => ({ id, username, display_name })));
+    }
+    if (u.pathname.startsWith('/rest/v1/rpc/') && ['catalog_search', 'catalog_add', 'catalog_page', 'sync_outings'].includes(u.pathname.slice(13))) {
+      const fn = u.pathname.slice(13);
+      const a = JSON.parse(req.postData() || '{}');
+      const reply = (v) => r.fulfill({ status: 200, headers, body: JSON.stringify(v) });
+      if (fn === 'catalog_search') {
+        const q = a.q.toLowerCase();
+        return reply(db.catalog.filter((e) => e.name.toLowerCase().includes(q) && (!a.p_kind || e.kind === a.p_kind)));
+      }
+      if (fn === 'catalog_add') {
+        const sid = a.p_source === 'orbit' ? `${a.p_kind}:${a.p_name.toLowerCase()}` : a.p_source_id;
+        let e = db.catalog.find((x) => x.source === a.p_source && x.source_id === sid);
+        if (!e) {
+          e = { id: `00000000-0000-4000-8000-${String(db.catalog.length + 1).padStart(12, '0')}`, kind: a.p_kind, name: a.p_name, about: a.p_about, source: a.p_source, source_id: sid, outings: 0, average: null };
+          db.catalog.push(e);
+        }
+        db.added = [...(db.added || []), a];
+        return reply(e);
+      }
+      if (fn === 'catalog_page') {
+        const e = db.catalog.find((x) => x.id === a.p_id);
+        if (!e) return reply(null);
+        return reply(db.pages[a.p_id] || { entry: e, ratings: 0, average: null, spread: Array(10).fill(0), outings: [] });
+      }
+      if (fn === 'sync_outings') {
+        db.synced.push(a.items);
+        return reply(a.items.length);
+      }
     }
     if (u.pathname === '/rest/v1/notification_prefs') {
       if (req.method() === 'GET') return r.fulfill({ status: 200, headers, body: JSON.stringify(db.prefs ? [db.prefs] : []) });
@@ -217,10 +256,117 @@ const newPage = async ({ signedIn = false, local = {}, rows = {}, profile = sign
   return { page, db, mine, problems, close: () => ctx.close() };
 };
 
+// What Wikidata's search knows, in its own shape.
+const WIKIDATA = [
+  { id: 'Q223455', label: 'Kansas City Chiefs', description: 'National Football League franchise in Kansas City, Missouri' },
+  { id: 'Q223507', label: 'Denver Broncos', description: 'National Football League franchise in Denver, Colorado' },
+  { id: 'Q1128848', label: 'Arrowhead Stadium', description: 'American football stadium in Kansas City, Missouri' },
+  { id: 'Q1149473', label: 'Kaizer Chiefs', description: 'South African football club' },
+  { id: 'Q224', label: 'Chiefs', description: 'Wikimedia disambiguation page' },
+];
+
 const localKeys = (page) => page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith('orbit')).sort());
 const shown = (loc) => loc.waitFor({ timeout: 8000 }).then(() => true, () => false);
 
 const scenarios = {
+  async 'linking events to the shared catalog'() {
+    const CHIEFS = { id: '00000000-0000-4000-8000-00000000c41f', kind: 'team', name: 'Kansas City Chiefs', about: 'NFL team', source: 'wikidata', source_id: 'Q223455', outings: 3, average: 4.2 };
+    const ARROWHEAD = { id: '00000000-0000-4000-8000-0000000a4404', kind: 'venue', name: 'Arrowhead Stadium', about: 'Stadium', source: 'wikidata', source_id: 'Q1128848', outings: 1, average: null };
+    const page0 = {
+      entry: CHIEFS, ratings: 2, average: 4.25, spread: [0, 0, 0, 0, 0, 0, 0, 1, 1, 0],
+      outings: [
+        { by: { username: 'bea', display_name: 'Bea', relation: 'friends' }, kind: 'Sports', title: 'Chiefs home opener', date: '2025-09-07', rating: 4.5,
+          review: 'Loudest crowd I have heard.', links: [ARROWHEAD] },
+        { by: { username: 'dora', display_name: 'Dora', relation: 'none' }, kind: 'Sports', title: 'Wild card', date: '2025-01-11', rating: 4, review: '', links: [] },
+      ],
+    };
+    const EVENTS = [
+      { id: 'ev1', title: 'Chiefs vs Broncos', kind: 'Sports', date: '2025-12-07', endDate: null, rating: 4, note: 'private note about the tailgate', people: ['p1'], place: '', lat: null, lon: null, addedOn: '2025-12-07' },
+      { id: 'ev2', title: 'Moved house', kind: 'Milestone', date: '2025-02-01', endDate: null, note: '', people: [], place: '', lat: null, lon: null, addedOn: '2025-02-01' },
+    ];
+    const PEOPLE = [{ id: 'p1', name: 'Dana Tailgate', circle: 'friend', tier: 'friend', cadence: 30, log: [] }];
+    const { page, db, mine, problems, close } = await newPage({
+      signedIn: true,
+      rows: { [USER.id]: { 'crm-owner-v1': 'Sam', 'crm-events-v1': JSON.stringify(EVENTS), 'crm-people-v1': JSON.stringify(PEOPLE) } },
+      catalog: [CHIEFS, ARROWHEAD], pages: { [CHIEFS.id]: page0 },
+    });
+    await page.goto(url);
+    await shown(page.getByText("Sam's Orbit"));
+    await page.getByRole('button', { name: 'Events', exact: true }).first().click();
+    await page.waitForTimeout(1600);
+    check('nothing is shared before anything is linked', db.synced.every((s) => s.length === 0), db.synced);
+    check('Explore is offered beside Add an event', await page.getByRole('button', { name: 'Explore' }).isVisible());
+
+    await page.getByRole('button', { name: 'Edit' }).first().click();
+    check('a milestone has nothing to link', true);
+    const who = page.getByLabel('Who played');
+    check('a game asks who played', await who.isVisible());
+    await who.fill('Chiefs');
+    const matches = page.getByRole('group', { name: 'Matches for Chiefs' });
+    await matches.waitFor();
+    const rows = await matches.getByRole('button').allInnerTexts();
+    check('matches come from Orbit first, with how many logged it', /^Kansas City Chiefs[\s\S]*3 logged · ★ 4\.2/.test(rows[0]), rows);
+    check('then Wikidata, without what Orbit already has, or disambiguation pages', rows.filter((t) => t.includes('Kansas City Chiefs')).length === 1
+      && rows.some((t) => t.startsWith('Kaizer Chiefs') && t.includes('Wikidata')) && !rows.some((t) => /disambiguation/.test(t)), rows);
+    check('and a way to add it if neither has it', /Add “Chiefs”/.test(rows[rows.length - 1]), rows);
+    check('Wikidata is asked in the browser\'s language, from any site', db.wikidata[0]?.language === 'en' && db.wikidata[0]?.origin === '*', db.wikidata[0]);
+    await matches.getByRole('button', { name: /^Kansas City Chiefs/ }).click();
+    check('picking one links it', await page.getByRole('button', { name: 'Remove Kansas City Chiefs' }).isVisible());
+    await who.fill('Broncos');
+    await page.getByRole('group', { name: 'Matches for Broncos' }).getByRole('button', { name: /^Denver Broncos/ }).click();
+    check('a Wikidata match is added to the catalog as it is picked', db.added?.[0]?.p_source === 'wikidata' && db.added[0].p_source_id === 'Q223507' && db.added[0].p_kind === 'team', db.added);
+    await page.getByLabel('Venue').fill('Arrowhead');
+    await page.getByRole('group', { name: 'Matches for Arrowhead' }).getByRole('button', { name: /^Arrowhead Stadium/ }).click();
+    check('picking a venue fills in where, when that was empty', await page.getByPlaceholder('Cincinnati, Ohio').inputValue() === 'Arrowhead Stadium');
+    check('one venue at most', await page.getByLabel('Venue').count() === 0);
+
+    await page.getByLabel('Your thoughts').fill('Cold, loud, worth it.');
+    await page.getByRole('button', { name: 'Everyone', exact: true }).click();
+    await page.getByRole('button', { name: 'Save changes' }).click();
+    await page.waitForTimeout(400);
+    const saved = JSON.parse(mine().get('crm-events-v1')).find((e) => e.id === 'ev1');
+    check('the event keeps its links, thoughts and who sees them', saved.links.map((l) => l.name).join() === 'Kansas City Chiefs,Denver Broncos,Arrowhead Stadium'
+      && saved.review === 'Cold, loud, worth it.' && saved.visibility === 'everyone', saved);
+    await page.waitForFunction(() => true);
+    await page.waitForTimeout(1600);
+    const sent = db.synced[db.synced.length - 1] || [];
+    check('and it is shared', sent.length === 1 && sent[0].event_id === 'ev1' && sent[0].rating === 4 && sent[0].visibility === 'everyone'
+      && sent[0].links.length === 3 && sent[0].review === 'Cold, loud, worth it.', sent);
+    check('never with who went, or the private notes', !/Dana|p1|private note|tailgate/.test(JSON.stringify(db.synced)), JSON.stringify(sent));
+    const syncs = db.synced.length;
+    await page.reload();
+    await shown(page.getByText("Sam's Orbit"));
+    await page.waitForTimeout(1600);
+    check('an unchanged set is not sent again', db.synced.length === syncs, db.synced.length);
+
+    // ---- the card, and Explore ----
+    await page.getByRole('button', { name: 'Events', exact: true }).first().click();
+    check('the card shows the thoughts and who they are shared with', await page.getByText('Shared with everyone').isVisible());
+    await page.getByRole('button', { name: 'Open Kansas City Chiefs' }).click();
+    check('a link opens its page', await shown(page.getByRole('heading', { name: 'Kansas City Chiefs', level: 1 })));
+    check('with the average of ratings shared with everyone', await page.getByText('4.3', { exact: true }).isVisible() && await page.getByText(/^two ratings shared with everyone$/i).isVisible());
+    check('and what people thought, with who they are', await page.getByText('Loudest crowd I have heard.').isVisible() && await page.getByText('@bea').isVisible()
+      && await page.getByText('Friend', { exact: true }).isVisible());
+    check('and a link to Wikidata', await page.getByRole('link', { name: 'On Wikidata' }).getAttribute('href') === 'https://www.wikidata.org/wiki/Q223455');
+    await page.getByRole('button', { name: 'Open Arrowhead Stadium' }).click();
+    check('what an outing links to opens too', await shown(page.getByRole('heading', { name: 'Arrowhead Stadium', level: 1 })));
+    check('a page nobody has shared a rating on says so', await page.getByText('No ratings shared with everyone yet.').isVisible());
+    await page.getByRole('button', { name: '← Back' }).click();
+    check('Back goes to the page before', await shown(page.getByRole('heading', { name: 'Kansas City Chiefs', level: 1 })));
+    await page.getByRole('button', { name: '← Back' }).click();
+    await page.getByLabel('Search the catalog').fill('arrow');
+    check('Explore searches the catalog', await shown(page.getByRole('button', { name: /^Arrowhead Stadium/ })));
+    await page.getByRole('button', { name: '← Events' }).click();
+
+    // ---- keeping it to yourself ----
+    await page.getByRole('button', { name: 'Edit' }).first().click();
+    await page.getByRole('button', { name: 'Only me', exact: true }).click();
+    await page.getByRole('button', { name: 'Save changes' }).click();
+    await page.waitForTimeout(1800);
+    check('Only me takes it back out of the catalog', (db.synced[db.synced.length - 1] || [1]).length === 0, db.synced[db.synced.length - 1]);
+    check('no page errors', problems.length === 0, problems);
+    await close();
+  },
   async 'signed out'() {
     const { page, db, problems, close } = await newPage({ local: { 'orbit:crm-owner-v1': 'Sam' } });
     await page.goto(`${url}#share=abc123`);
